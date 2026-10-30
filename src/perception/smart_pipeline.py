@@ -146,9 +146,9 @@ QWEN_SYSTEM_PROMPT = """你是一位专精 UI 截图文字识别的 OCR 引擎�
 class _QwenAPIClient:
     """轻量级 qwen3.6-flash API 客户端，只保留核心调用逻辑。"""
 
-    def __init__(self, api_key: Optional[str] = None, model: str = "qwen3.6-flash"):
+    def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None):
         self.api_key = api_key or os.environ.get("DASHSCOPE_API_KEY")
-        self.model = model
+        self.model = model or os.environ.get("VISION_MODEL", "qwen3.6-flash")
         if not self.api_key:
             raise RuntimeError("DASHSCOPE_API_KEY not set")
         try:
@@ -772,7 +772,7 @@ class SmartPerceptionPipeline:
             _logger.warning("[SmartPipeline] API客户端不可用，跳过API调用")
             return {}
         t0 = time.time()
-        _logger.info(f"[SmartPipeline] API请求开始: model=qwen3.6-flash, image={Path(image_path).name}")
+        _logger.info(f"[SmartPipeline] API请求开始: model={client.model}, image={Path(image_path).name}")
         try:
             raw, prompt, response_text, thinking = client.recognize_with_debug(image_path)
             latency_ms = (time.time() - t0) * 1000
@@ -805,7 +805,7 @@ class SmartPerceptionPipeline:
         try:
             self._api_client = _QwenAPIClient(api_key=self._api_key)
             self._api_available = True
-            _logger.info("qwen3.6-flash API 客户端初始化成功")
+            _logger.info(f"{self._api_client.model} API 客户端初始化成功")
             return self._api_client
         except Exception as e:
             self._api_available = False
