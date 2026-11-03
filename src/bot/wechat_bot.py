@@ -8,8 +8,10 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from src.action.chat_list_clicker import ChatListClicker
+from src.action.chat_opener import ChatOpener
 from src.action.login_recovery import LoginRecoveryStatus, WeChatLoginHandler
 from src.action.message_sender import WeChatMessageSender
+from src.bot.scheduled_push import ScheduledPusher
 from src.capture.window_capture import WeChatNotReadyError
 from src.logging.bot_logger import BotLogger, get_logger
 from src.memory import MemoryEngine
@@ -88,6 +90,12 @@ class WeChatBot:
             enable_timestamps=True,
         )
         self.sender = WeChatMessageSender(silent_mode=os.environ.get("WECHAT_SILENT_MODE") == "1")
+        # 定时推送：目标群为 SILENT_WHITELIST，配置见 src/bot/scheduled_push.py
+        self.scheduled_pusher = ScheduledPusher(
+            groups=sorted(self.sender._silent_whitelist),
+            open_chat=ChatOpener(self.perception).open,
+            send=self.send_to_chat,
+        )
 
         # 动态注册 send_file 工具（需要 sender 实例）
         def _load_shareable_files() -> dict:
@@ -744,6 +752,12 @@ class WeChatBot:
         self._interval = interval
         while self.running:
             tick_started = time.monotonic()
+            try:
+                pusher = getattr(self, "scheduled_pusher", None)
+                if pusher is not None:
+                    pusher.run_due()
+            except Exception as e:
+                self.logger.error(f"定时推送异常: {e}", exc_info=True)
             try:
                 self.tick()
             except Exception as e:
