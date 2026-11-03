@@ -18,6 +18,7 @@ import logging
 import os
 import re
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Optional
 
@@ -44,23 +45,9 @@ QWEN_SYSTEM_PROMPT = """你是一位专精 UI 截图文字识别的 OCR 引擎�
 2. 中间上方标题栏：当前聊天名称
 3. 中间消息区域：消息按对话顺序从上到下排列
 
-请严格按以下 JSON 格式输出（不要加 markdown 代码块，直接输出纯 JSON）：
+请严格按以下 JSON 格式输出（不要加 markdown 代码块，直接输出纯 JSON，压缩成一行，不要缩进和换行）：
 
-{
-  "chat_name": "当前聊天名称，如果没有则空字符串",
-  "chat_list": [
-    {"nickname": "昵称1", "unread_count": "未读数量，没有则为空字符串"},
-    {"nickname": "昵称2", "unread_count": "3"}
-  ],
-  "messages": [
-    {"sender": "自己", "text": "消息内容", "type": "text"},
-    {"sender": "对方", "text": "私聊中对方的消息", "type": "text"},
-    {"sender": "群成员昵称", "text": "群聊中对方的消息", "type": "text"},
-    {"sender": "对方", "text": "", "type": "image", "image_description": "一只橘猫趴在键盘上", "image_text": "不想上班"},
-    {"sender": "对方", "text": "", "type": "sticker", "image_description": "熊猫头流泪的表情包", "image_text": ""},
-    {"sender": "群成员昵称", "text": "回复消息", "type": "text", "quoted_text": "被引用的消息内容"}
-  ]
-}
+{"chat_name":"当前聊天名称，如果没有则空字符串","chat_list":[{"nickname":"有未读角标的聊天昵称","unread_count":"3"}],"messages":[{"sender":"自己","text":"消息内容","type":"text"},{"sender":"对方","text":"私聊中对方的消息","type":"text"},{"sender":"群成员昵称","text":"群聊中对方的消息","type":"text"},{"sender":"对方","text":"","type":"image","image_description":"一只橘猫趴在键盘上","image_text":"不想上班"},{"sender":"对方","text":"","type":"sticker","image_description":"熊猫头流泪的表情包","image_text":""},{"sender":"群成员昵称","text":"回复消息","type":"text","quoted_text":"被引用的消息内容"}]}
 
 【关键识别规则 - 必须严格遵守】
 
@@ -75,10 +62,11 @@ QWEN_SYSTEM_PROMPT = """你是一位专精 UI 截图文字识别的 OCR 引擎�
    - 如果没有红色圆形数字，unread_count 为空字符串""
 
 2. 聊天列表（chat_list）：
-   - 【重要】chat_list 必须严格按照截图中左侧列表从上到下的顺序排列，第一个就是截图中最顶部的条目
-   - 左侧每个条目提取昵称，忽略头像区域的所有数字（除非是红色圆形未读角标）
-   - 当前高亮选中的聊天条目也必须包含
-   - 预览消息文字不要放入 nickname
+   - 【重要】chat_list 只列出带红色未读角标的条目，没有未读角标的条目一律不输出；全部没有未读时输出 []
+   - 【严禁】最左侧窄图标栏（微信图标、通讯录图标等）上的红色数字是全局总未读数，不属于任何聊天，也不能算到列表最上方的条目上
+   - 逐个检查：只有角标就压在该条目自己的头像右上角时，才输出该条目
+   - 按截图中左侧列表从上到下的顺序排列
+   - nickname 只填昵称，预览消息文字不要放入 nickname
 
 3. 消息 sender 判断（这是最容易出错的地方，请仔细看对齐方向）：
    - 【铁律】对齐方向是判断 sender 的唯一依据，文本、图片、表情、链接卡片全部适用：
@@ -139,7 +127,7 @@ QWEN_SYSTEM_PROMPT = """你是一位专精 UI 截图文字识别的 OCR 引擎�
    - 输入框中的文字是未发送的草稿，不是已发送的消息，必须排除
    - 不要输出输入框中的任何内容
 
-9. 只输出 JSON，不要任何解释文字。
+9. 只输出 JSON，不要任何解释文字。JSON 压缩成一行，不要缩进、换行和多余空格。
 """
 
 
@@ -684,64 +672,38 @@ class SmartPerceptionPipeline:
     def _merge_chat_list(
         self, local_chat_list: list, api_chat_list: list
     ) -> list:
-        """结合本地 Layout 的准确位置和 API 的准确昵称/未读数。
+        """结合本地 Layout 的准确位置和 API 的未读数。
 
-        策略：
-        1. 本地 chat_list 按 y 坐标排序（截图从上到下）
-        2. API chat_list 理论上也应该从上到下，但不可靠
-        3. 如果数量相同，按索引一一对应（本地提供 rect，API 提供 nickname/unread）
-        4. 如果数量不同，用昵称模糊匹配
+        API chat_list 只包含有未读角标的条目，未读数只采信 API：
+        1. 本地 chat_list 按 y 坐标排序（截图从上到下），提供 rect，未读数一律清空
+        2. 每个 API 未读条目用昵称模糊匹配到最相似的本地条目，写入 nickname/unread_count
         """
         if not local_chat_list:
-            # 本地 Layout 失败，回退到虚拟坐标。1738×1602 为 2x Retina 参考尺寸。
-            _logger.warning("[SmartPipeline] 本地Layout无chat_list，回退到虚拟坐标")
-            return self._build_chat_list_items_from_api(api_chat_list, 1738, 1602, "")
+            # API 只返回未读条目，无法推算虚拟坐标，放弃本轮切换以免误点
+            _logger.warning("[SmartPipeline] 本地Layout无chat_list，跳过聊天列表")
+            return []
 
         # 本地按 y 坐标排序（确保从上到下）
         sorted_local = sorted(local_chat_list, key=lambda item: item.rect.y)
+        result = [replace(item, unread_count="") for item in sorted_local]
 
-        # 如果数量相同，直接按索引对应
-        if len(sorted_local) == len(api_chat_list):
-            result = []
-            for local_item, api_item in zip(sorted_local, api_chat_list):
-                result.append(
-                    ChatListItem(
-                        nickname=api_item.get("nickname", local_item.nickname),
-                        last_message_preview=local_item.last_message_preview,
-                        unread_count=api_item.get("unread_count", local_item.unread_count),
-                        timestamp=local_item.timestamp,
-                        rect=local_item.rect,
-                    )
-                )
-            return result
-
-        # 数量不同：用昵称模糊匹配
-        _logger.warning(
-            f"[SmartPipeline] chat_list数量不匹配: 本地={len(sorted_local)}, API={len(api_chat_list)}, "
-            f"使用昵称模糊匹配"
-        )
-        result = []
-        for local_item in sorted_local:
-            best_match = None
+        for api_item in api_chat_list:
+            nickname = api_item.get("nickname", "")
+            best_index = -1
             best_score = 0.0
-            for api_item in api_chat_list:
-                nickname = api_item.get("nickname", "")
+            for i, local_item in enumerate(sorted_local):
                 score = self._lcs_similarity(local_item.nickname, nickname)
                 if score > best_score:
                     best_score = score
-                    best_match = api_item
-            if best_match and best_score >= 0.5:
-                result.append(
-                    ChatListItem(
-                        nickname=best_match.get("nickname", local_item.nickname),
-                        last_message_preview=local_item.last_message_preview,
-                        unread_count=best_match.get("unread_count", local_item.unread_count),
-                        timestamp=local_item.timestamp,
-                        rect=local_item.rect,
-                    )
+                    best_index = i
+            if best_index >= 0 and best_score >= 0.5:
+                result[best_index] = replace(
+                    result[best_index],
+                    nickname=nickname or result[best_index].nickname,
+                    unread_count=api_item.get("unread_count", ""),
                 )
             else:
-                result.append(local_item)
+                _logger.warning(f"[SmartPipeline] API 未读条目 '{nickname}' 未匹配到本地列表项")
         return result
 
     def _lcs_similarity(self, a: str, b: str) -> float:
