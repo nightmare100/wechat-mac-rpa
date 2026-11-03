@@ -6,6 +6,7 @@
 """
 
 import logging
+import shutil
 import subprocess  # nosec B404
 from abc import ABC, abstractmethod
 
@@ -97,8 +98,8 @@ class SystemAutomation(ABC):
 class MacOSSystemAutomation(SystemAutomation):
     """macOS 实现：基于 AppleScript + cliclick + screencapture。"""
 
-    def __init__(self, cliclick_path: str = "/opt/homebrew/bin/cliclick"):
-        self.cliclick_path = cliclick_path
+    def __init__(self, cliclick_path: str = ""):
+        self.cliclick_path = cliclick_path or shutil.which("cliclick") or "/opt/homebrew/bin/cliclick"
 
     def activate_app(self, app_name: str) -> bool:
         script = f'tell application "{app_name}" to activate'
