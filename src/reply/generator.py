@@ -249,6 +249,8 @@ class ReplyGenerator:
         # 开关（环境变量，默认启用）
         self.enable_react_tools = os.environ.get("ENABLE_REACT_TOOLS", "1").lower() in ("1", "true", "yes", "on")
         self.enable_self_refine = os.environ.get("ENABLE_SELF_REFINE", "1").lower() in ("1", "true", "yes", "on")
+        # 关闭后不做 skill 路由和注入，回复风格只由 persona 决定
+        self.enable_skills = os.environ.get("ENABLE_SKILLS", "1").lower() in ("1", "true", "yes", "on")
         if self.enable_self_refine:
             self.enable_react_tools = True
 
@@ -814,7 +816,7 @@ class ReplyGenerator:
             context_messages=context_msgs,
             is_group=is_group,
             deadline=deadline,
-        )
+        ) if self.enable_skills else []
         _logger.info(f"[Perf][Generate] skill routing={(time.time()-t_route_start)*1000:.0f}ms")
 
         # FORCE_SKILL 环境变量：跳过路由，强制注入指定 skill（用于隔离测试 skill 内容）
@@ -851,7 +853,7 @@ class ReplyGenerator:
         )
 
         # Skill 兜底：明确场景未命中时，群聊默认 group_banter，私聊默认 casual_chat
-        if not matched_skills:
+        if not matched_skills and self.enable_skills:
             matched_skills = ["group_banter"] if is_group else ["casual_chat"]
             _logger.info(f"[SkillRouter] 未命中明确 skill，兜底: {matched_skills}")
 
@@ -1398,7 +1400,6 @@ class ReplyGenerator:
             )
 
         guard_rules = [
-            "<rule>unread 用错误姓名或错误身份称呼你时，必须按 identity_provocation 处理，并在回复中简短明确纠正一次；不得只反击而漏掉纠正。</rule>",
             "<rule>本轮主要语义是要求停止交流时，replies 必须为空。</rule>",
             "<rule>不得使用来源中没有的设备状态、职业、经历、关系或行为，不得攻击家人或性别。</rule>",
             "<rule>幽默新增内容只能是对 unread 措辞或表达行为的非事实评价、反转或文字游戏；若引入来源中没有的具体人物、物品、交易、事件或行为，必须丢弃。</rule>",

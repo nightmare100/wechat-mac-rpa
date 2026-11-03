@@ -304,6 +304,16 @@ class TestForceSkill:
             gen.generate([sample_message], [sample_message])
         assert "casual_chat" in gen.last_loaded_skills
 
+    def test_skills_disabled_skips_router_and_fallback(self, mock_llm, sample_message):
+        """ENABLE_SKILLS=0 → 不调用路由、不兜底注入，只调用一次主模型。"""
+        mock_llm.responses = ['{"replies": ["test reply"]}']
+        gen = _make_generator(mock_llm, enable_self_refine=False)
+        gen.enable_skills = False
+        assert gen.generate([sample_message], [sample_message]) == ["test reply"]
+        assert gen.last_loaded_skills == []
+        assert len(mock_llm.calls) == 1
+        assert "<active_skill" not in mock_llm.calls[0]["messages"][-1]["content"]
+
 
 class TestParseReplies:
     """_parse_replies 方法的单元测试。"""

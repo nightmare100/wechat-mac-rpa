@@ -135,7 +135,10 @@ class TestReplyGenerator:
         root = ET.fromstring(gen._build_user_prompt([unread], [unread], is_group=True))
 
         assert [child.tag for child in root][-1] == "reply_guard"
-        assert "必须按 identity_provocation 处理" in "".join(root.find("./reply_guard").itertext())
+        guard_text = "".join(root.find("./reply_guard").itertext())
+        assert "要求停止交流" in guard_text
+        # OCR 常把昵称识别错，不再强制"纠正错误称呼"，避免把识别错误放大成回复
+        assert "identity_provocation" not in guard_text
 
     def test_system_prompt_does_not_embed_skill_catalog(self):
         gen = ReplyGenerator(llm_client=None, tool_registry=_TEST_TOOL_REGISTRY)
