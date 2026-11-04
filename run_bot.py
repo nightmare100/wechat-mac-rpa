@@ -69,8 +69,12 @@ def main():
         print(f"  • LLM: {model_name} ({base_url})")
         print("  • Prompt: DT style (data/persona.md)")
         print("  • 检索: 待启用")
-        interval = 5.0
-        print(f"  • 轮询: 每 {interval:.0f} 秒")
+        try:
+            interval = max(1.0, float(os.environ.get("POLL_INTERVAL", "5")))
+        except ValueError:
+            print("  ⚠️ POLL_INTERVAL 不是数字，使用默认 5 秒")
+            interval = 5.0
+        print(f"  • 轮询: 每 {interval:g} 秒")
 
         llm = QwenClient()
         perception = SmartPerceptionPipeline(PROFILE_WECHAT_MAC_1760X1280)
