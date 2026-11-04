@@ -1406,11 +1406,12 @@ class ReplyGenerator:
         ]
         if consumed_self_items:
             guard_rules.extend([
-                "<rule>consumed_self_replies 是你已经发过的话，只用于排除素材，不用于模仿或延续。</rule>",
-                "<rule>候选回复只要依赖其中已用过的事实、数字、人物标签、虚构关系、处境、反差或包袱，就必须丢弃。</rule>",
+                "<rule>consumed_self_replies 是你已经发过的话，只用于排除素材，不用于模仿或延续。每条开头的「@昵称」是当时回复的对象。</rule>",
+                "<rule>不得复用其中的句子、梗和包袱；候选回复只要依赖其中已用过的数字、人物标签、虚构关系、反差或包袱，就必须丢弃。</rule>",
                 "<rule>不得围绕已用素材新增动作、状态或场景；已用素材不能成为回复的主语、宾语、修饰对象、背景或隐含前提。</rule>",
                 "<rule>即使 unread 再次引用这些内容，也不得 callback；宁可字面回应、换全新角度或不回复。</rule>",
-                "<rule>若 unread 除追问、复述或抱怨已用素材外没有独立的新内容，replies 必须为空。</rule>",
+                "<rule>若 unread 的发送者就是已用回复 @ 过的同一个人，且除追问、复述或抱怨已用素材外没有独立的新内容，replies 必须为空。</rule>",
+                "<rule>若是另一个人问到同一件事（例如也问你为什么不玩、要不要一起打），照常回答：事实和立场保持一致，但必须换一种说法，不得照抄已用的句子。</rule>",
             ])
         sections.append(
             '<reply_guard priority="final" enforcement="hard">\n'
