@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""定时推送：在配置的时间（每天或每周指定几天），向 SILENT_WHITELIST 里的群按顺序发送固定内容。
+"""定时推送：在配置的时间（每天或每周指定几天），向 SILENT_WHITELIST 里的群发送一条消息（从 messages 中随机选一条）。
 
 配置文件 data/scheduled_messages.json（修改后重启生效）：
     {
@@ -11,6 +11,7 @@
       ]
     }
 
+- messages：到点从中随机选一条发送（每个群各自随机）。
 - weekdays 可选：1=周一 … 7=周日；不配或为空表示每天发送。
 
 - prefixes 可选：每条消息发送时随机选一个前缀，拼成「前缀：消息」。
@@ -151,17 +152,15 @@ class ScheduledPusher:
                 self._push(at, group, messages)
 
     def _push(self, at: str, group: str, messages: list[str]) -> None:
-        _logger.info(f"[ScheduledPush] {at} 开始推送到 '{group}'，共 {len(messages)} 条")
-        for i, text in enumerate(messages):
-            if self.prefixes:
-                text = f"{random.choice(self.prefixes)}：{text}"
-            if self.mention_all:
-                text = f"@所有人 {text}"
-            if not self._send_with_retry(group, text):
-                _logger.error(f"[ScheduledPush] {at} 推送到 '{group}' 失败，放弃剩余 {len(messages) - i} 条")
-                return
-            if i < len(messages) - 1:
-                self.sleep(random.uniform(2, 5))
+        text = random.choice(messages)
+        _logger.info(f"[ScheduledPush] {at} 开始推送到 '{group}'（从 {len(messages)} 条中随机选 1 条）")
+        if self.prefixes:
+            text = f"{random.choice(self.prefixes)}：{text}"
+        if self.mention_all:
+            text = f"@所有人 {text}"
+        if not self._send_with_retry(group, text):
+            _logger.error(f"[ScheduledPush] {at} 推送到 '{group}' 失败")
+            return
         _logger.info(f"[ScheduledPush] {at} 推送到 '{group}' 完成")
 
     def _send_with_retry(self, group: str, text: str) -> bool:

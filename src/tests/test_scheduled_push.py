@@ -59,19 +59,30 @@ def test_due_only_on_configured_weekdays():
     assert due_schedules(schedules, datetime(2026, 11, 8, 8, 0)) == []  # 周日
 
 
-def test_sends_all_messages_in_order_once_per_day(tmp_path):
+def test_sends_one_random_message_once_per_day(tmp_path):
     send = Mock(return_value=ActionResult(success=True))
     pusher = _pusher(tmp_path, [{"time": "08:00", "messages": ["a", "b"]}], send=send, groups=["群1", "群2"])
     pusher.run_due(datetime(2026, 11, 3, 8, 0))
     pusher.run_due(datetime(2026, 11, 3, 8, 5))
-    assert [c.args for c in send.call_args_list] == [("群1", "a"), ("群1", "b"), ("群2", "a"), ("群2", "b")]
+    calls = [c.args for c in send.call_args_list]
+    assert [g for g, _ in calls] == ["群1", "群2"]
+    assert all(t in ("a", "b") for _, t in calls)
 
     # 重启后读取发送记录，不重复发送；第二天照常发送
     restarted = _pusher(tmp_path, [{"time": "08:00", "messages": ["a", "b"]}], send=send, groups=["群1", "群2"])
     restarted.run_due(datetime(2026, 11, 3, 8, 6))
-    assert send.call_count == 4
+    assert send.call_count == 2
     restarted.run_due(datetime(2026, 11, 4, 8, 0))
-    assert send.call_count == 8
+    assert send.call_count == 4
+
+
+def test_random_pick_covers_all_messages(tmp_path):
+    send = Mock(return_value=ActionResult(success=True))
+    pusher = _pusher(tmp_path, [{"time": "08:00", "messages": ["a", "b", "c"]}], send=send)
+    for day in range(1, 31):
+        pusher.run_due(datetime(2026, 12, day, 8, 0))
+    assert send.call_count == 30
+    assert {c.args[1] for c in send.call_args_list} == {"a", "b", "c"}
 
 
 def test_prefixes_prepended_to_each_message(tmp_path):
@@ -84,8 +95,9 @@ def test_prefixes_prepended_to_each_message(tmp_path):
     assert pusher.prefixes == ["P1", "P2"]
     pusher.run_due(datetime(2026, 11, 3, 8, 0))
     texts = [c.args[1] for c in send.call_args_list]
-    assert [t.split("：", 1)[1] for t in texts] == ["a", "b"]
-    assert all(t.split("：", 1)[0] in ("P1", "P2") for t in texts)
+    assert len(texts) == 1
+    assert texts[0].split("：", 1)[1] in ("a", "b")
+    assert texts[0].split("：", 1)[0] in ("P1", "P2")
 
 
 def test_mention_all_goes_before_prefix(tmp_path):
@@ -102,7 +114,7 @@ def test_send_failure_retries_twice_then_gives_up(tmp_path):
     send = Mock(return_value=ActionResult(success=False, error="x"))
     pusher = _pusher(tmp_path, [{"time": "08:00", "messages": ["a", "b"]}], send=send)
     pusher.run_due(datetime(2026, 11, 3, 8, 0))
-    assert send.call_count == 3  # 首次 + 重试 2 次，"b" 不再发送
+    assert send.call_count == 3  # 首次 + 重试 2 次
     pusher.run_due(datetime(2026, 11, 3, 8, 1))
     assert send.call_count == 3  # 当天已放弃，不再尝试
 
