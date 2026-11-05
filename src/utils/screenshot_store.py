@@ -3,6 +3,7 @@
 原位于 src/session/global_store.py，拆分出来避免 GlobalStore 职责过重。
 """
 
+import hashlib
 import logging
 import shutil
 import time
@@ -32,15 +33,22 @@ class ScreenshotStore:
         self._max_age_seconds = max_age_seconds
         self._cleanup_interval = cleanup_interval
         self._last_cleanup = 0.0
+        self._last_hash: Optional[str] = None
+        self._last_saved: Optional[Path] = None
 
     def save(self, image_path: str, session_id: Optional[str] = None) -> str:
-        """保存截图到目标目录并触发过期清理。"""
+        """保存截图到目标目录并触发过期清理。与上一张内容完全相同时不重复保存，返回上一张的路径。"""
+        with open(image_path, "rb") as f:
+            digest = hashlib.md5(f.read(), usedforsecurity=False).hexdigest()
+        if digest == self._last_hash and self._last_saved is not None and self._last_saved.exists():
+            return str(self._last_saved)
         if session_id is None:
             session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
         filename = f"wechat_{session_id}_{timestamp}.png"
         filepath = self._screenshots_dir / filename
         shutil.copy2(image_path, filepath)
+        self._last_hash, self._last_saved = digest, filepath
         self.cleanup_old_screenshots()
         return str(filepath)
 
