@@ -4,6 +4,7 @@
 import logging
 import json
 import os
+import random
 import re
 import threading
 import time
@@ -40,6 +41,63 @@ def _get_judge_worker():
 # ReAct 工具调用上限
 MAX_TOOL_CALLS = 10
 FINAL_RESPONSE_RESERVE_SECONDS = 3.0
+
+# emoji 冷却：最近 N 条自己发的消息里有 emoji，本次回复去掉句尾 emoji
+EMOJI_COOLDOWN = 3
+_EMOJI_CHARS = "\U0001F000-\U0001FAFF☀-➿⬀-⯿️‍"
+_EMOJI_RE = re.compile(f"[{_EMOJI_CHARS}]")
+_TRAILING_EMOJI_RE = re.compile(f"[\\s{_EMOJI_CHARS}]+$")
+
+
+def _apply_emoji_cooldown(replies: List[str], history: List[ChatMessage],
+                          cooldown: int = EMOJI_COOLDOWN) -> List[str]:
+    recent = [m.text or "" for m in history if m.sender_type == SenderType.SELF][-cooldown:]
+    result = []
+    for reply in replies:
+        if any(_EMOJI_RE.search(t) for t in recent):
+            stripped = _TRAILING_EMOJI_RE.sub("", reply)
+            if re.sub(r"@\S+", "", stripped).strip():
+                reply = stripped
+        result.append(reply)
+        recent = (recent + [reply])[-cooldown:]
+    return result
+
+
+# 群聊回复开头的「@昵称」：昵称未识别时一律去掉，其余按概率保留
+AT_KEEP_RATE = 0.25
+_UNKNOWN_SENDERS = {"未知", "未知昵称", "[未知]", "群成员昵称"}
+_LEADING_AT_RE = re.compile(r"^@(\S+)\s+")
+
+
+def _apply_at_policy(replies: List[str], keep_rate: float = AT_KEEP_RATE,
+                     rand: Callable[[], float] = random.random) -> List[str]:
+    result = []
+    for reply in replies:
+        m = _LEADING_AT_RE.match(reply)
+        if m and reply[m.end():].strip():
+            if m.group(1) in _UNKNOWN_SENDERS or rand() >= keep_rate:
+                reply = reply[m.end():]
+        result.append(reply)
+    return result
+
+
+# 开头「哈哈」「嘿嘿」冷却：最近 N 条自己发的消息里有以它开头的，本次回复去掉开头的笑声
+LAUGH_COOLDOWN = 3
+_LAUGH_OPENER_RE = re.compile(r"^((?:@\S+\s+)?)(?:哈哈+|嘿嘿+)[\s，,。.!！]*")
+
+
+def _apply_laugh_cooldown(replies: List[str], history: List[ChatMessage],
+                          cooldown: int = LAUGH_COOLDOWN) -> List[str]:
+    recent = [m.text or "" for m in history if m.sender_type == SenderType.SELF][-cooldown:]
+    result = []
+    for reply in replies:
+        if any(_LAUGH_OPENER_RE.match(t) for t in recent):
+            stripped = _LAUGH_OPENER_RE.sub(r"\1", reply, count=1)
+            if re.sub(r"@\S+", "", stripped).strip():
+                reply = stripped
+        result.append(reply)
+        recent = (recent + [reply])[-cooldown:]
+    return result
 
 
 def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -948,6 +1006,10 @@ class ReplyGenerator:
                 final_messages = current_messages
 
         # 更新最终观测字段
+        replies = _apply_laugh_cooldown(replies, all_messages)
+        replies = _apply_emoji_cooldown(replies, all_messages)
+        if is_group:
+            replies = _apply_at_policy(replies)
         self.last_llm_messages = [dict(m) for m in final_messages]
         # last_raw_response 保留原始 generation 的 raw_response，self-refine 的原文单独存
         # 在 last_feedback_raw / last_iterate_raw 中
@@ -1406,11 +1468,11 @@ class ReplyGenerator:
         ]
         if consumed_self_items:
             guard_rules.extend([
-                "<rule>consumed_self_replies 是你已经发过的话，只用于排除素材，不用于模仿或延续。每条开头的「@昵称」是当时回复的对象。</rule>",
+                "<rule>consumed_self_replies 是你已经发过的话，只用于排除素材，不用于模仿或延续。开头有「@昵称」的，回复对象就是这个人；没有的，回复对象是序号在它之前、最近一条 @ 你或引用你的消息的发送者。</rule>",
                 "<rule>不得复用其中的句子、梗和包袱；候选回复只要依赖其中已用过的数字、人物标签、虚构关系、反差或包袱，就必须丢弃。</rule>",
                 "<rule>不得围绕已用素材新增动作、状态或场景；已用素材不能成为回复的主语、宾语、修饰对象、背景或隐含前提。</rule>",
                 "<rule>即使 unread 再次引用这些内容，也不得 callback；宁可字面回应、换全新角度或不回复。</rule>",
-                "<rule>若 unread 的发送者就是已用回复 @ 过的同一个人，且除追问、复述或抱怨已用素材外没有独立的新内容，replies 必须为空。</rule>",
+                "<rule>若 unread 的发送者就是某条已用回复的回复对象，且除追问、复述或抱怨已用素材外没有独立的新内容，replies 必须为空。</rule>",
                 "<rule>若是另一个人问到同一件事（例如也问你为什么不玩、要不要一起打），照常回答：事实和立场保持一致，但必须换一种说法，不得照抄已用的句子。</rule>",
             ])
         sections.append(
