@@ -81,6 +81,54 @@ def _apply_at_policy(replies: List[str], keep_rate: float = AT_KEEP_RATE,
     return result
 
 
+# 接话轮数：被 @ 或引用后随机给 2～4 轮不带 @ 的接话额度，每接一次减 1，30 分钟没动静作废
+FOLLOWUP_ROUNDS = (2, 4)
+FOLLOWUP_TTL_SECONDS = 1800
+
+
+def _same_person(a: str, b: str) -> bool:
+    """截图识别的昵称可能差一个字（Mr乂朧月 / Mrㄨ朧月），按同一人算。"""
+    a, b = (a or "").replace(" ", ""), (b or "").replace(" ", "")
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    return len(a) == len(b) >= 3 and sum(x != y for x, y in zip(a, b)) <= 1
+
+
+class FollowupTracker:
+    def __init__(self, rounds: Tuple[int, int] = FOLLOWUP_ROUNDS, ttl: float = FOLLOWUP_TTL_SECONDS,
+                 randint: Callable[[int, int], int] = random.randint, now: Callable[[], float] = time.time):
+        self.rounds, self.ttl, self.randint, self.now = rounds, ttl, randint, now
+        self.threads: Dict[str, Dict[str, list]] = {}  # chat -> sender -> [remaining, updated_at]
+
+    def _find(self, chat: str, sender: str) -> Optional[str]:
+        return next((k for k in self.threads.get(chat, {}) if _same_person(k, sender)), None)
+
+    def candidates(self, chat: str) -> List[Tuple[str, int]]:
+        now = self.now()
+        return [(s, r) for s, (r, t) in self.threads.get(chat, {}).items() if r > 0 and now - t <= self.ttl]
+
+    def record(self, chat: str, unreplied: List[ChatMessage], replies: List[str]) -> None:
+        senders = {m.sender for m in unreplied if m.sender_type == SenderType.OTHER}
+        for reply in replies:
+            m = _LEADING_AT_RE.match(reply)
+            target = m.group(1) if m else (next(iter(senders)) if len(senders) == 1 else None)
+            if not target or target in _UNKNOWN_SENDERS:
+                continue
+            msgs = [u for u in unreplied if _same_person(u.sender, target)]
+            if not msgs:
+                continue
+            chat_threads = self.threads.setdefault(chat, {})
+            key = self._find(chat, target)
+            if any("@" in (u.text or "") or getattr(u, "quoted_text", "") for u in msgs):
+                if key:
+                    del chat_threads[key]
+                chat_threads[target] = [self.randint(*self.rounds), self.now()]
+            elif key and chat_threads[key][0] > 0:
+                chat_threads[key] = [chat_threads[key][0] - 1, self.now()]
+
+
 # 开头「哈哈」「嘿嘿」冷却：最近 N 条自己发的消息里有以它开头的，本次回复去掉开头的笑声
 LAUGH_COOLDOWN = 3
 _LAUGH_OPENER_RE = re.compile(r"^((?:@\S+\s+)?)(?:哈哈+|嘿嘿+)[\s，,。.!！]*")
@@ -176,6 +224,7 @@ class ReplyGenerator:
         self.enable_reply_restraint = enable_reply_restraint
         self.enable_unread_dedup = enable_unread_dedup
         self.enable_timestamps = enable_timestamps
+        self.followup = FollowupTracker()
         project_root = Path(__file__).parent.parent.parent
         few_shot_path = Path(os.environ.get(
             "PERSONA_FEW_SHOT_PATH",
@@ -1009,6 +1058,7 @@ class ReplyGenerator:
         replies = _apply_laugh_cooldown(replies, all_messages)
         replies = _apply_emoji_cooldown(replies, all_messages)
         if is_group:
+            self.followup.record(chat_name, unreplied, replies)
             replies = _apply_at_policy(replies)
         self.last_llm_messages = [dict(m) for m in final_messages]
         # last_raw_response 保留原始 generation 的 raw_response，self-refine 的原文单独存
@@ -1454,6 +1504,14 @@ class ReplyGenerator:
             unread_items.append(self._message_element(m, i, enable_timestamps, already_handled))
         sections.append("<unread>\n" + "\n".join(unread_items) + "\n</unread>")
 
+        if is_group:
+            followup_items = [
+                f'<candidate sender="{xml_escape(s, quote=True)}" remaining_rounds="{r}"/>'
+                for s, r in self.followup.candidates(chat_name)
+            ]
+            if followup_items:
+                sections.append("<followup_candidates>\n" + "\n".join(followup_items) + "\n</followup_candidates>")
+
         if consumed_self_items:
             sections.append(
                 '<consumed_self_replies reuse="forbidden">\n'
@@ -1468,7 +1526,7 @@ class ReplyGenerator:
         ]
         if consumed_self_items:
             guard_rules.extend([
-                "<rule>consumed_self_replies 是你已经发过的话，只用于排除素材，不用于模仿或延续。开头有「@昵称」的，回复对象就是这个人；没有的，回复对象是序号在它之前、最近一条 @ 你或引用你的消息的发送者。</rule>",
+                "<rule>consumed_self_replies 是你已经发过的话，只用于排除素材，不用于模仿或延续。开头有「@昵称」的，回复对象就是这个人；没有的，回复对象是序号在它之前、最近一条你回应过的消息（@ 你、引用你或接你话）的发送者。</rule>",
                 "<rule>不得复用其中的句子、梗和包袱；候选回复只要依赖其中已用过的数字、人物标签、虚构关系、反差或包袱，就必须丢弃。</rule>",
                 "<rule>不得围绕已用素材新增动作、状态或场景；已用素材不能成为回复的主语、宾语、修饰对象、背景或隐含前提。</rule>",
                 "<rule>即使 unread 再次引用这些内容，也不得 callback；宁可字面回应、换全新角度或不回复。</rule>",
