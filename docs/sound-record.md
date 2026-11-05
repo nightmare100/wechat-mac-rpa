@@ -95,16 +95,55 @@ ffmpeg -hide_banner -f lavfi -i anullsrc -t 0.05 -f audiotoolbox -list_devices t
 6. 再等约 0.3 秒，松开 Option → 发送
 7. 切回默认输入 → MacBook Pro Microphone（无论成功失败都要执行）
 
-未验证：
-- 微信是否跟随系统默认输入设备，还是在自己的设置里单独选麦克风；
-- 程序模拟的按住 Option 能否触发录音；
-- 按下 Option 到真正开始录音之间的延迟，会不会吞掉开头。
+手动验证（2026-11-05，在「文件传输助手」里发给自己）：✅ 链路打通
+
+- 已安装 BlackHole 2ch 和 SwitchAudioSource（`/usr/local/bin/SwitchAudioSource`）。
+- **回环**：用 ffmpeg 播放到 BlackHole（`-f audiotoolbox -audio_device_index 1`），再从 BlackHole 录回（`-f avfoundation -i ":1"`）。录回的峰值和原文件一致（都是 -6.1 dB），声音原样传过去了。
+- **微信录音**：把系统默认输入切到 BlackHole，**人手按住 Option**；1.5 秒后播放 2.7 秒的合成语音，播完再等 0.5 秒松开。语音条成功发出，手机上播放正常、内容完整、没有杂音。
+- **结论**：
+  - 微信用的是**系统默认输入设备**，切换系统默认输入就能生效。
+  - 按下 Option 后等 1.5 秒再播放，开头不会被吞。
+- 测试脚本用提示音告诉操作者按住或松开 Option，退出时一定会切回原来的输入设备。
+
+ffmpeg 的设备序号（本机，2026-11-05）：
+- audiotoolbox 输出：`[1] BlackHole 2ch`；
+- avfoundation 输入：`[1] BlackHole 2ch`。
+- 新增或拔出音频设备后，序号可能会变，接入代码时应按设备名查找序号。
+
+自动化验证（2026-11-05）：✅ 程序按键可以触发录音
+
+- **必须是右 Option**。人工测试时也是只有右 Option 有效。
+  - AppleScript 的 `tell application "System Events" to key down option` 按的是**左 Option**，微信不响应，语音没有发出。
+- **可行做法**：用 Quartz 发 `flagsChanged` 事件。
+  - 按下：键码 61（右 Option），flags = `kCGEventFlagMaskAlternate | 0x40`（右 Alt 的设备位）。
+  - 松开：flags = 0。
+  - 事件发到 `kCGHIDEventTap`。
+
+  ```python
+  import Quartz as Q
+  ev = Q.CGEventCreateKeyboardEvent(None, 61, down)
+  Q.CGEventSetType(ev, Q.kCGEventFlagsChanged)
+  Q.CGEventSetFlags(ev, (Q.kCGEventFlagMaskAlternate | 0x40) if down else 0)
+  Q.CGEventPost(Q.kCGHIDEventTap, ev)
+  ```
+
+- **完整时序**（已跑通，语音条成功发出）：
+  1. `tell application "WeChat" to activate`，等 1 秒；
+  2. 输入切到 BlackHole；
+  3. 按下右 Option；
+  4. 等 1.5 秒；
+  5. ffmpeg 播放到 BlackHole；
+  6. 等 0.5 秒；
+  7. 松开右 Option；
+  8. 切回原输入。
+- **收尾一定要执行**：无论成功或失败，都要「松开右 Option + 切回原输入」（脚本里用 `trap ... EXIT` 保证）。否则 Option 会一直处于按下状态，麦克风也一直停在 BlackHole 上。
+- 前提：运行 bot 的终端需要有「辅助功能」权限。bot 现有的按键操作本来就依赖这个权限。
 
 ### 本机环境现状（2026-11-04）
 
 - `ffmpeg`：已安装（`/usr/local/bin/ffmpeg`），可用于格式转换。
-- `BlackHole`：未安装（`brew install --cask blackhole-2ch`，需要管理员密码）。
-- `SwitchAudioSource`：未安装（`brew install switchaudio-osx`），用于命令行切换输入设备。
+- `BlackHole`：2026-11-05 已安装（`brew install --cask blackhole-2ch`，需要管理员密码）。
+- `SwitchAudioSource`：2026-11-05 已安装（`brew install switchaudio-osx`），用于命令行切换输入设备。
 - 已有的虚拟声卡：Apowersoft Audio Device、Omi Recorder Audio Driver。能否作为回环使用未验证，建议仍用 BlackHole。
 - 当前默认输入：MacBook Pro Microphone。
 
@@ -161,12 +200,12 @@ ffmpeg -hide_banner -f lavfi -i anullsrc -t 0.05 -f audiotoolbox -list_devices t
   - MiniMax：`speed`、`pitch`、`vol`。
   - 这些参数对复刻的声音是否同样有效，文档没写。
 
-### 初步结论
+### 初步结论（实测后已选定 qwen-audio-3.1-tts-plus，见下文「实测结果」）
 
 - **候选**：`qwen-audio-3.1-tts-plus` 和 `cosyvoice-v3.5-plus`。两者都是各自系列的最新版，复刻的声音都支持情绪指令。
 - **排除**：cosyvoice-v3-plus（复刻的声音不能控制情绪）、Realtime 系列（用不上）。
 - **备选**：MiniMax，因为有 9.9 元解锁费。
-- **需要确认**：项目里百炼 API key 所在的地域。cosyvoice-v3.5 只有北京地域有。
+- **地域**：已确认项目的百炼地址是北京地域（`cn-beijing`）。
 
 ### 尚未确认
 
@@ -174,12 +213,35 @@ ffmpeg -hide_banner -f lavfi -i anullsrc -t 0.05 -f audiotoolbox -list_devices t
 - 音质、情绪表现是否自然，以及 plus 和 flash 差多少：文档没有对比，需要实际听。
 - 合成延迟：文档未提。
 
-### 下一步建议
+### 实测结果（2026-11-05）
 
-1. 录一段约 15 秒的样本：安静房间、平时说话的语气、完整的句子。
-2. 用这段录音，在两个候选模型上各复刻一次（免费）。
-3. 每个模型用同一句群聊常见回复（如「别闹啦」），分别配「正常 / 开心 / 撒娇」三种语气生成，共 6 段，对比试听后再定模型。
-4. 接入 bot 时，由回复模型同时输出这句话的语气，作为 TTS 的 `instruction`。
+**选定：`qwen-audio-3.1-tts-plus`**。两个模型的效果都不错，用户更喜欢 qwen 的声音。
+
+- **录音样本**：iPhone 语音备忘录录制，m4a（AAC），单声道，44.1 kHz，17.4 秒，停顿都小于 1 秒，峰值 -4 dB。用 ffmpeg 转成 24 kHz 单声道 16-bit WAV 后上传。
+- **复刻出的声音**（两个都已在百炼后台创建，状态 `OK`，长期有效）：
+
+| 模型 | voice_id | 用途 |
+|---|---|---|
+| qwen-audio-3.1-tts-plus | `qwen-audio-3.1-tts-plus-nannan-4d9b8cad77e74df6903490a146e2e6ae` | **正式使用**，已写入 `.env`：`TTS_MODEL`、`TTS_VOICE_ID` |
+| cosyvoice-v3.5-plus | `cosyvoice-v3.5-plus-nannan-c68b27b18e254cf6a47b6819998a63a8` | 对比用，暂时保留 |
+
+- **测试内容**：3 句话（「别闹啦」「好哒 收到」「周活动快结束啦，记得去兑换奖励哦」），每句配 3 种语气（不加指令 / 「语气开心、轻快」/「撒娇的语气，声音软软的」），两个模型共 18 段，全部成功。
+- **合成耗时**：非流式 HTTP，每段 1～2 秒（含下载）。
+- **计费单位**：qwen-audio-3.1-tts-plus 的 usage 同时返回 token 和字符数（文档说明 plus 按字符计费）；cosyvoice 按字符计费。本次总量不到 200 字。
+
+### 调用要点（实测可用）
+
+- **地址**：用项目现有的业务空间地址，把 `DASHSCOPE_BASE_URL` 末尾的 `/compatible-mode/v1` 换成 `/api/v1/services/audio/tts/...`；鉴权用现有的 `DASHSCOPE_API_KEY`。
+  - 复刻：`POST .../customization`，body 为 `{"model":"voice-enrollment","input":{"action":"create_voice","target_model":...,"prefix":"nannan","audio":"data:audio/wav;base64,...","language_hints":["zh"]}}`，从 `output.voice_id` 取 ID。之后用 `query_voice` 轮询，直到 `status` 为 `OK`。
+  - 合成：`POST .../SpeechSynthesizer`，body 为 `{"model":"qwen-audio-3.1-tts-plus","input":{"text":...,"voice":<voice_id>,"format":"wav","sample_rate":24000,"instruction":"语气开心、轻快"}}`。`instruction` 放在 `input` 里，可以不传。
+- **下载音频**：返回的是 `output.audio.url`（OSS 签名链接，24 小时有效）。**下载时不能带 Authorization 头**，否则 OSS 会返回 `SignatureDoesNotMatch` 的 XML 报错。
+- **代理**：请求不走本地代理，与项目现有百炼客户端的处理方式一致。
+
+### 下一步
+
+1. 打通微信发语音的链路（方案 A：BlackHole 回环 + 模拟按住 Option 录音）。
+2. 确定什么时候发语音、发什么内容。
+3. 接入 bot：回复模型同时输出这句话的语气，作为 TTS 的 `instruction`。
 
 ## 建议推进步骤
 
