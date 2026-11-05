@@ -115,6 +115,72 @@ ffmpeg -hide_banner -f lavfi -i anullsrc -t 0.05 -f audiotoolbox -list_devices t
 - **按键触发未验证**：程序模拟的"按住 Option"能否被微信识别需实测；不行就改为鼠标点击麦克风按钮。
 - **麦克风权限**：需确认微信已在系统设置中获得麦克风权限。
 
+## TTS 选型：百炼声音复刻（自定义声音）
+
+> 调研日期：2026-11-05。来源为百炼官方文档，见文末参考。仅查阅文档，未实测。
+
+### 支持声音复刻的模型
+
+| 系列 | 模型 | 地域 |
+|---|---|---|
+| Qwen-Audio-TTS | qwen-audio-3.1-tts-plus / flash、qwen-audio-3.0-tts-plus / flash | 北京、新加坡 |
+| Qwen-Audio-Realtime | qwen-audio-3.1 / 3.0-realtime-plus / flash | 仅北京 |
+| CosyVoice | cosyvoice-v3.5-plus / flash、cosyvoice-v3-plus / flash、cosyvoice-v2 | 北京全部；新加坡仅 v3-plus / v3-flash |
+| MiniMax | speech-2.8-hd / turbo、speech-02-hd / turbo | 仅北京 |
+
+- Realtime 系列用于实时语音对话。本项目是「先生成音频文件，再播放进微信」，用不上实时对话，因此不考虑。
+
+### 复刻规则
+
+- **费用**：
+  - Qwen-Audio 与 CosyVoice：创建音色免费；合成时按目标模型计费。
+  - MiniMax：复刻本身不收费；首次用复刻的声音合成时收 9.9 元解锁费，无免费额度。
+- **复刻的声音绑定模型**：创建时要指定 `target_model`，之后只能在这个模型上用，不能跨模型。对比两个模型时，需用同一段录音各复刻一次。
+- **有效期与数量**：默认长期有效；每个账号最多 1000 个，与「声音设计」共用这个额度。
+- **流程**：
+  1. 用 `voice-enrollment` 的 `create_voice` 传入参考音频（URL 或 Base64）和 `target_model`，拿到 voice_id。
+  2. 用 `query_voice` 轮询，直到状态为 `OK`。
+  3. 合成时 `voice` 填 voice_id，模型填同一个 `target_model`。
+- **录音要求**（Qwen-Audio / CosyVoice）：
+  - 格式与规格：WAV（16-bit）、MP3 或 M4A；10～20 秒为宜，最长 60 秒；≤ 10 MB；采样率 ≥ 16 kHz。
+  - 内容：至少 5 秒连续清晰的说话，停顿 ≤ 2 秒；不要背景音乐、杂音、其他人声，不要唱歌。
+- **替代方案**：「声音设计」用一段文字描述来生成声音，不需要录音。
+
+### 复刻的声音能否控制情绪、语调
+
+| 模型 | 复刻的声音能否带情绪 | 控制方式 |
+|---|---|---|
+| qwen-audio-3.1 / 3.0-tts-plus / flash | ✅ 文档原文：「系统音色、复刻音色和设计音色均支持在合成请求中通过 `instruction` 设置自然语言指令」 | ① `instruction` 参数，用自然语言描述，例如「开心、撒娇的语气」；② 在文本里直接写标签，如 `[excited]` `[sad]` `[whispers]` `[very slowly]` `[laughing]` `[sighing]`。标签对复刻的声音有没有限制，文档没写 |
+| cosyvoice-v3.5-plus / flash | ✅ 这两个模型没有系统音色，指令控制就是给复刻 / 设计音色用的 | `instruction` 参数，用自然语言描述；最多 100 个字符，汉字算 2 个字符 |
+| cosyvoice-v3-flash | ✅ 复刻的声音支持自然语言指令 | 同上 |
+| cosyvoice-v3-plus | ❌ 文档原文：「复刻音色、设计音色不支持指令控制」 | — |
+| MiniMax speech-2.8 | 文档没说复刻的声音能不能用 | `voice_setting.emotion`：happy / sad / angry / fearful / disgusted / surprised / calm；speech-2.8 系列不支持 whisper。不指定时，模型会按文本自动匹配情绪 |
+
+- 各模型都有语速、音调、音量参数：
+  - Qwen-Audio / CosyVoice：`rate` 0.5～2.0、`pitch` 0.5～2.0、`volume` 0～100。
+  - MiniMax：`speed`、`pitch`、`vol`。
+  - 这些参数对复刻的声音是否同样有效，文档没写。
+
+### 初步结论
+
+- **候选**：`qwen-audio-3.1-tts-plus` 和 `cosyvoice-v3.5-plus`。两者都是各自系列的最新版，复刻的声音都支持情绪指令。
+- **排除**：cosyvoice-v3-plus（复刻的声音不能控制情绪）、Realtime 系列（用不上）。
+- **备选**：MiniMax，因为有 9.9 元解锁费。
+- **需要确认**：项目里百炼 API key 所在的地域。cosyvoice-v3.5 只有北京地域有。
+
+### 尚未确认
+
+- 合成单价：计费页没读到这几个模型的价格。
+- 音质、情绪表现是否自然，以及 plus 和 flash 差多少：文档没有对比，需要实际听。
+- 合成延迟：文档未提。
+
+### 下一步建议
+
+1. 录一段约 15 秒的样本：安静房间、平时说话的语气、完整的句子。
+2. 用这段录音，在两个候选模型上各复刻一次（免费）。
+3. 每个模型用同一句群聊常见回复（如「别闹啦」），分别配「正常 / 开心 / 撒娇」三种语气生成，共 6 段，对比试听后再定模型。
+4. 接入 bot 时，由回复模型同时输出这句话的语气，作为 TTS 的 `instruction`。
+
 ## 建议推进步骤
 
 1. **手动验证**：装好 BlackHole 后，在「文件传输助手」中按住 Option，用 `afplay` 播放一段 `say` 生成的语音，确认能发出可正常播放的语音条。
@@ -127,3 +193,10 @@ ffmpeg -hide_banner -f lavfi -i anullsrc -t 0.05 -f audiotoolbox -list_devices t
 
 - [IT之家：微信 4.1.9 for Mac 发布](https://www.ithome.com/0/942/316.htm)
 - [IT之家：PC 版微信 4.1.9 内测](https://www.ithome.com/0/939/485.htm)
+- [百炼：声音复刻使用指南](https://help.aliyun.com/zh/model-studio/voice-cloning-user-guide)
+- [百炼：语音合成指令控制（realtime-tts-user-guide）](https://help.aliyun.com/zh/model-studio/realtime-tts-user-guide)
+- [百炼：CosyVoice 客户端事件 / 参数](https://help.aliyun.com/zh/model-studio/cosyvoice-client-events)
+- [百炼：Qwen-Audio-TTS 客户端事件 / 参数](https://help.aliyun.com/zh/model-studio/qwen-audio-tts-client-events)
+- [百炼：MiniMax 同步语音合成 API](https://help.aliyun.com/zh/model-studio/minimax-synchronous-speech-synthesis-api)
+- [百炼：声音设计](https://help.aliyun.com/zh/model-studio/voice-design-user-guide)
+- [百炼：模型计费](https://help.aliyun.com/zh/model-studio/model-pricing)
