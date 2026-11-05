@@ -10,6 +10,20 @@ from src.utils.chat_utils import _normalize_chat_name
 
 _logger = logging.getLogger("src.chat_opener")
 
+# 本地 OCR 偶尔漏掉标题首字或尾字（如「弓箭2战神公会」读成「箭2战神公会」），
+# 群名至少这么长时，允许少开头或结尾 1 个字；中间的字必须完全一致，防止发到名字相近的群。
+FUZZY_MIN_LEN = 5
+
+
+def title_matches(ocr_title: str, chat_name: str) -> bool:
+    title = _normalize_chat_name(ocr_title)
+    target = _normalize_chat_name(chat_name)
+    if not title or not target:
+        return False
+    if title == target:
+        return True
+    return len(target) >= FUZZY_MIN_LEN and title in (target[1:], target[:-1])
+
 
 class ChatOpener:
     """⌘F 搜索 → 粘贴聊天名 → 回车 → OCR 读标题确认。标题对不上一律视为失败，宁可不发也不发错。"""
@@ -27,9 +41,8 @@ class ChatOpener:
         return [t for t in [layout.chat_name or ""] + [e.text for e in layout.title_elements] if t]
 
     def is_current(self, chat_name: str) -> bool:
-        target = _normalize_chat_name(chat_name)
         titles = self._titles()
-        matched = any(_normalize_chat_name(t) == target for t in titles)
+        matched = any(title_matches(t, chat_name) for t in titles)
         _logger.info(f"[ChatOpener] 标题校验 target='{chat_name}' titles={titles} matched={matched}")
         return matched
 
