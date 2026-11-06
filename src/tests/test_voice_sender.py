@@ -112,3 +112,17 @@ def test_too_long_rejected_before_touching_anything():
     run, keys = FakeRun(), []
     result = _sender(run, keys).send_wav(_wav(59))
     assert not result.success and keys == [] and run.calls == []
+
+
+def test_tune_params_and_style_appended():
+    body = build_tts_input("好", "撒娇", "v", rate=0.9, volume=60, style="尾音拖长一点")
+    assert body["rate"] == 0.9 and body["volume"] == 60
+    assert body["instruction"] == "撒娇的语气，声音软软的；尾音拖长一点"
+    assert build_tts_input("好", "平静", "v", style="慢一点")["instruction"] == "慢一点"
+    assert "rate" not in build_tts_input("好", "平静", "v")
+
+
+@pytest.mark.parametrize("kw", [{"rate": 2.5}, {"rate": 0.4}, {"volume": 101}])
+def test_tune_out_of_range_rejected(kw):
+    with pytest.raises(ValueError):
+        build_tts_input("好", "平静", "v", **kw)

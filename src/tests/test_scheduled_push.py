@@ -5,7 +5,7 @@ from datetime import datetime
 from unittest.mock import Mock
 
 from src.action.chat_opener import ChatOpener
-from src.bot.scheduled_push import ScheduledPusher, due_schedules, load_schedules
+from src.bot.scheduled_push import ScheduledPusher, due_schedules, load_schedules, load_voice_plans
 from src.models.base import ActionResult
 
 
@@ -155,3 +155,71 @@ def test_opener_fails_when_title_mismatch(monkeypatch):
     opener, automation = _opener(["其他群", "人格测试二群"])
     assert opener.open("人格测试") is False
     automation.send_keys.assert_called_with("key code 53")
+
+
+# ---- 语音 ----
+
+def _voice_pusher(tmp_path, cfg, open_chat=None, send=None, send_voice=None, groups=("群",)):
+    path = tmp_path / "scheduled_messages.json"
+    path.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+    return ScheduledPusher(list(groups), open_chat or Mock(return_value=True),
+                           send or Mock(return_value=ActionResult(success=True)),
+                           config_path=path, state_path=tmp_path / "state.json", sleep=Mock(),
+                           send_voice=send_voice or Mock(return_value=ActionResult(success=True)))
+
+
+def test_voice_lines_parsed_and_invalid_skipped(tmp_path):
+    path = tmp_path / "c.json"
+    path.write_text(json.dumps({"voice_probability": 0.3, "schedules": [
+        {"time": "08:00", "messages": ["a"], "voice_messages": [
+            "纯文字", {"text": "开心", "mood": "开心", "rate": 1.1, "volume": 60, "style": "上扬"},
+            {"text": "坏心情", "mood": "暴躁"}, {"text": "太快", "rate": 3}, {"mood": "开心"}]},
+        {"time": "09:00", "messages": ["b"], "voice_messages": ["x"], "voice_probability": 0},
+        {"time": "10:00", "messages": ["c"]},
+        {"time": "11:00", "weekdays": [5], "messages": ["d"], "voice_messages": ["y"], "voice_probability": 1},
+    ]}, ensure_ascii=False), encoding="utf-8")
+    plans = load_voice_plans(path)
+    assert plans == {
+        ("08:00", frozenset()): (0.3, [{"text": "纯文字", "mood": "平静"},
+                                       {"text": "开心", "mood": "开心", "rate": 1.1, "volume": 60, "style": "上扬"}]),
+        ("11:00", frozenset({5})): (1.0, [{"text": "y", "mood": "平静"}]),
+    }
+
+
+def test_voice_sent_after_text_when_probability_hits(tmp_path):
+    order = []
+    send = Mock(side_effect=lambda g, t: order.append("text") or ActionResult(success=True))
+    send_voice = Mock(side_effect=lambda line: order.append(line["text"]) or ActionResult(success=True))
+    _voice_pusher(tmp_path, {"schedules": [{"time": "08:00", "messages": ["a"], "voice_probability": 1,
+                                            "voice_messages": [{"text": "语音", "mood": "开心"}]}]},
+                  send=send, send_voice=send_voice).run_due(datetime(2026, 11, 3, 8, 0))
+    assert order == ["text", "语音"]
+    send_voice.assert_called_once_with({"text": "语音", "mood": "开心"})
+
+
+def test_no_voice_by_default_probability(tmp_path):
+    send_voice = Mock()
+    _voice_pusher(tmp_path, {"schedules": [{"time": "08:00", "messages": ["a"], "voice_messages": ["v"]}]},
+                  send_voice=send_voice).run_due(datetime(2026, 11, 3, 8, 0))
+    send_voice.assert_not_called()
+
+
+def test_no_voice_when_text_failed_or_reopen_failed(tmp_path):
+    cfg = {"voice_probability": 1, "schedules": [{"time": "08:00", "messages": ["a"], "voice_messages": ["v"]}]}
+    send_voice = Mock()
+    _voice_pusher(tmp_path, cfg, send=Mock(return_value=ActionResult(success=False, error="x")),
+                  send_voice=send_voice).run_due(datetime(2026, 11, 3, 8, 0))
+    send_voice.assert_not_called()
+
+    (tmp_path / "state.json").unlink()
+    _voice_pusher(tmp_path, cfg, open_chat=Mock(side_effect=[True, False]),
+                  send_voice=send_voice).run_due(datetime(2026, 11, 3, 8, 0))
+    send_voice.assert_not_called()  # 发语音前重新校验群失败
+
+
+def test_voice_failure_or_exception_does_not_break(tmp_path):
+    cfg = {"voice_probability": 1, "schedules": [{"time": "08:00", "messages": ["a"], "voice_messages": ["v"]}]}
+    send = Mock(return_value=ActionResult(success=True))
+    _voice_pusher(tmp_path, cfg, send=send, send_voice=Mock(side_effect=RuntimeError("boom")),
+                  groups=["群1", "群2"]).run_due(datetime(2026, 11, 3, 8, 0))
+    assert [c.args[0] for c in send.call_args_list] == ["群1", "群2"]

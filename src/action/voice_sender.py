@@ -48,14 +48,29 @@ RIGHT_OPTION_KEYCODE = 61
 _NX_DEVICERALTKEYMASK = 0x40  # 右 Alt 的设备位；微信只认右 Option
 
 
-def build_tts_input(text: str, mood: str, voice_id: str) -> dict:
-    """组装合成请求的 input：控制类标签加在文本开头，instruction 单独传。"""
+# 可调参数 → 取值范围（百炼 HTTP 接口文档）
+RANGES = {"rate": (0.5, 2.0), "volume": (0, 100)}
+
+
+def build_tts_input(
+    text: str, mood: str, voice_id: str,
+    rate: Optional[float] = None, volume: Optional[int] = None, style: Optional[str] = None,
+) -> dict:
+    """组装合成请求的 input：控制类标签加在文本开头，instruction = 心情语气 + style。"""
     if mood not in MOODS:
         raise ValueError(f"未知心情「{mood}」，可选：{'、'.join(MOODS)}")
     tag, instruction = MOODS[mood]
     body = {"text": f"{tag}{text}" if tag else text, "voice": voice_id, "format": "wav", "sample_rate": 24000}
+    instruction = "；".join(x for x in (instruction, style) if x)
     if instruction:
         body["instruction"] = instruction
+    for name, value in (("rate", rate), ("volume", volume)):
+        if value is None:
+            continue
+        lo, hi = RANGES[name]
+        if not lo <= value <= hi:
+            raise ValueError(f"{name} 取值范围 {lo}–{hi}，当前 {value}")
+        body[name] = value
     return body
 
 
@@ -108,12 +123,13 @@ class VoiceSender:
         self.http = http or httpx.Client(transport=httpx.HTTPTransport(proxy=None), timeout=60)
 
     # ---- 合成 ----
-    def synthesize(self, text: str, mood: str = DEFAULT_MOOD) -> bytes:
+    def synthesize(self, text: str, mood: str = DEFAULT_MOOD, **tune) -> bytes:
+        """tune：可选 rate / volume / style，见 build_tts_input。"""
         if not (self.api_key and self.model and self.voice_id):
             raise RuntimeError("缺少配置：DASHSCOPE_API_KEY / TTS_MODEL / TTS_VOICE_ID")
         r = self.http.post(
             self.tts_url,
-            json={"model": self.model, "input": build_tts_input(text, mood, self.voice_id)},
+            json={"model": self.model, "input": build_tts_input(text, mood, self.voice_id, **tune)},
             headers={"Authorization": f"Bearer {self.api_key}"},
         )
         if r.status_code != 200:
@@ -173,14 +189,15 @@ class VoiceSender:
                 self._set_input(original)
             Path(wav_path).unlink(missing_ok=True)
 
-    def send(self, text: str, mood: str = DEFAULT_MOOD) -> ActionResult:
+    def send(self, text: str, mood: str = DEFAULT_MOOD, **tune) -> ActionResult:
         try:
-            data = self.synthesize(text, mood)
+            data = self.synthesize(text, mood, **tune)
         except Exception as e:
             _logger.error("[VoiceSender] 合成失败: %s", e)
             return ActionResult(success=False, error=f"合成失败: {e}")
         result = self.send_wav(data)
         if result.success:
             result.sent_text = text
-        _logger.info("[VoiceSender] mood=%s text=%r success=%s error=%s", mood, text, result.success, result.error)
+        _logger.info("[VoiceSender] mood=%s tune=%s text=%r success=%s error=%s",
+                     mood, tune, text, result.success, result.error)
         return result

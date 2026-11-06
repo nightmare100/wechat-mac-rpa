@@ -20,6 +20,18 @@
   重启或中途异常都不会重复发送（宁可漏发，不重复发）。
 - 超过时间点 GRACE_MINUTES 分钟仍未发出（如 bot 未运行），当天跳过，不补发。
 - 打开群失败（标题校验不通过）则跳过该群，绝不发到其他会话。
+
+语音（可选）：文字发送成功后，按概率再补一条语音（每个群各自掷概率）。
+    "voice_probability": 0.3,                     # 顶层默认概率，不配为 0（不发语音）
+    {"time": "21:30", "messages": [...],
+     "voice_probability": 1.0,                    # 可选，覆盖顶层概率
+     "voice_messages": [                          # 到点随机选一句；不配则只发文字
+       {"text": "周活动快结束啦", "mood": "开心", "rate": 1.1, "volume": 60, "style": "尾音上扬"},
+       "只写文字也行（心情平静、语速 1.0）"
+     ]}
+- mood 见 src/action/voice_sender.py 的 MOODS；rate 0.5–2.0，volume 0–100，style 为补充语气描述。
+- 非法的语音条目启动时报错并跳过；语音失败只记日志，不重试，不影响已发出的文字。
+- 发语音前重新打开并校验群标题，校验不通过则不发语音。
 """
 
 import json
@@ -30,6 +42,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable
 
+from src.action.voice_sender import DEFAULT_MOOD, build_tts_input
 from src.models.base import ActionResult
 
 _logger = logging.getLogger("src.scheduled_push")
@@ -84,6 +97,48 @@ def load_schedules(path: Path = CONFIG_PATH) -> list[Schedule]:
     return schedules
 
 
+VoiceLine = dict  # {"text", "mood", 可选 "rate" / "volume" / "style"}
+VoicePlan = tuple[float, list[VoiceLine]]  # (概率, 语音候选)
+
+
+def _parse_voice_line(raw) -> VoiceLine:
+    """字符串或对象 → 语音条目；不合法抛 ValueError。"""
+    if isinstance(raw, str):
+        raw = {"text": raw}
+    if not isinstance(raw, dict) or not str(raw.get("text", "")).strip():
+        raise ValueError("缺少 text")
+    line = {"text": str(raw["text"]).strip(), "mood": raw.get("mood") or DEFAULT_MOOD}
+    for k in ("rate", "volume", "style"):
+        if raw.get(k) is not None:
+            line[k] = raw[k]
+    tune = {k: v for k, v in line.items() if k not in ("text", "mood")}
+    build_tts_input(line["text"], line["mood"], "", **tune)  # 校验心情和取值范围
+    return line
+
+
+def load_voice_plans(path: Path = CONFIG_PATH) -> dict[tuple[str, frozenset[int]], VoicePlan]:
+    """读取每个定时任务的语音配置，键为 (HH:MM, 星期几)。没有 voice_messages 或概率为 0 的不返回。"""
+    data = _read_config(path)
+    default_p = data.get("voice_probability", 0)
+    plans = {}
+    for item in data.get("schedules", []):
+        lines = []
+        for raw in item.get("voice_messages") or []:
+            try:
+                lines.append(_parse_voice_line(raw))
+            except (ValueError, TypeError) as e:
+                _logger.error(f"[ScheduledPush] 语音条目不合法，已跳过: {raw}: {e}")
+                print(f"❌ 定时推送语音条目不合法，已跳过: {raw}: {e}")
+        p = item.get("voice_probability", default_p)
+        if not isinstance(p, (int, float)) or not 0 <= p <= 1:
+            _logger.error(f"[ScheduledPush] voice_probability 需为 0～1，该条不发语音: {item.get('time')}")
+            print(f"❌ 定时推送 {item.get('time')} 的 voice_probability 需为 0～1，该条不发语音")
+            continue
+        if lines and p > 0:
+            plans[(str(item.get("time", "")).strip(), frozenset(item.get("weekdays") or []))] = (float(p), lines)
+    return plans
+
+
 def due_schedules(schedules: list[Schedule], now: datetime) -> list[Schedule]:
     """返回今天需要发送、且当前处于发送窗口 [时间点, 时间点 + GRACE_MINUTES] 内的条目。"""
     due = []
@@ -106,15 +161,18 @@ class ScheduledPusher:
         config_path: Path = CONFIG_PATH,
         state_path: Path = STATE_PATH,
         sleep: Callable[[float], None] = time.sleep,
+        send_voice: Callable[[VoiceLine], ActionResult] | None = None,
     ):
         self.groups = groups
         self.open_chat = open_chat
         self.send = send
         self.state_path = state_path
         self.sleep = sleep
+        self.send_voice = send_voice
         self.schedules = load_schedules(config_path)
         self.prefixes = load_prefixes(config_path) if self.schedules else []
         self.mention_all = bool(_read_config(config_path).get("mention_all")) if self.schedules else False
+        self.voice_plans = load_voice_plans(config_path) if self.schedules and send_voice else {}
         self.sent = self._load_state()
         if self.schedules:
             _logger.info(f"[ScheduledPush] 已加载 {len(self.schedules)} 个时间点，目标群: {groups}")
@@ -143,15 +201,15 @@ class ScheduledPusher:
             return
         now = now or datetime.now()
         day = now.strftime("%Y-%m-%d")
-        for at, messages, _ in due_schedules(self.schedules, now):
+        for at, messages, weekdays in due_schedules(self.schedules, now):
             for group in self.groups:
                 key = f"{at}|{group}"
                 if self.sent.get(key) == day:
                     continue
                 self._mark_sent(key, day)
-                self._push(at, group, messages)
+                self._push(at, group, messages, self.voice_plans.get((at, weekdays)))
 
-    def _push(self, at: str, group: str, messages: list[str]) -> None:
+    def _push(self, at: str, group: str, messages: list[str], voice: VoicePlan | None = None) -> None:
         text = random.choice(messages)
         _logger.info(f"[ScheduledPush] {at} 开始推送到 '{group}'（从 {len(messages)} 条中随机选 1 条）")
         if self.prefixes:
@@ -162,6 +220,22 @@ class ScheduledPusher:
             _logger.error(f"[ScheduledPush] {at} 推送到 '{group}' 失败")
             return
         _logger.info(f"[ScheduledPush] {at} 推送到 '{group}' 完成")
+        if voice and random.random() < voice[0]:
+            self._push_voice(at, group, random.choice(voice[1]))
+
+    def _push_voice(self, at: str, group: str, line: VoiceLine) -> None:
+        # 语音只能发到当前窗口：重新打开并校验群标题，不通过就不发
+        if not self.open_chat(group):
+            _logger.error(f"[ScheduledPush] {at} 语音：打开群失败 '{group}'，不发语音")
+            return
+        try:
+            result = self.send_voice(line)
+        except Exception as e:  # 语音是附加内容，任何异常都不影响主流程
+            result = ActionResult(success=False, error=str(e))
+        if result.success:
+            _logger.info(f"[ScheduledPush] {at} 语音推送到 '{group}' 完成: {line}")
+        else:
+            _logger.error(f"[ScheduledPush] {at} 语音推送到 '{group}' 失败: {result.error} | {line}")
 
     def _send_with_retry(self, group: str, text: str) -> bool:
         for attempt in range(SEND_RETRIES + 1):

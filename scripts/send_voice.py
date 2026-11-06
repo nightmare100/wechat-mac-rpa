@@ -4,6 +4,7 @@
 用法（在 wechat-mac-rpa 目录下）：
     .venv/bin/python scripts/send_voice.py "周活动快结束啦" --mood 开心
     .venv/bin/python scripts/send_voice.py "测试一下" --mood 撒娇 --dry-run   # 只合成并用扬声器播放，不发微信
+    .venv/bin/python scripts/send_voice.py "大宝，讨厌" --mood 撒娇 --rate 0.9 --style "尾音拖长一点"
     .venv/bin/python scripts/send_voice.py --list                            # 列出可选心情
 
 发送前请先在微信里打开目标聊天窗口；发送期间不要碰键盘鼠标。
@@ -27,13 +28,16 @@ if env_file.exists():
             k, v = line.split("=", 1)
             os.environ.setdefault(k.strip(), v.strip())
 
-from src.action.voice_sender import DEFAULT_MOOD, MOODS, VoiceSender, wav_seconds  # noqa: E402
+from src.action.voice_sender import DEFAULT_MOOD, MOODS, VoiceSender, build_tts_input, wav_seconds  # noqa: E402
 
 
 def main() -> int:
     p = argparse.ArgumentParser(description="在微信当前聊天窗口发送一条语音")
     p.add_argument("text", nargs="?", help="要说的话")
     p.add_argument("--mood", default=DEFAULT_MOOD, help=f"心情，默认{DEFAULT_MOOD}")
+    p.add_argument("--rate", type=float, help="语速 0.5–2.0，默认 1.0")
+    p.add_argument("--volume", type=int, help="音量 0–100，默认 50")
+    p.add_argument("--style", help="补充语气描述，接在心情语气后面，如「尾音拖长一点」")
     p.add_argument("--dry-run", action="store_true", help="只合成并用扬声器播放，不发微信")
     p.add_argument("--list", action="store_true", help="列出可选心情")
     args = p.parse_args()
@@ -47,9 +51,15 @@ def main() -> int:
     if args.mood not in MOODS:
         p.error(f"未知心情「{args.mood}」，可选：{'、'.join(MOODS)}")
 
+    tune = {k: v for k, v in (("rate", args.rate), ("volume", args.volume), ("style", args.style)) if v is not None}
+    try:
+        build_tts_input(args.text, args.mood, "", **tune)  # 先校验范围，不发请求
+    except ValueError as e:
+        p.error(str(e))
+
     sender = VoiceSender()
     if args.dry_run:
-        data = sender.synthesize(args.text, args.mood)
+        data = sender.synthesize(args.text, args.mood, **tune)
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             f.write(data)
         print(f"合成完成 {wav_seconds(data):.1f}s，扬声器播放中…")
@@ -57,7 +67,7 @@ def main() -> int:
         Path(f.name).unlink(missing_ok=True)
         return 0
 
-    result = sender.send(args.text, args.mood)
+    result = sender.send(args.text, args.mood, **tune)
     print("✅ 已发送" if result.success else f"❌ 发送失败：{result.error}")
     return 0 if result.success else 1
 

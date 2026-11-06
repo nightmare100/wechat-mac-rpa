@@ -95,6 +95,7 @@ class WeChatBot:
             groups=sorted(self.sender._silent_whitelist),
             open_chat=ChatOpener(self.perception).open,
             send=self.send_to_chat,
+            send_voice=self._send_voice_line,
         )
 
         # 动态注册 send_file 工具（需要 sender 实例）
@@ -954,6 +955,14 @@ class WeChatBot:
         self.logger.info(f"🔄 切换聊天: {target_name!r} (未读 {target_unread})")
         self.debug_logger.log_bot_decision(switch_target=target_name, switch_reason=f"未读 {target_unread}")
         return target_name
+
+    def _send_voice_line(self, line: dict) -> ActionResult:
+        """定时推送的语音：合成并发到微信当前窗口（调用方已打开并校验群）。"""
+        if getattr(self, "_voice_sender", None) is None:
+            from src.action.voice_sender import VoiceSender
+            self._voice_sender = VoiceSender()
+        tune = {k: v for k, v in line.items() if k not in ("text", "mood")}
+        return self._voice_sender.send(line["text"], line["mood"], **tune)
 
     def send_to_chat(self, chat_name: str, text: str) -> ActionResult:
         """外部系统调用此接口主动发消息到指定聊天。"""
