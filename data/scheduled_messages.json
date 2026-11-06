@@ -1,7 +1,7 @@
 {
   "_说明": "只有 schedules 里的条目会被执行。每条格式：{\"time\": \"HH:MM\", \"messages\": [\"候选一\", \"候选二\"]}，24 小时制，到点从 messages 里随机选一条，发到 .env 里 SILENT_WHITELIST 的每个群（每次只发一条）。weekdays 可选，指定星期几发送，如 \"weekdays\": [1, 3, 5]，1=周一 … 7=周日，不配则每天发送。超过时间点 10 分钟仍未发出则当天跳过。最后一个条目后面不能有逗号。修改后重启 bot 生效。prefixes 可选：每条消息发送时随机选一个前缀，拼成「前缀：消息」，删掉或留空则不加前缀。mention_all 为 true 时在最前面加「@所有人 」，即「@所有人 前缀：消息」，改为 false 则不加。语音（可选）：文字发送成功后按 voice_probability（0～1，顶层为默认值，每条可单独覆盖，不配为 0）的概率，从该条的 voice_messages 里随机选一句发语音；每句可写 {\"text\": \"…\", \"mood\": \"开心\", \"rate\": 1.1, \"volume\": 60, \"style\": \"尾音拖长一点\"}，只写文字也行（心情平静、语速 1.0）；mood 可选：平静、开心、撒娇、调皮、好奇、惊讶、难过、生气、疲惫、安慰、不情愿、悄悄话；rate 0.5～2.0，volume 0～100。没配 voice_messages 的只发文字。",
   "mention_all": true,
-  "voice_probability": 0.25,
+  "voice_probability": 0,
   "prefixes": [
     "『宵桜』囡囡播报",
     "『宵桜』囡囡提醒",
