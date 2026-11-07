@@ -649,7 +649,12 @@ class WeChatBot:
                                      decision.text, decision.mood, decision.style, decision.rate)
                 elif decision.send_voice:
                     voice_result = self._try_send_voice_reply(chat_name, decision)
-                    if voice_result.success:
+                    recording_started = getattr(getattr(self, "_voice_sender", None), "last_pressed", False) is True
+                    if not voice_result.success and recording_started:
+                        # 已按下右 Option：微信已把录到的部分发出，再补文字会重复
+                        self.logger.warning("[VoiceReply] 录音开始后失败，可能发出半截语音，不再补文字: %s",
+                                            voice_result.error)
+                    if voice_result.success or recording_started:
                         voiced = True
                         tagged = f"[语音] {decision.text}"
                         replies = [tagged]
@@ -1014,10 +1019,12 @@ class WeChatBot:
 
     def _try_send_voice_reply(self, chat_name: str, decision: VoiceDecision) -> ActionResult:
         """回复语音：静默白名单检查 → 校验当前窗口就是该群 → 合成并发送。任一步失败返回失败，由调用方改发文字。"""
+        if getattr(self, "_voice_sender", None) is not None:
+            self._voice_sender.last_pressed = False  # 清掉上一次的标记，避免本次早退时被误判为已开始录音
         if self.sender.silent_mode and not self.sender.in_silent_whitelist(chat_name):
             return ActionResult(success=False, error="静默模式非白名单，不发语音")
         try:
-            if not ChatOpener(self.perception).open(chat_name):
+            if not ChatOpener(self.perception).is_current(chat_name):  # 只读校验，不切换会话
                 return ActionResult(success=False, error="当前窗口校验失败")
             if getattr(self, "_voice_sender", None) is None:
                 from src.action.voice_sender import VoiceSender

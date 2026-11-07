@@ -342,7 +342,7 @@ class TestVoiceReply:
         db._get_conn.return_value = Mock()
         monkeypatch.setattr("src.badcase.case_db.get_db", lambda: db)
         self.opener = Mock()
-        self.opener.return_value.open.return_value = True
+        self.opener.return_value.is_current.return_value = True
         monkeypatch.setattr("src.bot.wechat_bot.ChatOpener", self.opener)
         bot = WeChatBot(PROFILE_WECHAT_MAC_1760X1280, llm_client=Mock(), perception=Mock())
         bot.debug_logger = Mock(current=None)
@@ -359,7 +359,7 @@ class TestVoiceReply:
         bot.voice_policy = Mock()
         bot.voice_policy.decide.return_value = VOICE_YES
         bot.voice_reply_config = VOICE_DEFAULTS.__class__(**{**VOICE_DEFAULTS.__dict__, "dry_run": False})
-        bot._voice_sender = Mock()
+        bot._voice_sender = Mock(last_pressed=False)
         bot._voice_sender.send.return_value = ActionResult(success=True)
         return bot
 
@@ -401,8 +401,9 @@ class TestVoiceReply:
         bot.voice_policy.record_sent.assert_called_once_with("测试群", False)
 
     def test_chat_check_failure_falls_back_to_text(self, bot, tmp_path):
-        self.opener.return_value.open.return_value = False
+        self.opener.return_value.is_current.return_value = False
         self._tick(bot, tmp_path)
+        self.opener.return_value.open.assert_not_called()  # 只读校验，绝不切换会话
         bot._voice_sender.send.assert_not_called()
         bot.sender.send.assert_called_once_with("@A 哼，算你有眼光", chat_name="测试群")
 
@@ -419,6 +420,24 @@ class TestVoiceReply:
         bot.sender.send.return_value = ActionResult(success=False, error="静默", skipped=True)
         self._tick(bot, tmp_path)
         bot._voice_sender.send.assert_not_called()
+
+    def test_failure_after_recording_started_skips_text_fallback(self, bot, tmp_path):
+        """已按下右 Option 后失败：微信已发出（半截）语音，不能再补文字。"""
+        def send(*args, **kwargs):  # 真实情况：send 过程中按下了右 Option 后播放失败
+            bot._voice_sender.last_pressed = True
+            return ActionResult(success=False, error="播放失败")
+        bot._voice_sender.send.side_effect = send
+        msg, _ = self._tick(bot, tmp_path)
+        bot.sender.send.assert_not_called()
+        bot.global_store.mark_replied.assert_called_once_with("测试群", msg, "[语音] 哼，算你有眼光")
+        bot.voice_policy.record_sent.assert_called_once_with("测试群", True)
+
+    def test_stale_pressed_flag_does_not_block_fallback(self, bot, tmp_path):
+        """上一次成功发送留下 last_pressed=True，本次在窗口校验就失败 → 仍要补文字。"""
+        bot._voice_sender.last_pressed = True
+        self.opener.return_value.is_current.return_value = False
+        self._tick(bot, tmp_path)
+        bot.sender.send.assert_called_once_with("@A 哼，算你有眼光", chat_name="测试群")
 
     def test_private_chat_skips_policy(self, bot, tmp_path):
         self._tick(bot, tmp_path, chat="Alice", is_group=False)
@@ -443,3 +462,4 @@ def test_disabled_config_no_prompt(monkeypatch, tmp_path):
     bot = WeChatBot(PROFILE_WECHAT_MAC_1760X1280, llm_client=Mock(), perception=Mock())
     assert bot.voice_policy is None and bot.voice_reply_config is None
     assert bot.generator.voice_prompt == ""
+

@@ -132,3 +132,22 @@ def test_seed_passed_and_range_checked():
     assert build_tts_input("好", "平静", "v", seed=123)["seed"] == 123
     with pytest.raises(ValueError):
         build_tts_input("好", "平静", "v", seed=70000)
+
+
+def test_last_pressed_flag():
+    run, keys = FakeRun(fail={"play"}), []
+    s = _sender(run, keys)
+    s.send_wav(_wav(2))
+    assert s.last_pressed is True
+    run, keys = FakeRun(fail={"switch"}), []
+    s = _sender(run, keys)
+    s.send_wav(_wav(2))
+    assert s.last_pressed is False
+
+
+def test_last_pressed_reset_when_synthesis_fails():
+    s = _sender(FakeRun(), [])
+    s.last_pressed = True
+    s.synthesize = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("tts down"))
+    assert not s.send("好").success
+    assert s.last_pressed is False

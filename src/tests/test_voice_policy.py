@@ -77,6 +77,8 @@ def test_mentions_stripped_before_count_and_speech():
     d = _policy(0.0).decide("群", "A", ["@张三 哼，算你有眼光"], PRAISE, NOON)
     assert d.send_voice and d.text == "哼，算你有眼光"
     assert strip_mentions("@所有人 早") == "早"
+    assert not is_speakable(strip_mentions("谢谢@张三你最好"))  # 句中 @ 不删，判为不可念
+    assert not _policy(0.0).decide("群", "A", ["谢谢@张三你最好"], PRAISE, NOON).send_voice
     assert speech_len("@张三 哼，好！") == 2
 
 

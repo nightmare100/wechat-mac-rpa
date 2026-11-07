@@ -24,11 +24,12 @@ VOICE_REPLY_CONFIG_PATH = PROJECT_ROOT / "data" / "voice_reply.json"
 SCENES = ("被夸感谢", "斗嘴调侃", "安慰", "要听语音")
 REQUEST_SCENE = "要听语音"
 
-_MENTION = re.compile(r"@[^\s ]+[\s ]?")
+_MENTION = re.compile(r"^(?:@[^\s\u2005]+[\s\u2005]+)+")  # 只去开头的 @某某（与 _apply_at_policy 一致）
 _UNSPEAKABLE = re.compile(
     r"https?://|www\.|[0-9０-９A-Za-zＡ-Ｚａ-ｚ]"
     r"|[\U0001F000-\U0001FAFF☀-➿️]"
     r"|\[[^\[\]]{1,4}\]"  # 微信文字表情 [捂脸]
+    r"|@"  # 句中残留的 @某某（开头的已去掉）
 )
 _NON_WORD = re.compile(r"[\W_]")
 

@@ -120,6 +120,8 @@ class VoiceSender:
         self.voice_id = os.environ.get("TTS_VOICE_ID", "")
         self.device = os.environ.get("VOICE_INPUT_DEVICE", "BlackHole 2ch")
         self.run, self.key, self.sleep = run, key, sleep
+        # 上一次 send_wav 是否已按下右 Option：按下后再失败，微信会把已录的部分发出去，调用方不能再补文字
+        self.last_pressed = False
         # 与项目现有百炼客户端一致：不走本地代理
         self.http = http or httpx.Client(transport=httpx.HTTPTransport(proxy=None), timeout=60)
 
@@ -152,6 +154,7 @@ class VoiceSender:
 
     def send_wav(self, data: bytes) -> ActionResult:
         """把 wav 作为语音条发到微信当前聊天窗口。"""
+        self.last_pressed = False
         seconds = wav_seconds(data)
         if seconds > MAX_SECONDS - PRE_ROLL - POST_ROLL:
             return ActionResult(success=False, error=f"语音 {seconds:.1f}s 太长，微信单条上限 60s")
@@ -171,7 +174,7 @@ class VoiceSender:
             if not self._set_input(self.device):
                 return ActionResult(success=False, error=f"切换输入设备到「{self.device}」失败")
             self.key(True)
-            pressed = True
+            pressed = self.last_pressed = True
             self.sleep(PRE_ROLL)
             play = self.run(
                 ["ffmpeg", "-hide_banner", "-loglevel", "error", "-re", "-i", wav_path,
@@ -191,6 +194,7 @@ class VoiceSender:
             Path(wav_path).unlink(missing_ok=True)
 
     def send(self, text: str, mood: str = DEFAULT_MOOD, **tune) -> ActionResult:
+        self.last_pressed = False
         try:
             data = self.synthesize(text, mood, **tune)
         except Exception as e:
