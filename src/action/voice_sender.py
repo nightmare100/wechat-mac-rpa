@@ -49,12 +49,13 @@ _NX_DEVICERALTKEYMASK = 0x40  # 右 Alt 的设备位；微信只认右 Option
 
 
 # 可调参数 → 取值范围（百炼 HTTP 接口文档）
-RANGES = {"rate": (0.5, 2.0), "volume": (0, 100)}
+RANGES = {"rate": (0.5, 2.0), "volume": (0, 100), "seed": (0, 65535)}
 
 
 def build_tts_input(
     text: str, mood: str, voice_id: str,
     rate: Optional[float] = None, volume: Optional[int] = None, style: Optional[str] = None,
+    seed: Optional[int] = None,
 ) -> dict:
     """组装合成请求的 input：控制类标签加在文本开头，instruction = 心情语气 + style。"""
     if mood not in MOODS:
@@ -64,7 +65,7 @@ def build_tts_input(
     instruction = "；".join(x for x in (instruction, style) if x)
     if instruction:
         body["instruction"] = instruction
-    for name, value in (("rate", rate), ("volume", volume)):
+    for name, value in (("rate", rate), ("volume", volume), ("seed", seed)):
         if value is None:
             continue
         lo, hi = RANGES[name]
@@ -124,7 +125,7 @@ class VoiceSender:
 
     # ---- 合成 ----
     def synthesize(self, text: str, mood: str = DEFAULT_MOOD, **tune) -> bytes:
-        """tune：可选 rate / volume / style，见 build_tts_input。"""
+        """tune：可选 rate / volume / style / seed，见 build_tts_input。"""
         if not (self.api_key and self.model and self.voice_id):
             raise RuntimeError("缺少配置：DASHSCOPE_API_KEY / TTS_MODEL / TTS_VOICE_ID")
         r = self.http.post(

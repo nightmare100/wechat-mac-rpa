@@ -126,3 +126,9 @@ def test_tune_params_and_style_appended():
 def test_tune_out_of_range_rejected(kw):
     with pytest.raises(ValueError):
         build_tts_input("好", "平静", "v", **kw)
+
+
+def test_seed_passed_and_range_checked():
+    assert build_tts_input("好", "平静", "v", seed=123)["seed"] == 123
+    with pytest.raises(ValueError):
+        build_tts_input("好", "平静", "v", seed=70000)

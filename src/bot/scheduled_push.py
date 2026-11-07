@@ -27,9 +27,13 @@
      "voice_probability": 1.0,                    # 可选，覆盖顶层概率
      "voice_messages": [                          # 到点随机选一句；不配则只发文字
        {"text": "周活动快结束啦", "mood": "开心", "rate": 1.1, "volume": 60, "style": "尾音上扬"},
+       {"text": "快去兑奖哦", "style": ["带点笑意", "声音软一点"]},   # style 可写列表，每次随机选一个
        "只写文字也行（心情平静、语速 1.0）"
      ]}
 - mood 见 src/action/voice_sender.py 的 MOODS；rate 0.5–2.0，volume 0–100，style 为补充语气描述。
+- 随机性：每次合成随机换 seed（0–65535）；顶层 "voice_rate_jitter": 0.05 表示语速在配置值（未配为 1.0）
+  基础上随机 ±0.05，不配为 0（不浮动）；style 为列表时每次随机选一个。
+- 顶层 "voice_styles": {"撒娇": ["尾音拖长一点", ...], ...}：句子没写 style 时，从它心情对应的列表里随机选。
 - 非法的语音条目启动时报错并跳过；语音失败只记日志，不重试，不影响已发出的文字。
 - 发语音前重新打开并校验群标题，校验不通过则不发语音。
 """
@@ -42,7 +46,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable
 
-from src.action.voice_sender import DEFAULT_MOOD, build_tts_input
+from src.action.voice_sender import DEFAULT_MOOD, MOODS, build_tts_input
 from src.models.base import ActionResult
 
 _logger = logging.getLogger("src.scheduled_push")
@@ -97,7 +101,7 @@ def load_schedules(path: Path = CONFIG_PATH) -> list[Schedule]:
     return schedules
 
 
-VoiceLine = dict  # {"text", "mood", 可选 "rate" / "volume" / "style"}
+VoiceLine = dict  # {"text", "mood", 可选 "rate" / "volume" / "style"（配置里为候选列表）}
 VoicePlan = tuple[float, list[VoiceLine]]  # (概率, 语音候选)
 
 
@@ -108,24 +112,71 @@ def _parse_voice_line(raw) -> VoiceLine:
     if not isinstance(raw, dict) or not str(raw.get("text", "")).strip():
         raise ValueError("缺少 text")
     line = {"text": str(raw["text"]).strip(), "mood": raw.get("mood") or DEFAULT_MOOD}
-    for k in ("rate", "volume", "style"):
+    for k in ("rate", "volume"):
         if raw.get(k) is not None:
             line[k] = raw[k]
-    tune = {k: v for k, v in line.items() if k not in ("text", "mood")}
-    build_tts_input(line["text"], line["mood"], "", **tune)  # 校验心情和取值范围
+    styles = raw.get("style")
+    if styles is not None:
+        styles = [styles] if isinstance(styles, str) else styles
+        if not isinstance(styles, list) or not styles or not all(isinstance(x, str) and x.strip() for x in styles):
+            raise ValueError("style 需为非空文字或文字列表")
+        line["style"] = [x.strip() for x in styles]
+    tune = {k: v for k, v in line.items() if k not in ("text", "mood", "style")}
+    for style in line.get("style") or [None]:
+        build_tts_input(line["text"], line["mood"], "", style=style, **tune)  # 校验心情和取值范围
     return line
 
 
+def realize_voice_line(line: VoiceLine, rate_jitter: float = 0.0, rng=random) -> dict:
+    """配置条目 → 本次实际合成参数：style 随机选一个、语速随机浮动、随机 seed。"""
+    out = {k: v for k, v in line.items() if k != "style"}
+    if line.get("style"):
+        out["style"] = rng.choice(line["style"])
+    if rate_jitter:
+        base = line.get("rate", 1.0)
+        out["rate"] = round(min(2.0, max(0.5, base + rng.uniform(-rate_jitter, rate_jitter))), 2)
+    out["seed"] = rng.randint(0, 65535)
+    return out
+
+
+def load_rate_jitter(path: Path = CONFIG_PATH) -> float:
+    j = _read_config(path).get("voice_rate_jitter", 0)
+    if not isinstance(j, (int, float)) or not 0 <= j <= 0.5:
+        _logger.error(f"[ScheduledPush] voice_rate_jitter 需为 0～0.5，已按 0 处理: {j}")
+        print(f"❌ 定时推送 voice_rate_jitter 需为 0～0.5，已按 0 处理: {j}")
+        return 0.0
+    return float(j)
+
+
+def _load_mood_styles(data: dict) -> dict[str, list[str]]:
+    """顶层 voice_styles：心情 → style 候选。非法的心情或列表报错并跳过。"""
+    styles = {}
+    for mood, items in (data.get("voice_styles") or {}).items():
+        try:
+            if mood not in MOODS:
+                raise ValueError(f"未知心情「{mood}」")
+            styles[mood] = _parse_voice_line({"text": "校验", "mood": mood, "style": items})["style"]
+        except (ValueError, TypeError) as e:
+            _logger.error(f"[ScheduledPush] voice_styles 的「{mood}」不合法，已跳过: {e}")
+            print(f"❌ 定时推送 voice_styles 的「{mood}」不合法，已跳过: {e}")
+    return styles
+
+
 def load_voice_plans(path: Path = CONFIG_PATH) -> dict[tuple[str, frozenset[int]], VoicePlan]:
-    """读取每个定时任务的语音配置，键为 (HH:MM, 星期几)。没有 voice_messages 或概率为 0 的不返回。"""
+    """读取每个定时任务的语音配置，键为 (HH:MM, 星期几)。没有 voice_messages 或概率为 0 的不返回。
+    句子没写 style 时，填入 voice_styles 里该心情的候选。"""
     data = _read_config(path)
     default_p = data.get("voice_probability", 0)
+    mood_styles = _load_mood_styles(data)
     plans = {}
     for item in data.get("schedules", []):
         lines = []
         for raw in item.get("voice_messages") or []:
             try:
-                lines.append(_parse_voice_line(raw))
+                line = _parse_voice_line(raw)
+                if "style" not in line and line["mood"] in mood_styles:
+                    line["style"] = mood_styles[line["mood"]]
+                lines.append(line)
             except (ValueError, TypeError) as e:
                 _logger.error(f"[ScheduledPush] 语音条目不合法，已跳过: {raw}: {e}")
                 print(f"❌ 定时推送语音条目不合法，已跳过: {raw}: {e}")
@@ -173,6 +224,7 @@ class ScheduledPusher:
         self.prefixes = load_prefixes(config_path) if self.schedules else []
         self.mention_all = bool(_read_config(config_path).get("mention_all")) if self.schedules else False
         self.voice_plans = load_voice_plans(config_path) if self.schedules and send_voice else {}
+        self.rate_jitter = load_rate_jitter(config_path) if self.voice_plans else 0.0
         self.sent = self._load_state()
         if self.schedules:
             _logger.info(f"[ScheduledPush] 已加载 {len(self.schedules)} 个时间点，目标群: {groups}")
@@ -229,6 +281,7 @@ class ScheduledPusher:
             _logger.error(f"[ScheduledPush] {at} 语音：打开群失败 '{group}'，不发语音")
             return
         try:
+            line = realize_voice_line(line, self.rate_jitter)
             result = self.send_voice(line)
         except Exception as e:  # 语音是附加内容，任何异常都不影响主流程
             result = ActionResult(success=False, error=str(e))

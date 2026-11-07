@@ -5,7 +5,7 @@ from datetime import datetime
 from unittest.mock import Mock
 
 from src.action.chat_opener import ChatOpener
-from src.bot.scheduled_push import ScheduledPusher, due_schedules, load_schedules, load_voice_plans
+from src.bot.scheduled_push import ScheduledPusher, due_schedules, load_schedules, load_voice_plans, realize_voice_line
 from src.models.base import ActionResult
 
 
@@ -173,6 +173,7 @@ def test_voice_lines_parsed_and_invalid_skipped(tmp_path):
     path.write_text(json.dumps({"voice_probability": 0.3, "schedules": [
         {"time": "08:00", "messages": ["a"], "voice_messages": [
             "纯文字", {"text": "开心", "mood": "开心", "rate": 1.1, "volume": 60, "style": "上扬"},
+            {"text": "多风格", "style": ["a", "b"]}, {"text": "空风格", "style": []},
             {"text": "坏心情", "mood": "暴躁"}, {"text": "太快", "rate": 3}, {"mood": "开心"}]},
         {"time": "09:00", "messages": ["b"], "voice_messages": ["x"], "voice_probability": 0},
         {"time": "10:00", "messages": ["c"]},
@@ -181,7 +182,8 @@ def test_voice_lines_parsed_and_invalid_skipped(tmp_path):
     plans = load_voice_plans(path)
     assert plans == {
         ("08:00", frozenset()): (0.3, [{"text": "纯文字", "mood": "平静"},
-                                       {"text": "开心", "mood": "开心", "rate": 1.1, "volume": 60, "style": "上扬"}]),
+                                       {"text": "开心", "mood": "开心", "rate": 1.1, "volume": 60, "style": ["上扬"]},
+                                       {"text": "多风格", "mood": "平静", "style": ["a", "b"]}]),
         ("11:00", frozenset({5})): (1.0, [{"text": "y", "mood": "平静"}]),
     }
 
@@ -194,7 +196,9 @@ def test_voice_sent_after_text_when_probability_hits(tmp_path):
                                             "voice_messages": [{"text": "语音", "mood": "开心"}]}]},
                   send=send, send_voice=send_voice).run_due(datetime(2026, 11, 3, 8, 0))
     assert order == ["text", "语音"]
-    send_voice.assert_called_once_with({"text": "语音", "mood": "开心"})
+    sent = send_voice.call_args.args[0]
+    assert sent["text"] == "语音" and sent["mood"] == "开心" and 0 <= sent["seed"] <= 65535
+    assert "rate" not in sent  # 未配 voice_rate_jitter 时不浮动
 
 
 def test_no_voice_by_default_probability(tmp_path):
@@ -223,3 +227,39 @@ def test_voice_failure_or_exception_does_not_break(tmp_path):
     _voice_pusher(tmp_path, cfg, send=send, send_voice=Mock(side_effect=RuntimeError("boom")),
                   groups=["群1", "群2"]).run_due(datetime(2026, 11, 3, 8, 0))
     assert [c.args[0] for c in send.call_args_list] == ["群1", "群2"]
+
+
+def test_realize_voice_line_randomness():
+    import random as _r
+    rng = _r.Random(1)
+    line = {"text": "t", "mood": "开心", "rate": 1.1, "style": ["a", "b", "c"]}
+    outs = [realize_voice_line(line, 0.05, rng) for _ in range(200)]
+    assert all(1.05 <= o["rate"] <= 1.15 for o in outs)
+    assert {o["style"] for o in outs} == {"a", "b", "c"}
+    assert len({o["seed"] for o in outs}) > 150
+    assert line["style"] == ["a", "b", "c"]  # 不改原配置
+    # 未配语速时以 1.0 为基准，且不超出 0.5～2.0
+    assert all(0.95 <= realize_voice_line({"text": "t", "mood": "平静"}, 0.05, rng)["rate"] <= 1.05 for _ in range(50))
+    assert realize_voice_line({"text": "t", "mood": "平静", "rate": 2.0}, 0.5, _r.Random(0))["rate"] <= 2.0
+
+
+def test_rate_jitter_applied_when_configured(tmp_path):
+    send_voice = Mock(return_value=ActionResult(success=True))
+    _voice_pusher(tmp_path, {"voice_probability": 1, "voice_rate_jitter": 0.05, "schedules": [
+        {"time": "08:00", "messages": ["a"], "voice_messages": [{"text": "v", "rate": 1.2, "style": ["x", "y"]}]}]},
+        send_voice=send_voice).run_due(datetime(2026, 11, 3, 8, 0))
+    sent = send_voice.call_args.args[0]
+    assert 1.15 <= sent["rate"] <= 1.25 and sent["style"] in ("x", "y")
+
+
+def test_mood_styles_fill_lines_without_style(tmp_path):
+    path = tmp_path / "c.json"
+    path.write_text(json.dumps({"voice_probability": 1, "voice_styles": {
+        "开心": ["元气", "笑意"], "暴躁": ["x"], "撒娇": []},
+        "schedules": [{"time": "08:00", "messages": ["a"], "voice_messages": [
+            {"text": "1", "mood": "开心"}, {"text": "2", "mood": "开心", "style": "自带"},
+            {"text": "3", "mood": "撒娇"}, {"text": "4"}]}]}, ensure_ascii=False), encoding="utf-8")
+    _, lines = load_voice_plans(path)[("08:00", frozenset())]
+    assert lines[0]["style"] == ["元气", "笑意"]      # 用心情候选
+    assert lines[1]["style"] == ["自带"]              # 句子自己的优先
+    assert "style" not in lines[2] and "style" not in lines[3]  # 空列表被跳过 / 没配候选
