@@ -1,0 +1,11 @@
+{
+  "_说明": "回复消息时偶尔改发语音（仅群聊）。enabled=false 或删掉本文件则完全不启用。dry_run=true 时只在日志里记录「本会发语音」，照常发文字；确认无误后改为 false 并重启 bot 正式启用。hours：[开始, 结束) 点，只在这段时间发。max_chars：语音文本去掉 @ 后最多几个字，超过不发语音。rate_by_length：语速随字数从最小值线性涨到最大值（1 字最慢，max_chars 字最快），再叠加 scheduled_messages.json 的 voice_rate_jitter 浮动。moods：主动发语音允许的心情。scenes：主动场合（被夸感谢 / 斗嘴调侃 / 安慰）的概率。request：有人要听语音时，同一人 window_minutes 分钟内第 1、2、3 次及以后答应的概率。style 取 scheduled_messages.json 的 voice_styles。修改后重启 bot 生效。",
+  "enabled": true,
+  "dry_run": true,
+  "hours": [8, 22],
+  "max_chars": 20,
+  "rate_by_length": [0.9, 1.2],
+  "moods": ["撒娇", "调皮", "开心", "安慰", "惊讶"],
+  "scenes": {"被夸感谢": 0.15, "斗嘴调侃": 0.15, "安慰": 0.2},
+  "request": {"window_minutes": 10, "probabilities": [0.3, 0.6, 0.9]}
+}
