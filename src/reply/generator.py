@@ -215,8 +215,11 @@ class ReplyGenerator:
                  enable_time_awareness: bool = True,
                  enable_reply_restraint: bool = True,
                  enable_unread_dedup: bool = True,
-                 enable_timestamps: bool = True):
+                 enable_timestamps: bool = True,
+                 voice_prompt: str = ""):
         self.llm_client = llm_client
+        self.voice_prompt = voice_prompt  # 回复语音：启用时追加到群聊 system prompt（见 src/reply/voice_policy.py）
+        self.last_voice_meta: Optional[Dict] = None
         self.memory_engine = memory_engine
         self.tool_registry = tool_registry or get_registry()
         self.judge_worker = judge_worker
@@ -815,6 +818,9 @@ class ReplyGenerator:
                         assistant_msg["reasoning_content"] = self.last_thinking
                     messages.append(assistant_msg)
                     replies = self._parse_replies(text)
+                    if replies and self.voice_prompt and self.last_voice_meta is None:
+                        from src.reply.voice_policy import parse_voice_meta
+                        self.last_voice_meta = parse_voice_meta((self._extract_json(text) or {}).get("voice"))
                     if replies:
                         _logger.info("[Generate] deepseek 直接生成 replies=%d 条", len(replies))
                         self.last_llm_calls = llm_calls
@@ -876,6 +882,7 @@ class ReplyGenerator:
         """
         t_generate_start = time.time()
         self.last_generation_failed = False
+        self.last_voice_meta = None
         if not unreplied:
             self._submit_to_judge(tick_id, [], unreplied, all_messages, is_group)
             return []
@@ -948,6 +955,8 @@ class ReplyGenerator:
             all_messages=all_messages,
             is_group=is_group,
         )
+        if is_group and self.voice_prompt:
+            system_prompt += "\n\n" + self.voice_prompt
 
         tools_context = self._build_tools_context(chat_name)
 

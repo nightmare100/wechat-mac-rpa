@@ -321,3 +321,125 @@ class TestWeChatBot:
         bot.global_store.mark_replied.assert_called_once_with(
             "测试群", msg, "(未回复)"
         )
+
+
+# ---- 回复语音 ----
+from src.reply.voice_policy import DEFAULTS as VOICE_DEFAULTS  # noqa: E402
+from src.reply.voice_policy import VoiceDecision  # noqa: E402
+
+VOICE_YES = VoiceDecision(True, "概率命中", "被夸感谢", "哼，算你有眼光", "调皮", "带点笑意", 1.0)
+
+
+class TestVoiceReply:
+    @pytest.fixture
+    def bot(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("scripts.sync_knowledge.sync", lambda: False)
+        monkeypatch.setattr("src.bot.wechat_bot.GlobalStore", Mock)
+        monkeypatch.setattr("src.bot.wechat_bot.MemoryEngine", Mock)
+        monkeypatch.setattr("src.bot.wechat_bot.time.sleep", Mock())
+        db = Mock()
+        db._get_conn.return_value = Mock()
+        monkeypatch.setattr("src.badcase.case_db.get_db", lambda: db)
+        self.opener = Mock()
+        self.opener.return_value.open.return_value = True
+        monkeypatch.setattr("src.bot.wechat_bot.ChatOpener", self.opener)
+        bot = WeChatBot(PROFILE_WECHAT_MAC_1760X1280, llm_client=Mock(), perception=Mock())
+        bot.debug_logger = Mock(current=None)
+        bot.memory_engine = None
+        bot.policy = Mock()
+        bot.policy.should_reply.return_value = True
+        bot.generator = Mock(last_voice_meta={"scene": "被夸感谢", "mood": "调皮"})
+        bot.generator.generate.return_value = ["@A 哼，算你有眼光"]
+        bot.generator.text_for_logging.side_effect = lambda text: text
+        bot.generator.messages_for_logging.side_effect = lambda messages: messages
+        bot.sender = Mock(silent_mode=False)
+        bot.sender.send.return_value = ActionResult(success=True)
+        bot._update_tick_send_result = Mock()
+        bot.voice_policy = Mock()
+        bot.voice_policy.decide.return_value = VOICE_YES
+        bot.voice_reply_config = VOICE_DEFAULTS.__class__(**{**VOICE_DEFAULTS.__dict__, "dry_run": False})
+        bot._voice_sender = Mock()
+        bot._voice_sender.send.return_value = ActionResult(success=True)
+        return bot
+
+    def _tick(self, bot, tmp_path, chat="测试群", is_group=True):
+        msg = ChatMessage(text="囡囡好可爱", sender="A", sender_type=SenderType.OTHER, chat_name=chat)
+        bot.perception.perceive.return_value = PerceptionResult(
+            chat_name=chat, messages=[msg], chat_list_items=[], screenshot_path=str(tmp_path / "v.png"),
+            is_group=is_group,
+        )
+        state = Mock(messages=[msg], pending_self_messages=[])
+        bot.global_store = Mock()
+        bot.global_store.merge_tick.return_value = (state, [msg])
+        bot.global_store.chats = {chat: state}
+        bot.tick()
+        return msg, state
+
+    def test_dry_run_logs_and_sends_text(self, bot, tmp_path, caplog):
+        bot.voice_reply_config = VOICE_DEFAULTS
+        with caplog.at_level("INFO"):
+            msg, _ = self._tick(bot, tmp_path)
+        bot._voice_sender.send.assert_not_called()
+        bot.sender.send.assert_called_once_with("@A 哼，算你有眼光", chat_name="测试群")
+        assert "[VoiceReply] 本会发语音" in caplog.text
+
+    def test_voice_replaces_text_and_records_tag(self, bot, tmp_path):
+        msg, state = self._tick(bot, tmp_path)
+        bot._voice_sender.send.assert_called_once_with("哼，算你有眼光", "调皮", rate=1.0, style="带点笑意")
+        bot.sender.send.assert_not_called()
+        bot.global_store.mark_replied.assert_called_once_with("测试群", msg, "[语音] 哼，算你有眼光")
+        assert state.pending_self_messages[0].text == "[语音] 哼，算你有眼光"
+        bot.voice_policy.record_sent.assert_called_once_with("测试群", True)
+        bot._update_tick_send_result.assert_called_once()
+        assert bot._update_tick_send_result.call_args.kwargs["success"] is True
+
+    def test_voice_failure_falls_back_to_text_once(self, bot, tmp_path):
+        bot._voice_sender.send.return_value = ActionResult(success=False, error="合成失败")
+        self._tick(bot, tmp_path)
+        bot.sender.send.assert_called_once_with("@A 哼，算你有眼光", chat_name="测试群")  # 主动场合兜底保留原回复（含 @）
+        bot.voice_policy.record_sent.assert_called_once_with("测试群", False)
+
+    def test_chat_check_failure_falls_back_to_text(self, bot, tmp_path):
+        self.opener.return_value.open.return_value = False
+        self._tick(bot, tmp_path)
+        bot._voice_sender.send.assert_not_called()
+        bot.sender.send.assert_called_once_with("@A 哼，算你有眼光", chat_name="测试群")
+
+    def test_request_fallback_sends_accept_text(self, bot, tmp_path):
+        bot.generator.generate.return_value = ["哼，才不给你听"]
+        bot.voice_policy.decide.return_value = VoiceDecision(True, "答应", "要听语音", "好啦就一句哦", "不情愿", None, 0.95)
+        bot._voice_sender.send.return_value = ActionResult(success=False, error="合成失败")
+        self._tick(bot, tmp_path)
+        bot.sender.send.assert_called_once_with("好啦就一句哦", chat_name="测试群")
+
+    def test_silent_non_whitelist_never_voices(self, bot, tmp_path):
+        bot.sender = Mock(silent_mode=True)
+        bot.sender.in_silent_whitelist.return_value = False
+        bot.sender.send.return_value = ActionResult(success=False, error="静默", skipped=True)
+        self._tick(bot, tmp_path)
+        bot._voice_sender.send.assert_not_called()
+
+    def test_private_chat_skips_policy(self, bot, tmp_path):
+        self._tick(bot, tmp_path, chat="Alice", is_group=False)
+        bot.voice_policy.decide.assert_not_called()
+        bot.sender.send.assert_called_once()
+
+    def test_mock_generator_meta_ignored(self, bot, tmp_path):
+        from src.reply.voice_policy import VoiceReplyPolicy
+        bot.voice_policy = VoiceReplyPolicy(bot.voice_reply_config, {}, 0.0)
+        bot.generator.last_voice_meta = Mock()
+        self._tick(bot, tmp_path)
+        bot._voice_sender.send.assert_not_called()
+        bot.sender.send.assert_called_once_with("@A 哼，算你有眼光", chat_name="测试群")
+
+
+def test_disabled_config_no_prompt(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("scripts.sync_knowledge.sync", lambda: False)
+    monkeypatch.setattr("src.bot.wechat_bot.GlobalStore", Mock)
+    monkeypatch.setattr("src.bot.wechat_bot.MemoryEngine", Mock)
+    monkeypatch.setattr("src.bot.wechat_bot.load_voice_reply_config", lambda: None)
+    bot = WeChatBot(PROFILE_WECHAT_MAC_1760X1280, llm_client=Mock(), perception=Mock())
+    assert bot.voice_policy is None and bot.voice_reply_config is None
+    assert bot.generator.voice_prompt == ""

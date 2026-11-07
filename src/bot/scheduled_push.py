@@ -162,6 +162,11 @@ def _load_mood_styles(data: dict) -> dict[str, list[str]]:
     return styles
 
 
+def load_mood_styles(path: Path = CONFIG_PATH) -> dict[str, list[str]]:
+    """读取顶层 voice_styles（心情 → style 候选），供回复语音复用。"""
+    return _load_mood_styles(_read_config(path))
+
+
 def load_voice_plans(path: Path = CONFIG_PATH) -> dict[tuple[str, frozenset[int]], VoicePlan]:
     """读取每个定时任务的语音配置，键为 (HH:MM, 星期几)。没有 voice_messages 或概率为 0 的不返回。
     句子没写 style 时，填入 voice_styles 里该心情的候选。"""

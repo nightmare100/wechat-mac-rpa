@@ -473,3 +473,44 @@ class TestReActLoop:
 
         # 验证确实存在 dummy_loop 工具调用记录
         assert any(tc["tool_name"] == "dummy_loop" for tc in gen.last_tool_calls)
+
+
+class TestVoiceMeta:
+    def _group_msg(self):
+        return ChatMessage(text="囡囡好可爱", sender="Alice", sender_type=SenderType.OTHER, chat_name="测试群")
+
+    def test_voice_prompt_appended_only_for_group(self, sample_message):
+        llm = MockLLM()
+        gen = _make_generator(llm, enable_self_refine=False)
+        gen.generate([sample_message], [sample_message], is_group=False)
+        base = gen.last_system_prompt
+        gen.voice_prompt = "VOICE"
+        gen.generate([sample_message], [sample_message], is_group=False)
+        assert gen.last_system_prompt == base
+        msg = self._group_msg()
+        gen.generate([msg], [msg], is_group=True)
+        assert gen.last_system_prompt.endswith("VOICE")
+        gen.voice_prompt = ""
+        gen.generate([msg], [msg], is_group=True)
+        assert "VOICE" not in gen.last_system_prompt
+
+    def test_last_voice_meta_from_first_generation(self):
+        msg = self._group_msg()
+        llm = MockLLM(responses=[
+            '{"skills": []}',
+            '{"replies": ["哼"], "voice": {"scene": "被夸感谢", "mood": "调皮"}}',
+            '{"decision": "fail", "issues": ["太短"]}',
+            '{"replies": ["哼，算你有眼光"], "voice": {"scene": "安慰", "mood": "安慰"}}',
+        ])
+        gen = _make_generator(llm, enable_self_refine=True)
+        gen.generate([msg], [msg], is_group=True)
+        assert gen.last_voice_meta is None  # 未启用语音（voice_prompt 为空）不解析
+        llm.responses, llm.index = llm.responses, 0
+        gen.voice_prompt = "VOICE"
+        gen.generate([msg], [msg], is_group=True)
+        assert gen.last_voice_meta == {"scene": "被夸感谢", "mood": "调皮"}
+
+        llm.responses, llm.index = ['{"skills": []}', '{"replies": ["好"]}'], 0
+        gen.enable_self_refine = False
+        gen.generate([msg], [msg], is_group=True)
+        assert gen.last_voice_meta is None

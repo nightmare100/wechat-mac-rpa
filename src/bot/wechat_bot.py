@@ -4,6 +4,7 @@
 import logging as _logging
 import os
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -11,7 +12,7 @@ from src.action.chat_list_clicker import ChatListClicker
 from src.action.chat_opener import ChatOpener
 from src.action.login_recovery import LoginRecoveryStatus, WeChatLoginHandler
 from src.action.message_sender import WeChatMessageSender
-from src.bot.scheduled_push import ScheduledPusher
+from src.bot.scheduled_push import ScheduledPusher, load_mood_styles, load_rate_jitter
 from src.capture.window_capture import WeChatNotReadyError
 from src.logging.bot_logger import BotLogger, get_logger
 from src.memory import MemoryEngine
@@ -19,6 +20,7 @@ from src.models.base import ActionResult, ChatMessage, PerceptionResult, SenderT
 from src.perception.vision_pipeline import VisionPipeline
 from src.reply.generator import ReplyGenerator, _get_judge_worker
 from src.reply.policy import ReplyPolicy
+from src.reply.voice_policy import VoiceDecision, VoiceReplyPolicy, load_voice_reply_config
 from src.session.global_store import GlobalStore
 from src.tools import get_registry, register_builtin_tools
 from src.utils.chat_utils import _is_group_chat_name, _normalize_chat_name
@@ -82,12 +84,30 @@ class WeChatBot:
         judge_worker = _get_judge_worker() if os.environ.get("ENABLE_JUDGE_WORKER", "0") == "1" else None
         if judge_worker is None:
             self.logger.info("JudgeWorker 已禁用（ENABLE_JUDGE_WORKER 未设置），跳过 badcase 审计以节省 deepseek token")
+        # 回复语音（仅群聊，配置见 data/voice_reply.json，设计见 src/reply/voice_policy.py）
+        self.voice_reply_config = load_voice_reply_config()
+        voice_prompt = ""
+        if self.voice_reply_config is not None:
+            prompt_path = Path(__file__).parent.parent.parent / "prompts" / "voice_reply.md"
+            if prompt_path.exists():
+                voice_prompt = prompt_path.read_text(encoding="utf-8")
+            else:
+                self.logger.error("[VoiceReply] 缺少 prompts/voice_reply.md，回复语音不启用")
+                self.voice_reply_config = None
+        self.voice_policy: Optional[VoiceReplyPolicy] = (
+            VoiceReplyPolicy(self.voice_reply_config, load_mood_styles(), load_rate_jitter())
+            if self.voice_reply_config is not None else None
+        )
+        if self.voice_reply_config is not None:
+            mode = "dry_run（只记日志）" if self.voice_reply_config.dry_run else "正式发送"
+            print(f"  • 回复语音: 已启用，{mode}")
         self.generator = ReplyGenerator(
             llm_client=actual_llm,
             memory_engine=self.memory_engine,
             tool_registry=registry,
             judge_worker=judge_worker,
             enable_timestamps=True,
+            voice_prompt=voice_prompt,
         )
         self.sender = WeChatMessageSender(silent_mode=os.environ.get("WECHAT_SILENT_MODE") == "1")
         # 定时推送：目标群为 SILENT_WHITELIST，配置见 src/bot/scheduled_push.py
@@ -611,11 +631,44 @@ class WeChatBot:
                     self.global_store.mark_replied(chat_name, msg, "(未回复)")
                 return
 
-            # 逐条发送回复，间隔 1.5 秒
+            # 回复语音：命中时语音替代整批文字；dry_run 只记日志；失败改发同样的文字
             send_failed = False
             send_skipped = False  # 静默模式跳过（非真实失败），应视为已处理避免卡循环
             sent_replies = []
-            for i, reply in enumerate(replies):
+            voiced = False
+            if self.voice_policy is not None and is_group:
+                decision = self.voice_policy.decide(
+                    chat_name, to_reply[-1].sender if to_reply else "", replies,
+                    getattr(self.generator, "last_voice_meta", None), datetime.now(),
+                )
+                self.logger.info("[VoiceReply] chat=%s sender=%s scene=%s decision=%s reason=%s",
+                                 chat_name, to_reply[-1].sender if to_reply else "", decision.scene or "-",
+                                 "发" if decision.send_voice else "不发", decision.reason)
+                if decision.send_voice and self.voice_reply_config.dry_run:
+                    self.logger.info("[VoiceReply] 本会发语音: %s mood=%s style=%s rate=%s",
+                                     decision.text, decision.mood, decision.style, decision.rate)
+                elif decision.send_voice:
+                    voice_result = self._try_send_voice_reply(chat_name, decision)
+                    if voice_result.success:
+                        voiced = True
+                        tagged = f"[语音] {decision.text}"
+                        replies = [tagged]
+                        sent_replies.append(tagged)
+                        self.logger.log_send(tick_id, success=True, text=tagged)
+                        self.debug_logger.log_action("send", action_input=tagged, success=True)
+                        chat_state = self.global_store.chats.get(chat_name)
+                        if chat_state is not None:
+                            chat_state.pending_self_messages.append(ChatMessage(
+                                text=tagged, sender="自己", sender_type=SenderType.SELF,
+                                chat_name=chat_name, replied=True, reply_text=tagged,
+                                reply_time=time.time(), message_type="text",
+                            ))
+                    else:
+                        self.logger.warning("[VoiceReply] 语音发送失败，改发文字: %s", voice_result.error)
+                        # 主动场合发原回复（保留 @）；要听语音时原回复是拒绝，改发答应的那句
+                        if decision.scene == "要听语音":
+                            replies = [decision.text]
+            for i, reply in enumerate([] if voiced else replies):
                 action_result = self.sender.send(reply, chat_name=chat_name)
                 if action_result.success:
                     sent_replies.append(reply)
@@ -646,6 +699,9 @@ class WeChatBot:
                     break
                 if i < len(replies) - 1:
                     time.sleep(1.5)
+
+            if self.voice_policy is not None and is_group and sent_replies:
+                self.voice_policy.record_sent(chat_name, voiced)
 
             self._update_tick_send_result(
                 tick_id,
@@ -955,6 +1011,21 @@ class WeChatBot:
         self.logger.info(f"🔄 切换聊天: {target_name!r} (未读 {target_unread})")
         self.debug_logger.log_bot_decision(switch_target=target_name, switch_reason=f"未读 {target_unread}")
         return target_name
+
+    def _try_send_voice_reply(self, chat_name: str, decision: VoiceDecision) -> ActionResult:
+        """回复语音：静默白名单检查 → 校验当前窗口就是该群 → 合成并发送。任一步失败返回失败，由调用方改发文字。"""
+        if self.sender.silent_mode and not self.sender.in_silent_whitelist(chat_name):
+            return ActionResult(success=False, error="静默模式非白名单，不发语音")
+        try:
+            if not ChatOpener(self.perception).open(chat_name):
+                return ActionResult(success=False, error="当前窗口校验失败")
+            if getattr(self, "_voice_sender", None) is None:
+                from src.action.voice_sender import VoiceSender
+                self._voice_sender = VoiceSender()
+            tune = {"rate": decision.rate, "style": decision.style}
+            return self._voice_sender.send(decision.text, decision.mood, **{k: v for k, v in tune.items() if v is not None})
+        except Exception as e:  # 语音是附加能力，任何异常都改发文字
+            return ActionResult(success=False, error=str(e))
 
     def _send_voice_line(self, line: dict) -> ActionResult:
         """定时推送的语音：合成并发到微信当前窗口（调用方已打开并校验群）。"""
