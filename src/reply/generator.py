@@ -17,6 +17,7 @@ from src.reply.evidence_utils import strip_assistant_history_lines
 from src.reply.few_shot import PersonaFewShotRetriever
 from src.reply.session_memory import SessionMemory, _extract_query_key
 from src.tools import get_registry
+from src.utils.time_window import in_sleep_window, parse_sleep_hours
 
 _logger = logging.getLogger("src.reply.generator")
 
@@ -228,6 +229,12 @@ class ReplyGenerator:
         self.enable_unread_dedup = enable_unread_dedup
         self.enable_timestamps = enable_timestamps
         self.followup = FollowupTracker()
+        # 睡前时段（.env 的 BEDTIME_HOURS，如 23:00-23:30）：时段内 prompt 加 <bedtime> 语境
+        try:
+            self.bedtime_window = parse_sleep_hours(os.environ.get("BEDTIME_HOURS", ""), name="BEDTIME_HOURS")
+        except ValueError as e:
+            _logger.warning(f"{e}，不启用睡前语境")
+            self.bedtime_window = None
         project_root = Path(__file__).parent.parent.parent
         few_shot_path = Path(os.environ.get(
             "PERSONA_FEW_SHOT_PATH",
@@ -1434,6 +1441,12 @@ class ReplyGenerator:
         if enable_time_awareness:
             session_fields.append(f"<current_time>{now_dt.strftime('%Y-%m-%d %H:%M')}</current_time>")
             session_fields.append("<timestamp_semantics>消息时间是绝对时间，不代表消息刚刚发出。</timestamp_semantics>")
+        bedtime = getattr(self, "bedtime_window", None)
+        if in_sleep_window(bedtime, now_dt):
+            session_fields.append(
+                f"<bedtime>你 {bedtime[1]:%H:%M} 睡觉，现在快到点了。回复可以自然带上犯困、准备去睡、催大家早点休息这类语气，"
+                "不用每条都提，提过就别反复说；不要说自己已经睡着了。</bedtime>"
+            )
 
         sections = ["<session>\n" + "\n".join(session_fields) + "\n</session>"]
         context_fields: List[str] = []

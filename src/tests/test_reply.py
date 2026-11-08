@@ -218,3 +218,26 @@ class TestReplyGenerator:
         reply = gen.generate([msg], [msg])
         assert reply == []
         assert gen.last_generation_failed is True
+
+
+class TestBedtimeContext:
+    def _prompt(self, window):
+        gen = ReplyGenerator(llm_client=None, tool_registry=_TEST_TOOL_REGISTRY)
+        gen.bedtime_window = window
+        unread = ChatMessage(text="还在吗", sender="Bob", sender_type=SenderType.OTHER, chat_name="测试群")
+        return ET.fromstring(gen._build_user_prompt([unread], [unread], is_group=True))
+
+    def test_bedtime_added_inside_window(self):
+        from datetime import datetime, timedelta
+        now = datetime.now()
+        window = ((now - timedelta(minutes=5)).time(), (now + timedelta(minutes=5)).time())
+        bedtime = self._prompt(window).find("./session/bedtime")
+        assert bedtime is not None
+        assert f"你 {window[1]:%H:%M} 睡觉" in bedtime.text
+
+    def test_no_bedtime_outside_window(self):
+        from datetime import datetime, timedelta
+        now = datetime.now()
+        window = ((now + timedelta(hours=1)).time(), (now + timedelta(hours=2)).time())
+        assert self._prompt(window).find("./session/bedtime") is None
+        assert self._prompt(None).find("./session/bedtime") is None

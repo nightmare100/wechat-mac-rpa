@@ -13,6 +13,7 @@ from src.action.chat_opener import ChatOpener
 from src.action.login_recovery import LoginRecoveryStatus, WeChatLoginHandler
 from src.action.message_sender import WeChatMessageSender
 from src.bot.scheduled_push import ScheduledPusher, load_mood_styles, load_rate_jitter
+from src.utils.time_window import in_sleep_window, parse_sleep_hours
 from src.capture.window_capture import WeChatNotReadyError
 from src.logging.bot_logger import BotLogger, get_logger
 from src.memory import MemoryEngine
@@ -25,6 +26,9 @@ from src.session.global_store import GlobalStore
 from src.tools import get_registry, register_builtin_tools
 from src.utils.chat_utils import _is_group_chat_name, _normalize_chat_name
 from src.utils.debug_logger import DebugLogger
+
+SLEEP_CHECK_SECONDS = 30  # 休眠中多久检查一次是否到点醒来
+WAKE_BACKLOG_SECONDS = 1800  # 醒来后多长时间内，聊天第一次看到的未回复消息算夜里积压
 
 
 def _raw_with_thinking(raw_response: str, thinking: str) -> str:
@@ -117,6 +121,21 @@ class WeChatBot:
             send=self.send_to_chat,
             send_voice=self._send_voice_line,
         )
+        # 休眠时段（.env 的 SLEEP_HOURS），见 src/utils/time_window.py
+        try:
+            self.sleep_window = parse_sleep_hours(os.environ.get("SLEEP_HOURS", ""))
+        except ValueError as e:
+            print(f"  ⚠️ {e}，不启用休眠")
+            self.sleep_window = None
+        if self.sleep_window is not None:
+            start, end = self.sleep_window
+            print(f"  • 休眠: {start:%H:%M}-{end:%H:%M}（停止轮询和定时推送，醒来不回积压消息）")
+        if self.generator.bedtime_window is not None:
+            start, end = self.generator.bedtime_window
+            print(f"  • 睡前语境: {start:%H:%M}-{end:%H:%M}")
+        self._asleep = False
+        self._woke_at: Optional[float] = None
+        self._backlog_skipped_chats: set = set()
 
         # 动态注册 send_file 工具（需要 sender 实例）
         def _load_shareable_files() -> dict:
@@ -365,6 +384,7 @@ class WeChatBot:
             state, unreplied = self.global_store.merge_tick(
                 chat_name, messages, mode=self._weflow_mode, is_group=is_group
             )
+            unreplied = self._skip_wake_backlog(chat_name, unreplied)
 
             # 记录 Session 层输入输出
             msg_dicts = [
@@ -813,6 +833,9 @@ class WeChatBot:
         self.running = True
         self._interval = interval
         while self.running:
+            if self._check_sleep(datetime.now()):
+                time.sleep(SLEEP_CHECK_SECONDS)
+                continue
             tick_started = time.monotonic()
             try:
                 pusher = getattr(self, "scheduled_pusher", None)
@@ -829,6 +852,32 @@ class WeChatBot:
                 from src.utils.qwen_client import QwenClient
                 QwenClient.log_token_stats(self.logger.runtime_logger)
             time.sleep(max(0.0, interval - (time.monotonic() - tick_started)))
+
+    def _check_sleep(self, now: datetime) -> bool:
+        """返回当前是否休眠；进入/醒来时记日志，醒来时开始「积压消息不回复」。"""
+        asleep = in_sleep_window(getattr(self, "sleep_window", None), now)
+        was_asleep = getattr(self, "_asleep", False)
+        if asleep and not was_asleep:
+            self.logger.info("💤 进入休眠，停止轮询和定时推送")
+        elif not asleep and was_asleep:
+            self.logger.info("☀️ 醒来，恢复轮询；各聊天第一次看到的积压消息不回复")
+            self._woke_at = time.monotonic()
+            self._backlog_skipped_chats = set()
+        self._asleep = asleep
+        return asleep
+
+    def _skip_wake_backlog(self, chat_name: str, unreplied: list) -> list:
+        """醒来后 WAKE_BACKLOG_SECONDS 内，每个聊天第一次合并出的未回复消息视为夜里积压，标记已读不回复。"""
+        woke_at = getattr(self, "_woke_at", None)
+        if (woke_at is None or not unreplied
+                or chat_name in self._backlog_skipped_chats
+                or time.monotonic() - woke_at > WAKE_BACKLOG_SECONDS):
+            return unreplied
+        self._backlog_skipped_chats.add(chat_name)
+        for msg in unreplied:
+            self.global_store.mark_replied(chat_name, msg, "")
+        self.logger.info(f"☀️ 醒来后跳过 '{chat_name}' 的 {len(unreplied)} 条积压消息")
+        return []
 
     _SERVICE_ACCOUNT_NAMES = {"服务号", "订阅号", "公众号"}
 
