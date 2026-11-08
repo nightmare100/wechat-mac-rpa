@@ -82,7 +82,7 @@ def _apply_at_policy(replies: List[str], keep_rate: float = AT_KEEP_RATE,
 
 
 # 接话轮数：被 @ 或引用后随机给 2～4 轮不带 @ 的接话额度，每接一次减 1，30 分钟没动静作废
-FOLLOWUP_ROUNDS = (2, 4)
+FOLLOWUP_ROUNDS = (3, 5)
 FOLLOWUP_TTL_SECONDS = 1800
 
 

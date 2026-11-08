@@ -58,7 +58,7 @@ def test_followup_without_open_thread_does_nothing_and_ttl_expires():
     assert t.candidates("g") == []
 
 
-def test_rounds_are_random_between_2_and_4():
+def test_rounds_are_random_between_3_and_5():
     import random
     rng = random.Random(1)
     t = FollowupTracker(randint=rng.randint)
@@ -66,4 +66,4 @@ def test_rounds_are_random_between_2_and_4():
     for i in range(200):
         t.record("g", [_m(f"人{i:03d}", "@囡囡 hi")], [f"@人{i:03d} 嗨"])
     seen = {r for _, r in t.candidates("g")}
-    assert seen == {2, 3, 4}
+    assert seen == {3, 4, 5}
