@@ -9,7 +9,7 @@ from src.action.login_recovery import LoginRecoveryResult, LoginRecoveryStatus
 from src.bot.wechat_bot import WeChatBot
 from src.capture.window_capture import WeChatNotReadyError
 from src.layout.profile import PROFILE_WECHAT_MAC_1760X1280
-from src.models.base import ActionResult, ChatMessage, PerceptionResult, SenderType
+from src.models.base import ActionResult, ChatListItem, ChatMessage, PerceptionResult, Rect, SenderType
 
 
 class TestWeChatBot:
@@ -463,3 +463,44 @@ def test_disabled_config_no_prompt(monkeypatch, tmp_path):
     assert bot.voice_policy is None and bot.voice_reply_config is None
     assert bot.generator.voice_prompt == ""
 
+
+
+class TestSwitchRespectsSilentWhitelist:
+    """静默模式下，切换未读聊天只切到白名单里的聊天。"""
+
+    @pytest.fixture
+    def bot(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr("scripts.sync_knowledge.sync", lambda: False)
+        monkeypatch.setattr("src.bot.wechat_bot.GlobalStore", Mock)
+        monkeypatch.setattr("src.bot.wechat_bot.MemoryEngine", Mock)
+        self.clicked = []
+        clicker = Mock()
+        clicker.click_item.side_effect = lambda item: self.clicked.append(item.nickname) or True
+        monkeypatch.setattr("src.bot.wechat_bot.ChatListClicker", lambda *a, **k: clicker)
+        bot = WeChatBot(PROFILE_WECHAT_MAC_1760X1280, llm_client=Mock(), perception=Mock())
+        bot._weflow_mode = "ocr"
+        bot.debug_logger = Mock(current=None)
+        bot.sender = Mock(silent_mode=True)
+        bot.sender.in_silent_whitelist.side_effect = lambda name: name.startswith("人格测试")
+        self.item = lambda name, unread: ChatListItem(name, "", unread, "", Rect(0, 0, 10, 10))
+        return bot
+
+    def _result(self, items):
+        return PerceptionResult(chat_name="其他群", messages=[], chat_list_items=items, screenshot_path="",
+                                window_rect=Rect(0, 0, 880, 640), scale_factor=2.0)
+
+    def test_skips_non_whitelisted_chat_with_more_unread(self, bot):
+        result = self._result([self.item("弓箭2战神公会", "8"), self.item("人格测试", "2")])
+        assert bot._try_switch_to_unread_chat(result) == "人格测试"
+        assert self.clicked == ["人格测试"]
+
+    def test_no_switch_when_only_non_whitelisted_unread(self, bot):
+        result = self._result([self.item("弓箭2战神公会", "8")])
+        assert bot._try_switch_to_unread_chat(result) == ""
+        assert self.clicked == []
+
+    def test_switches_freely_when_not_silent(self, bot):
+        bot.sender.silent_mode = False
+        result = self._result([self.item("弓箭2战神公会", "8"), self.item("人格测试", "2")])
+        assert bot._try_switch_to_unread_chat(result) == "弓箭2战神公会"

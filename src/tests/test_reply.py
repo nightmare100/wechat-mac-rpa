@@ -118,9 +118,9 @@ class TestReplyGenerator:
         guard = root.find("./reply_guard")
         assert guard is not None
         assert guard.attrib == {"priority": "final", "enforcement": "hard"}
-        assert "不得 callback" in "".join(guard.itertext())
-        assert "不能成为回复的主语、宾语、修饰对象、背景或隐含前提" in "".join(guard.itertext())
-        assert "没有独立的新内容" in "".join(guard.itertext())
+        assert "不得照抄其中的句子" in "".join(guard.itertext())
+        assert "不得在已用的梗上继续加戏" in "".join(guard.itertext())
+        assert "明确 @ 你时必须回复，不得输出空 replies" in "".join(guard.itertext())
         assert [child.tag for child in root][-3:] == ["unread", "consumed_self_replies", "reply_guard"]
 
     def test_reply_guard_exists_without_self_history(self):

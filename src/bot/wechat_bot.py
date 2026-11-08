@@ -874,6 +874,12 @@ class WeChatBot:
             self.logger.warning(f"[Recovery] 点击返回按钮异常: {e}")
             return False
 
+    def _switch_allowed(self, name: str) -> bool:
+        """免回复聊天不切换；静默模式下非白名单聊天也不切换（避免点开并上传无关聊天的截图）。"""
+        if _normalize_chat_name(name) in {_normalize_chat_name(c) for c in self.no_reply_chats}:
+            return False
+        return not (self.sender.silent_mode and not self.sender.in_silent_whitelist(name))
+
     def _try_switch_to_unread_chat(self, result: PerceptionResult) -> str:
         """检测到其他聊天有未读时，切换到未读数最多的那个。
 
@@ -901,7 +907,7 @@ class WeChatBot:
                         self.logger.info(f"[WeFlow] 未读候选: {name} ({item['unread_count']}条), current={current_chat}")
                         if name == current_chat:
                             continue
-                        if name in {_normalize_chat_name(c) for c in self.no_reply_chats}:
+                        if not self._switch_allowed(item["name"]):
                             continue
                         target_name = item["name"]
                         target_unread = item["unread_count"]
@@ -929,9 +935,7 @@ class WeChatBot:
                 item for item in chat_list_items
                 if item.unread_count
                 and _normalize_chat_name(item.nickname) != current_chat
-                and _normalize_chat_name(item.nickname) not in {
-                    _normalize_chat_name(c) for c in self.no_reply_chats
-                }
+                and self._switch_allowed(item.nickname)
             ]
             if not unread_items:
                 return ""
@@ -986,7 +990,7 @@ class WeChatBot:
             unread_items = [
                 item for item in result.chat_list_items
                 if item.unread_count and _normalize_chat_name(item.nickname) != current_chat
-                and _normalize_chat_name(item.nickname) not in {_normalize_chat_name(c) for c in self.no_reply_chats}
+                and self._switch_allowed(item.nickname)
             ]
             self.logger.info(f"[WeFlow] chat_list_items 未读项: {len(unread_items)}/{len(result.chat_list_items)}")
             if unread_items:
@@ -1001,6 +1005,9 @@ class WeChatBot:
 
         if target_item is None:
             self.logger.info(f"[WeFlow] 无法找到可点击的列表项，chat_list_items={len(result.chat_list_items)}")
+            return ""
+        if not self._switch_allowed(target_item.nickname):
+            self.logger.info(f"[WeFlow] '{target_item.nickname}' 不在白名单或属于免回复聊天，不切换")
             return ""
 
         self.logger.info(f"[WeFlow] 准备点击 '{target_item.nickname}' at ({target_item.rect.x},{target_item.rect.y})")
