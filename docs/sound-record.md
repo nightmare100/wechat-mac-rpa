@@ -1,7 +1,72 @@
 # 发送语音消息调研（存档）
 
 > 调研日期：2026-11-04
-> 状态：仅调研，未实现、未实测。项目代码中目前没有任何语音相关逻辑。
+> 状态（2026-11-08）：
+> - 已实现：`scripts/send_voice.py`、定时推送补发语音、回复消息时发语音。
+> - 回复语音目前是 dry_run，只记日志，不真的发。
+> - 换机器验证按 `docs/voice-test-plan.md` 做。
+
+## 新电脑环境准备
+
+### 1. 系统软件（Homebrew）
+
+```bash
+brew install --cask blackhole-2ch   # 虚拟声卡，把播放的声音变成麦克风输入；需要管理员密码，装完重启电脑
+brew install switchaudio-osx        # 命令行切换系统默认输入设备（SwitchAudioSource）
+brew install ffmpeg                 # 把语音播放到 BlackHole（audiotoolbox 输出）
+```
+
+装完检查：
+
+```bash
+SwitchAudioSource -a -t input        # 列表里要有「BlackHole 2ch」
+ffmpeg -hide_banner -f lavfi -i anullsrc -t 0.05 -f audiotoolbox -list_devices true -   # 输出设备里要有「BlackHole 2ch」
+```
+
+### 2. Python 依赖
+
+不需要额外安装。按项目的 `requirements.txt` 装好虚拟环境即可：
+- 语音合成用的 `httpx` 在 `requirements.txt` 里。
+- 模拟按下右 Option 用的 `Quartz`，会随 `pyobjc-framework-Vision` 一起安装。
+
+检查：
+
+```bash
+.venv/bin/python -c "import Quartz, httpx; print('ok')"
+```
+
+### 3. 系统权限（系统设置 → 隐私与安全性）
+
+| 权限 | 给谁 | 用途 |
+|---|---|---|
+| 辅助功能 | 运行 bot 的终端（Terminal、iTerm 等） | 模拟按住右 Option 录音。bot 原有的按键操作也依赖这个权限 |
+| 麦克风 | 微信 | 微信录音。实际录到的是 BlackHole 的声音 |
+
+### 4. 微信
+
+- 版本 **≥ 4.1.9**，Mac 版从这个版本开始支持发语音条。
+- 手动确认一次：在任意聊天里按住**右** Option 说话，松开能发出语音。左 Option 不行。
+
+### 5. 要从旧电脑拷过来的文件（不在 git 里）
+
+| 文件 | 说明 |
+|---|---|
+| `.env` | 除了原有配置，语音还需要这 2 行（同一个百炼账号就能用，音色属于账号，不属于电脑）：<br>`TTS_MODEL=qwen-audio-3.1-tts-plus`<br>`TTS_VOICE_ID=qwen-audio-3.1-tts-plus-nannan-4d9b8cad77e74df6903490a146e2e6ae` |
+| `prompts/voice_reply.md` | 回复语音的 prompt。缺了这个文件，回复语音不会启用 |
+
+`VOICE_INPUT_DEVICE` 可以不配，默认就是 `BlackHole 2ch`。
+
+### 6. 一条命令验证链路
+
+先打开微信「文件传输助手」，不要碰键盘鼠标，然后执行：
+
+```bash
+.venv/bin/python scripts/send_voice.py "新电脑测试" --mood 开心
+```
+
+- 输出 `✅ 已发送`，文件传输助手里出现一条能正常播放的语音，就说明整条链路通了。
+- 发完用 `SwitchAudioSource -c -t input` 看一下，输入设备应该已经切回原来的麦克风。
+- 新电脑的麦克风不一定叫 `MacBook Pro Microphone`，程序会切回发送前的设备，不需要配置。
 
 ## 背景
 
@@ -246,7 +311,7 @@ ffmpeg 的设备序号（本机，2026-11-05）：
 ## 发送语音程序：`scripts/send_voice.py`
 
 > 2026-11-05 新增。核心逻辑在 `src/action/voice_sender.py`，单元测试在 `src/tests/test_voice_sender.py`。
-> 状态：合成部分已实测；程序的正式发送还**没有**实测（链路本身已经用测试脚本验证过，见上文）。
+> 状态：合成部分已实测；程序的正式发送还**没有**实测（链路本身已经用测试脚本验证过，见上文）。新电脑上的验证见文首「新电脑环境准备」第 6 步。
 
 ### 前提
 
@@ -347,8 +412,8 @@ ffmpeg 的设备序号（本机，2026-11-05）：
   - 顶层 `voice_styles` 按心情配 style 候选，当前 8 种心情各 10 个。句子没写 style 时，从它心情对应的候选里随机选；句子自己写了 style 的，优先用句子的。
   - 实测 style 对效果影响很大，连节奏都会变。例如同一句撒娇，换 style 后时长在 4.6 秒到 6.7 秒之间。
   - 实测同时发 4 个合成请求会触发百炼限流（HTTP 429 `Throttling.RateQuota`），改成一条一条发就正常。bot 每次只发一条语音，不受影响。
-  - 顶层 `voice_rate_jitter`（0～0.5，不配置为 0）让语速在配置值的基础上随机浮动，没配语速的句子以 1.0 为基准。当前配置为 0.05。
-  - 每次合成都随机换 `seed`（0～65535）。`seed` 对复刻声音有多大影响还没有实测。
+  - 顶层 `voice_rate_jitter`（0～0.5，不配置为 0）让语速在配置值的基础上随机浮动，没配语速的句子以 1.0 为基准。当前配置为 0.1。
+  - 每次合成都随机换 `seed`（0～65535）。实测 seed 基本不起作用：同一个 seed 两次结果不同，不同 seed 结果反而可能一样。不过同一句话本身每次合成都会自然有变化。
 - 心情名称不存在或数值超出范围的条目，在 bot 启动时报 ❌ 并跳过。
 - 发语音前会重新打开群并校验标题，校验不通过就不发，避免发错群。语音失败只记日志，不重试，不影响已发出的文字。
 - 发一条语音会让主循环等待大约「合成时间 + 语音时长 + 3 秒」。

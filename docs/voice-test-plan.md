@@ -23,7 +23,8 @@
 ### 0.2 依赖和权限
 
 ```bash
-brew install blackhole-2ch switchaudio-osx ffmpeg   # 装 BlackHole 后需要重启电脑
+brew install --cask blackhole-2ch   # 需要管理员密码，装完重启电脑
+brew install switchaudio-osx ffmpeg
 cd wechat-mac-rpa && .venv/bin/python -c "import Quartz, httpx; print('ok')"
 ```
 
