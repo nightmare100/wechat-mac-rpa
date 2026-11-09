@@ -8,6 +8,7 @@ import re
 import threading
 import time
 import unicodedata
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -659,9 +660,41 @@ class MemoryEngine:
                 max_chars = 10000
             content = self._enforce_wiki_limits(content, max_chars=max_chars)
             content = self._sanitize_wiki_aliases(content, path.stem)
+            if path.exists():
+                self._backup_wiki(path, path.read_text(encoding="utf-8"))
             path.write_text(content, encoding="utf-8")
         except Exception as e:
             _logger.warning(f"保存 wiki 失败 {path}: {e}")
+
+    WIKI_BACKUP_KEEP = 5  # 每份 wiki 保留最近几份旧版
+    SHRINK_GUARD_MIN_CHARS = 500  # 旧版至少这么长才做缩水检查
+    SHRINK_GUARD_RATIO = 0.5  # 新版短于旧版这个比例就不覆盖
+
+    def _history_dir(self, path: Path) -> Path:
+        return path.parent.parent / "history" / path.parent.name / path.stem
+
+    def _backup_wiki(self, path: Path, content: str, suffix: str = ".md") -> None:
+        """把内容存到 wiki/history/<users|groups>/<名字>/<时间><suffix>；旧版只保留最近 WIKI_BACKUP_KEEP 份。"""
+        try:
+            d = self._history_dir(path)
+            d.mkdir(parents=True, exist_ok=True)
+            (d / f"{datetime.now():%Y%m%d-%H%M%S-%f}{suffix}").write_text(content, encoding="utf-8")
+            backups = sorted(f for f in d.glob("*.md") if not f.name.endswith(".rejected.md"))
+            for old in backups[:-self.WIKI_BACKUP_KEEP]:
+                old.unlink()
+        except Exception as e:
+            _logger.warning(f"备份 wiki 失败 {path}: {e}")
+
+    def _shrunk_too_much(self, path: Path, new_wiki: str) -> bool:
+        """旧版 ≥ SHRINK_GUARD_MIN_CHARS 且新版短于其 SHRINK_GUARD_RATIO 时，视为 LLM 输出残缺，不覆盖。"""
+        if not path.exists():
+            return False
+        old_len = len(path.read_text(encoding="utf-8").strip())
+        if old_len < self.SHRINK_GUARD_MIN_CHARS or len(new_wiki) >= old_len * self.SHRINK_GUARD_RATIO:
+            return False
+        _logger.warning(f"[WikiGuard] {path.stem} 新版 {len(new_wiki)} 字 < 旧版 {old_len} 字的一半，不覆盖")
+        self._backup_wiki(path, new_wiki, suffix=".rejected.md")
+        return True
 
     def _sanitize_wiki_aliases(self, content: str, main_name: str) -> str:
         """落盘前清洗 wiki 别名行（运行期护栏，防止 LLM 再积垃圾 token）。
@@ -820,6 +853,8 @@ class MemoryEngine:
                 # 清理 LLM 常见开场白/前缀
                 new_wiki = self._strip_llm_prefix(new_wiki)
                 if new_wiki and len(new_wiki) > 50:
+                    if self._shrunk_too_much(path, new_wiki):
+                        return ""
                     self._save_wiki(path, new_wiki)
                     self._save_prompt(path, current_prompt)
                     return new_wiki

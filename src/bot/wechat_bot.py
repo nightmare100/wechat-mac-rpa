@@ -870,7 +870,8 @@ class WeChatBot:
     def _skip_wake_backlog(self, chat_name: str, unreplied: list) -> list:
         """醒来后 WAKE_BACKLOG_SECONDS 内，每个聊天第一次合并出的未回复消息视为夜里积压，标记已读不回复。
 
-        消息有 create_time 时只跳过醒来前发的；没有时间戳的整批视为积压。
+        识别出了时间（timestamp 非空）且 create_time 晚于醒来的消息保留，其余视为积压。
+        没识别出时间时 create_time 是识别时刻（smart_pipeline 兜底），不能据此判断。
         """
         woke_at = getattr(self, "_woke_at", None)
         if (woke_at is None or not unreplied
@@ -882,7 +883,8 @@ class WeChatBot:
         backlog, keep = [], []
         for msg in unreplied:
             ct = getattr(msg, "create_time", None)
-            is_new = woke_ts is not None and isinstance(ct, (int, float)) and ct >= woke_ts
+            is_new = (woke_ts is not None and bool(getattr(msg, "timestamp", None))
+                      and isinstance(ct, (int, float)) and ct >= woke_ts)
             (keep if is_new else backlog).append(msg)
         for msg in backlog:
             self.global_store.mark_replied(chat_name, msg, "")

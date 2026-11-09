@@ -84,13 +84,23 @@ class TestBotSleep:
         WeChatBot._check_sleep(bot, _at("03:00"))
         WeChatBot._check_sleep(bot, _at("07:30"))
         woke = _at("07:30").timestamp()
-        night = SimpleNamespace(create_time=int(woke) - 3600)
-        morning = SimpleNamespace(create_time=int(woke) + 1200)
+        night = SimpleNamespace(create_time=int(woke) - 3600, timestamp="2026-11-08 06:30:00")
+        morning = SimpleNamespace(create_time=int(woke) + 1200, timestamp="2026-11-08 07:50:00")
         assert WeChatBot._skip_wake_backlog(bot, "人格测试", [night, morning]) == [morning]
         bot.global_store.mark_replied.assert_called_once_with("人格测试", night, "")
 
-        only_new = [SimpleNamespace(create_time=int(woke) + 60)]
+        only_new = [SimpleNamespace(create_time=int(woke) + 60, timestamp="2026-11-08 07:31:00")]
         assert WeChatBot._skip_wake_backlog(bot, "弓箭2战神公会", only_new) == only_new
+
+    def test_fallback_create_time_without_timestamp_is_backlog(self):
+        """截图没识别出时间时 create_time 是识别时刻，不能据此当成醒来后的新消息。"""
+        bot = _fake_bot()
+        WeChatBot._check_sleep(bot, _at("03:00"))
+        WeChatBot._check_sleep(bot, _at("07:30"))
+        woke = _at("07:30").timestamp()
+        night = SimpleNamespace(create_time=int(woke) + 5, timestamp="")
+        assert WeChatBot._skip_wake_backlog(bot, "人格测试", [night]) == []
+        bot.global_store.mark_replied.assert_called_once_with("人格测试", night, "")
 
     def test_no_skip_without_sleep(self):
         bot = _fake_bot()
