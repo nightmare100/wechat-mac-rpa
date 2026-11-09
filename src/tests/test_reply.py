@@ -86,7 +86,7 @@ class TestReplyGenerator:
         assert [message.text for message in root.findall("./history/message")] == ["Alice：旧消息"]
         assert [message.text for message in root.findall("./unread/message")] == ["Alice：新消息 <确认>"]
 
-    def test_self_history_is_separated_and_forbidden_after_unread(self):
+    def test_self_history_is_interleaved_and_also_forbidden_after_unread(self):
         gen = ReplyGenerator(llm_client=None, tool_registry=_TEST_TOOL_REGISTRY)
         other = ChatMessage(
             text="真人旧消息",
@@ -110,7 +110,11 @@ class TestReplyGenerator:
         prompt = gen._build_user_prompt([unread], [other, self_reply, unread], is_group=True)
         root = ET.fromstring(prompt)
 
-        assert [message.text for message in root.findall("./history/message")] == ["Alice：真人旧消息"]
+        # bot 自己的回复按原顺序留在 history 里（role="self"），模型能看到完整的一来一回
+        history = root.findall("./history/message")
+        assert [m.text for m in history] == ["Alice：真人旧消息", "我：Bot 已用旧梗"]
+        assert [m.attrib["role"] for m in history] == ["other", "self"]
+        assert [m.attrib["index"] for m in history] == ["1", "2"]
         consumed = root.find("./consumed_self_replies")
         assert consumed is not None
         assert consumed.attrib["reuse"] == "forbidden"

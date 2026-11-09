@@ -1512,7 +1512,6 @@ class ReplyGenerator:
             history_items = [
                 self._message_element(m, i, enable_timestamps)
                 for i, m in enumerate(recent, 1)
-                if m.sender_type != SenderType.SELF
             ]
             if history_items:
                 sections.append("<history>\n" + "\n".join(history_items) + "\n</history>")
