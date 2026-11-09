@@ -221,6 +221,7 @@ class ReplyGenerator:
         self.llm_client = llm_client
         self.voice_prompt = voice_prompt  # 回复语音：启用时追加到群聊 system prompt（见 src/reply/voice_policy.py）
         self.last_voice_meta: Optional[Dict] = None
+        self.last_go_online: bool = False  # 本次回复是否答应朧月上线（触发静默）
         self.memory_engine = memory_engine
         self.tool_registry = tool_registry or get_registry()
         self.judge_worker = judge_worker
@@ -825,6 +826,9 @@ class ReplyGenerator:
                         assistant_msg["reasoning_content"] = self.last_thinking
                     messages.append(assistant_msg)
                     replies = self._parse_replies(text)
+                    if replies:
+                        parsed_json = self._extract_json(text)
+                        self.last_go_online = isinstance(parsed_json, dict) and parsed_json.get("go_online") is True
                     if replies and self.voice_prompt and self.last_voice_meta is None:
                         from src.reply.voice_policy import parse_voice_meta
                         self.last_voice_meta = parse_voice_meta((self._extract_json(text) or {}).get("voice"))
@@ -890,6 +894,7 @@ class ReplyGenerator:
         t_generate_start = time.time()
         self.last_generation_failed = False
         self.last_voice_meta = None
+        self.last_go_online = False
         if not unreplied:
             self._submit_to_judge(tick_id, [], unreplied, all_messages, is_group)
             return []

@@ -3,6 +3,8 @@
 
 import logging as _logging
 import os
+import random
+import re
 import time
 from datetime import datetime
 from pathlib import Path
@@ -29,6 +31,12 @@ from src.utils.debug_logger import DebugLogger
 
 SLEEP_CHECK_SECONDS = 30  # 休眠中多久检查一次是否到点醒来
 WAKE_BACKLOG_SECONDS = 1800  # 醒来后多长时间内，聊天第一次看到的未回复消息算夜里积压
+ONLINE_SILENCE_MINUTES = (20, 30)  # 答应朧月上线后静默多少分钟（随机）
+_OBOROZUKI_RE = re.compile(r"[朧胧]月")  # 朧月的昵称，「Mr」后的符号常被识别成别的字
+
+
+def _is_oborozuki(sender: str) -> bool:
+    return bool(_OBOROZUKI_RE.search(sender or ""))
 
 
 def _raw_with_thinking(raw_response: str, thinking: str) -> str:
@@ -136,6 +144,7 @@ class WeChatBot:
         self._asleep = False
         self._woke_at: Optional[float] = None
         self._backlog_skipped_chats: set = set()
+        self._online_until: dict = {}  # 聊天名 → 静默截止（monotonic），答应朧月上线后设置
 
         # 动态注册 send_file 工具（需要 sender 实例）
         def _load_shareable_files() -> dict:
@@ -492,6 +501,16 @@ class WeChatBot:
                     self.debug_logger.log_action("switch", action_input=switch_target, success=True)
                 return
 
+            # 答应朧月上线后的静默期：只放行朧月 @ 囡囡的消息，其余标记已处理、不回复
+            to_reply = self._filter_online_silence(chat_name, unreplied, to_reply)
+            if not to_reply:
+                self.logger.log_decision(
+                    tick_id, should_reply=False, reason="上线静默中",
+                    latest_text=unreplied[-1].text if unreplied else "",
+                )
+                self.debug_logger.log_action("none", action_input="", success=False, error="上线静默中")
+                return
+
             # 传递完整消息上下文 + 所有未读消息，让 AI 生成多条回复
             all_messages = getattr(state, "messages", [])
             if not isinstance(all_messages, list):
@@ -727,6 +746,8 @@ class WeChatBot:
 
             if self.voice_policy is not None and is_group and sent_replies:
                 self.voice_policy.record_sent(chat_name, voiced)
+            if sent_replies and getattr(self.generator, "last_go_online", False):
+                self._start_online_silence(chat_name, to_reply)
 
             self._update_tick_send_result(
                 tick_id,
@@ -935,6 +956,34 @@ class WeChatBot:
         except Exception as e:
             self.logger.warning(f"[Recovery] 点击返回按钮异常: {e}")
             return False
+
+    def _start_online_silence(self, chat_name: str, replied_to: list) -> None:
+        """回复里答应了上线（go_online）且这批消息里有朧月发的话，开始随机 20–30 分钟静默。"""
+        if not any(_is_oborozuki(m.sender) for m in replied_to):
+            self.logger.info("🎮 回复带 go_online 但本批没有朧月的消息，忽略")
+            return
+        minutes = random.uniform(*ONLINE_SILENCE_MINUTES)
+        self._online_until[chat_name] = time.monotonic() + minutes * 60
+        until = datetime.fromtimestamp(time.time() + minutes * 60)
+        self.logger.info(f"🎮 答应朧月上线，'{chat_name}' 静默到 {until:%H:%M}（{minutes:.0f} 分钟）")
+
+    def _filter_online_silence(self, chat_name: str, unreplied: list, to_reply: list) -> list:
+        """静默期内只保留朧月 @ 囡囡的消息；其余未回复消息标记已处理，静默结束后也不补回。"""
+        until = getattr(self, "_online_until", {}).get(chat_name)
+        if until is None:
+            return to_reply
+        if time.monotonic() >= until:
+            del self._online_until[chat_name]
+            self.logger.info(f"🎮 '{chat_name}' 上线静默结束，恢复正常回复")
+            return to_reply
+        allowed = [m for m in to_reply if _is_oborozuki(m.sender) and getattr(m, "is_at_me", False)]
+        allowed_ids = {id(m) for m in allowed}
+        skipped = [m for m in unreplied if id(m) not in allowed_ids]
+        for msg in skipped:
+            self.global_store.mark_replied(chat_name, msg, "")
+        if skipped:
+            self.logger.info(f"🎮 上线静默中，跳过 '{chat_name}' 的 {len(skipped)} 条消息")
+        return allowed
 
     def _switch_allowed(self, name: str) -> bool:
         """免回复聊天不切换；静默模式下非白名单聊天也不切换（避免点开并上传无关聊天的截图）。"""
