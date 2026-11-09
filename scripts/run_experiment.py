@@ -275,6 +275,8 @@ def run_experiment(exp_config: BotConfig, tick_ids: list):
         if not all_messages or not unreplied:
             print(f"  #{tid}: 跳过（空消息列表）")
             continue
+        # 两份 JSON 反序列化出的是不同对象；generator 按对象排除未读，这里取 all_messages 尾部同一批对象
+        unreplied = all_messages[-len(unreplied):]
 
         is_group = bool(d.get("is_group", 0))
 

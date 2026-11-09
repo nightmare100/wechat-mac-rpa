@@ -24,6 +24,7 @@ from src.memory.evidence import (
     is_self_message,
     strip_unverified_lines,
 )
+from src.memory import engine as engine_module
 from src.memory.engine import MemoryEngine
 from src.memory.wiki_prompts import BATCH_UPDATE_GROUP_PROMPT, RUNTIME_UPDATE_GROUP_PROMPT
 from src.models.base import ChatMessage, SenderType
@@ -201,6 +202,15 @@ class TestBotRoleExclusion:
     def test_group_wiki_prompt_rejects_bot_originated_memes(self, prompt):
         assert "群内梗、文化和常用语只能从真人成员的明确发言归纳" in prompt
         assert "无法归因到真人成员的明确发言，必须删除" in prompt
+
+    @pytest.mark.parametrize(
+        "prompt",
+        [RUNTIME_UPDATE_GROUP_PROMPT, BATCH_UPDATE_GROUP_PROMPT, engine_module._UPDATE_PROMPT],
+    )
+    def test_wiki_prompt_says_bot_replies_are_omitted(self, prompt):
+        """输入对话刻意去掉了 Bot 的回复；提示词必须说明，否则模型会写出「Bot 从不回应」。"""
+        assert "对话内容已去掉 Bot 自己的回复" in prompt
+        assert "不得据此推断或记录 Bot 是否回应" in prompt
 
 
 # ── 3. assistant-history evidence exclusion (self-refine) ────────────────

@@ -1491,8 +1491,9 @@ class ReplyGenerator:
         if context_fields:
             sections.append("<context>\n" + "\n".join(context_fields) + "\n</context>")
 
-        # all_messages 的尾部是本批未读；从 history 中排除，避免同一输入出现两次。
-        history_messages = list(all_messages[:-len(unreplied)]) if unreplied else list(all_messages)
+        # 按对象排除本批未读，避免同一输入出现两次；未读不一定在末尾（中间可能夹着系统消息或「我」的消息）。
+        unread_ids = {id(m) for m in unreplied}
+        history_messages = [m for m in all_messages if id(m) not in unread_ids]
         if history_messages:
             def _msg_ts(m: ChatMessage) -> float:
                 if m.sender_type == SenderType.SELF and m.reply_time:

@@ -127,6 +127,31 @@ class TestReplyGenerator:
         assert "明确 @ 你时必须回复，不得输出空 replies" in "".join(guard.itertext())
         assert [child.tag for child in root][-3:] == ["unread", "consumed_self_replies", "reply_guard"]
 
+    def test_history_excludes_unread_by_identity_when_system_message_is_last(self):
+        """未读不在末尾（末尾是系统消息）时，history 不能重复未读、也不能丢系统消息。"""
+        gen = ReplyGenerator(llm_client=None, tool_registry=_TEST_TOOL_REGISTRY)
+        old = ChatMessage(text="旧话", sender="Alice", sender_type=SenderType.OTHER, chat_name="群")
+        ask = ChatMessage(text="问bot一句", sender="Alice", sender_type=SenderType.OTHER, chat_name="群")
+        system = ChatMessage(text="Bob加入了群聊", sender="系统", sender_type=SenderType.SYSTEM, chat_name="群")
+
+        root = ET.fromstring(gen._build_user_prompt([ask], [old, ask, system], is_group=True))
+
+        assert [m.text for m in root.findall("./history/message")] == ["Alice：旧话", "系统：Bob加入了群聊"]
+        assert [m.text for m in root.findall("./unread/message")] == ["Alice：问bot一句"]
+
+    def test_history_keeps_self_message_between_unread(self):
+        """未读中间夹着「我」的消息时，history 要保留这条，且不重复未读。"""
+        gen = ReplyGenerator(llm_client=None, tool_registry=_TEST_TOOL_REGISTRY)
+        old = ChatMessage(text="旧话", sender="Alice", sender_type=SenderType.OTHER, chat_name="群")
+        first = ChatMessage(text="A先问", sender="Alice", sender_type=SenderType.OTHER, chat_name="群")
+        mine = ChatMessage(text="手动回了一句", sender="我", sender_type=SenderType.SELF, chat_name="群")
+        second = ChatMessage(text="A追问", sender="Alice", sender_type=SenderType.OTHER, chat_name="群")
+
+        root = ET.fromstring(gen._build_user_prompt([first, second], [old, first, mine, second], is_group=True))
+
+        assert [m.text for m in root.findall("./history/message")] == ["Alice：旧话", "我：手动回了一句"]
+        assert [m.text for m in root.findall("./unread/message")] == ["Alice：A先问", "Alice：A追问"]
+
     def test_reply_guard_exists_without_self_history(self):
         gen = ReplyGenerator(llm_client=None, tool_registry=_TEST_TOOL_REGISTRY)
         unread = ChatMessage(
