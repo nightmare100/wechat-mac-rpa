@@ -862,22 +862,33 @@ class WeChatBot:
         elif not asleep and was_asleep:
             self.logger.info("☀️ 醒来，恢复轮询；各聊天第一次看到的积压消息不回复")
             self._woke_at = time.monotonic()
+            self._woke_at_ts = now.timestamp()
             self._backlog_skipped_chats = set()
         self._asleep = asleep
         return asleep
 
     def _skip_wake_backlog(self, chat_name: str, unreplied: list) -> list:
-        """醒来后 WAKE_BACKLOG_SECONDS 内，每个聊天第一次合并出的未回复消息视为夜里积压，标记已读不回复。"""
+        """醒来后 WAKE_BACKLOG_SECONDS 内，每个聊天第一次合并出的未回复消息视为夜里积压，标记已读不回复。
+
+        消息有 create_time 时只跳过醒来前发的；没有时间戳的整批视为积压。
+        """
         woke_at = getattr(self, "_woke_at", None)
         if (woke_at is None or not unreplied
                 or chat_name in self._backlog_skipped_chats
                 or time.monotonic() - woke_at > WAKE_BACKLOG_SECONDS):
             return unreplied
         self._backlog_skipped_chats.add(chat_name)
+        woke_ts = getattr(self, "_woke_at_ts", None)
+        backlog, keep = [], []
         for msg in unreplied:
+            ct = getattr(msg, "create_time", None)
+            is_new = woke_ts is not None and isinstance(ct, (int, float)) and ct >= woke_ts
+            (keep if is_new else backlog).append(msg)
+        for msg in backlog:
             self.global_store.mark_replied(chat_name, msg, "")
-        self.logger.info(f"☀️ 醒来后跳过 '{chat_name}' 的 {len(unreplied)} 条积压消息")
-        return []
+        if backlog:
+            self.logger.info(f"☀️ 醒来后跳过 '{chat_name}' 的 {len(backlog)} 条积压消息")
+        return keep
 
     _SERVICE_ACCOUNT_NAMES = {"服务号", "订阅号", "公众号"}
 

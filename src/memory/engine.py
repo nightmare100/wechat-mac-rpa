@@ -7,6 +7,7 @@ import math
 import re
 import threading
 import time
+import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -30,8 +31,19 @@ _logger = logging.getLogger("src.memory.engine")
 _ALIAS_BLACKLIST = {
     "Bot", "bot", "我", "对方", "对话中", "匿名", "未知昵称", "未知", "群主", "群聊主人",
     "群成员", "记录者", "记录人", "旁白", "示例交流群", "本人", "自己", "他人", "某人",
-    "无", "暂无", "未发现", "未发现其他显著别名",
+    "无", "暂无", "未发现", "未发现其他显著别名", "别名",
 }
+
+# 主名占位符：不是真人昵称，不建 wiki、不读记忆
+_PLACEHOLDER_NAMES = {"未知", "未知昵称", "匿名", "对方", "我", "自己", "Bot", "bot", "本人", "某人"}
+
+_UNVERIFIED_MARK_RE = re.compile(r"\[待验证\]")
+
+
+def _name_key(name: str) -> str:
+    """匹配用的名字：去掉 [待验证]、标点符号、emoji 和空格，英文不分大小写。只用于比较，不改显示名和文件名。"""
+    name = _UNVERIFIED_MARK_RE.sub("", name or "")
+    return "".join(c for c in name if unicodedata.category(c)[0] in "LN").casefold()
 
 # 房号 / 单元号模式：如 "6幢5号501"、"4-1-703"、"1幢10号802"
 _ROOM_NUMBER_RE = re.compile(r"\d+\s*[幢栋号楼室单元]\s*\d|\d+-\d+-\d+|\d+幢\d+号")
@@ -291,10 +303,15 @@ class MemoryEngine:
                 _logger.warning(f"加载 corrections 失败: {e}")
 
     def _resolve_alias(self, user_name: str) -> str:
-        """根据别名找到主用户名。"""
+        """根据别名找到主用户名：先精确匹配，再按 _name_key 匹配（忽略 [待验证] 和符号）。"""
         for main_name, aliases in self._aliases.items():
             if user_name == main_name or user_name in aliases:
                 return main_name
+        key = _name_key(user_name)
+        if key:
+            for main_name, aliases in self._aliases.items():
+                if key == _name_key(main_name) or any(key == _name_key(a) for a in aliases):
+                    return main_name
         return user_name
 
     def _all_names_for(self, user_name: str) -> List[str]:
@@ -397,12 +414,14 @@ class MemoryEngine:
         顺序（高优先级在前）：实体级权威纠正 → 人工 facts → wiki 本体。
         这样即使截断也保留权威纠正。运行时剔除 [待验证] 派生行。
         """
+        if not self._is_valid_main_name(user_name):
+            return ""
         resolved = self._resolve_alias(user_name)
         all_names = self._all_names_for(resolved)
 
-        # 合并所有别名的 wiki（运行时剔除 [待验证] 派生行）
+        # 合并所有别名的 wiki（运行时剔除 [待验证] 派生行）；别名带 [待验证] 时按去掉标记后的文件名找
         wikis = []
-        for name in all_names:
+        for name in dict.fromkeys(_UNVERIFIED_MARK_RE.sub("", n).strip() for n in all_names):
             path = self.wiki_dir / "users" / f"{name}.md"
             if path.exists():
                 wikis.append(strip_unverified_lines(self._load_wiki(path)))
@@ -437,6 +456,40 @@ class MemoryEngine:
         wiki_text = "\n\n".join(parts)
 
         return self._compress_wiki(wiki_text, max_chars)
+
+    _BRIEF_DROP_SECTIONS = {"别名", "共同群聊", "MBTI", "说过的话（短期）"}
+    _SOURCE_NOTE_RE = re.compile(r"[（(]来源[:：][^）)]*[）)]")
+    _EMPTY_FIELD_RE = re.compile(r"^-\s*[^：:]+[：:]\s*$")
+
+    def get_user_brief(self, user_name: str, max_chars: int = 400) -> str:
+        """群聊用的精简个人记忆：去空字段、（暂无）、来源标注、别名/共同群聊/MBTI/原话摘录，按整行截断。"""
+        full = self.get_user_memory(user_name, max_chars=6000)
+        out: List[str] = []
+        for sec in re.split(r"(?=^## )", full, flags=re.MULTILINE):
+            lines = sec.strip().splitlines()
+            if not lines or not lines[0].startswith("## "):
+                continue
+            title = lines[0][3:].strip()
+            if title in self._BRIEF_DROP_SECTIONS:
+                continue
+            body = []
+            for line in lines[1:]:
+                line = self._SOURCE_NOTE_RE.sub("", line).rstrip()
+                s = line.strip()
+                if not s or s.startswith("# ") or s in ("（暂无）", "(暂无)") or self._EMPTY_FIELD_RE.match(s):
+                    continue
+                body.append(line)
+            if body:
+                out.append(f"{title}：")
+                out.extend(body)
+        kept: List[str] = []
+        total = 0
+        for line in out:
+            if total + len(line) + (1 if kept else 0) > max_chars:
+                break
+            total += len(line) + (1 if kept else 0)
+            kept.append(line)
+        return "\n".join(kept)
 
     def get_group_memory(self, group_name: str, max_chars: int = 2000) -> str:
         """读取群聊 wiki（含外挂 corrections），返回压缩后的摘要。
@@ -884,6 +937,8 @@ class MemoryEngine:
         """
         name = name.strip()
         if not name or name.startswith("."):
+            return False
+        if name in _PLACEHOLDER_NAMES or not _name_key(name):
             return False
         if len(name) > 64:
             return False

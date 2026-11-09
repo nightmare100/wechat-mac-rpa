@@ -1468,9 +1468,22 @@ class ReplyGenerator:
             if is_group and chat_name:
                 t_m3 = time.time()
                 group_text = self.memory_engine.get_group_memory(chat_name, max_chars=6000)
-                t_mem_ms["group"] = (time.time() - t_m3) * 1000
                 if group_text:
                     context_fields.append(f"<group_memory>{xml_escape(group_text)}</group_memory>")
+                # 本批发言人的精简个人记忆：去重，最近发言的在前，最多 3 人
+                senders: List[str] = []
+                for m in reversed(unreplied):
+                    name = (m.sender or "").split(" @")[0]
+                    if name and name != "我" and name not in senders:
+                        senders.append(name)
+                for name in senders[:3]:
+                    brief = self.memory_engine.get_user_brief(name, max_chars=400)
+                    if brief:
+                        context_fields.append(
+                            f'<participant_memory subject="{xml_escape(name, quote=True)}">'
+                            f"{xml_escape(brief)}</participant_memory>"
+                        )
+                t_mem_ms["group"] = (time.time() - t_m3) * 1000
             _logger.info("[Perf][Memory] %s", " ".join(f"{k}={v:.0f}ms" for k, v in t_mem_ms.items()))
 
         if tools_context:

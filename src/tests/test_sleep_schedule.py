@@ -78,6 +78,20 @@ class TestBotSleep:
         later = [Mock()]
         assert WeChatBot._skip_wake_backlog(bot, "人格测试", later) == later
 
+    def test_messages_after_wake_are_kept(self):
+        """有 create_time 时只跳过醒来前发的；醒来后第一次 @ 不能被当成积压。"""
+        bot = _fake_bot()
+        WeChatBot._check_sleep(bot, _at("03:00"))
+        WeChatBot._check_sleep(bot, _at("07:30"))
+        woke = _at("07:30").timestamp()
+        night = SimpleNamespace(create_time=int(woke) - 3600)
+        morning = SimpleNamespace(create_time=int(woke) + 1200)
+        assert WeChatBot._skip_wake_backlog(bot, "人格测试", [night, morning]) == [morning]
+        bot.global_store.mark_replied.assert_called_once_with("人格测试", night, "")
+
+        only_new = [SimpleNamespace(create_time=int(woke) + 60)]
+        assert WeChatBot._skip_wake_backlog(bot, "弓箭2战神公会", only_new) == only_new
+
     def test_no_skip_without_sleep(self):
         bot = _fake_bot()
         msgs = [Mock()]
