@@ -83,7 +83,7 @@ def test_named_without_at_opens_thread():
 
 def test_chime_in_opens_thread_like_at():
     t, _ = _tracker(rounds=3)
-    t.record("g", [_m("得闲射击", "100 抽 5 件套")], ["@得闲射击 欧皇"], fresh=True)
+    t.record("g", [_m("得闲射击", "100 抽 5 件套")], ["@得闲射击 欧皇"], fresh_targets={"得闲射击"})
     assert t.candidates("g") == [("得闲射击", 3)]
     t.record("g", [_m("得闲射击", "哈哈 运气好")], ["@得闲射击 羡慕"])
     assert t.candidates("g") == [("得闲射击", 2)]

@@ -655,9 +655,13 @@ class WeChatBot:
                     return
                 # LLM 返回空 replies = 判断无需回复（群聊没@我/纯表情包等），
                 # 属正常决策。补明确日志，避免被误读为"漏回"。
+                no_reply_reason = (
+                    "主动插话冷却中，丢弃" if getattr(self.generator, "last_chime_in_dropped", False) is True
+                    else "LLM 判断无需回复"
+                )
                 self.logger.log_decision(
                     tick_id, should_reply=False,
-                    reason=f"LLM 判断无需回复 (未读 {len(unreplied)} 条，均已处理)",
+                    reason=f"{no_reply_reason} (未读 {len(unreplied)} 条，均已处理)",
                     latest_text=unreplied[-1].text if unreplied else ""
                 )
                 self.debug_logger.log_action("none", action_input="", success=False, error="LLM 判断无需回复")

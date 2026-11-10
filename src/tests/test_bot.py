@@ -322,6 +322,31 @@ class TestWeChatBot:
             "测试群", msg, "(未回复)"
         )
 
+    def test_chime_in_dropped_logs_cooldown_reason(self, bot, tmp_path):
+        msg = ChatMessage(text="100 抽 5 件套", sender="A", sender_type=SenderType.OTHER, chat_name="测试群")
+        bot.perception = Mock()
+        bot.perception.perceive.return_value = PerceptionResult(
+            chat_name="测试群", messages=[msg], chat_list_items=[], screenshot_path=str(tmp_path / "chime.png"),
+        )
+        bot.policy = Mock()
+        bot.policy.should_reply.return_value = True
+        bot.generator = Mock(last_generation_failed=False, last_chime_in_dropped=True)
+        bot.generator.generate.return_value = []
+        bot.generator.text_for_logging.side_effect = lambda text: text
+        bot.generator.messages_for_logging.side_effect = lambda messages: messages
+        bot.sender = Mock(silent_mode=False)
+        state = Mock(messages=[msg])
+        bot.global_store = Mock()
+        bot.global_store.merge_tick.return_value = (state, [msg])
+        bot.global_store.chats = {"测试群": state}
+        bot.logger.log_decision = Mock()
+
+        bot.tick()
+
+        reasons = [c.kwargs.get("reason", "") for c in bot.logger.log_decision.call_args_list]
+        assert any("主动插话冷却中" in r for r in reasons)
+        bot.global_store.mark_replied.assert_called_once_with("测试群", msg, "(未回复)")
+
 
 # ---- 回复语音 ----
 from src.reply.voice_policy import DEFAULTS as VOICE_DEFAULTS  # noqa: E402

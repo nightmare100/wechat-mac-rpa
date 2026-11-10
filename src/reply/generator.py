@@ -98,6 +98,14 @@ def _same_person(a: str, b: str) -> bool:
     return len(a) == len(b) >= 3 and sum(x != y for x, y in zip(a, b)) <= 1
 
 
+def _reply_target(reply: str, unreplied: List[ChatMessage]) -> Optional[str]:
+    """回复的对象：开头 @ 的昵称；没有 @ 时，未读只来自一个人才算他。认不出返回 None。"""
+    m = _LEADING_AT_RE.match(reply)
+    senders = {u.sender for u in unreplied if u.sender_type == SenderType.OTHER}
+    target = m.group(1) if m else (next(iter(senders)) if len(senders) == 1 else None)
+    return None if not target or target in _UNKNOWN_SENDERS else target
+
+
 class FollowupTracker:
     def __init__(self, rounds: Tuple[int, int] = FOLLOWUP_ROUNDS, ttl: float = FOLLOWUP_TTL_SECONDS,
                  randint: Callable[[int, int], int] = random.randint, now: Callable[[], float] = time.time):
@@ -111,19 +119,18 @@ class FollowupTracker:
         now = self.now()
         return [(s, r) for s, (r, t) in self.threads.get(chat, {}).items() if r > 0 and now - t <= self.ttl]
 
-    def record(self, chat: str, unreplied: List[ChatMessage], replies: List[str], fresh: bool = False) -> None:
-        """fresh=True：本次是放行的主动插话，和被 @ 一样给新的接话额度。"""
-        senders = {m.sender for m in unreplied if m.sender_type == SenderType.OTHER}
+    def record(self, chat: str, unreplied: List[ChatMessage], replies: List[str], fresh_targets=()) -> None:
+        """fresh_targets：放行的主动插话对象，和被 @ 一样给新的接话额度。"""
         for reply in replies:
-            m = _LEADING_AT_RE.match(reply)
-            target = m.group(1) if m else (next(iter(senders)) if len(senders) == 1 else None)
-            if not target or target in _UNKNOWN_SENDERS:
+            target = _reply_target(reply, unreplied)
+            if not target:
                 continue
             msgs = [u for u in unreplied if _same_person(u.sender, target)]
             if not msgs:
                 continue
             chat_threads = self.threads.setdefault(chat, {})
             key = self._find(chat, target)
+            fresh = any(_same_person(target, f) for f in fresh_targets)
             if fresh or any(mentions_bot(u.text) or getattr(u, "quoted_text", "") for u in msgs):
                 if key:
                     del chat_threads[key]
@@ -225,6 +232,7 @@ class ReplyGenerator:
         self.last_voice_meta: Optional[Dict] = None
         self.last_go_online: bool = False  # 本次回复是否答应朧月上线（触发静默）
         self.last_chime_in: bool = False  # 本次回复 LLM 是否标了主动插话
+        self.last_chime_in_dropped: bool = False  # 本次是否有主动插话因冷却被丢弃（bot 记录原因用）
         self.chime_in_cooldown = _env_int("CHIME_IN_COOLDOWN_MINUTES", 60, 0, 1440) * 60  # 每个群主动插话的冷却（秒）
         self.chime_in_last: Dict[str, float] = {}  # 聊天名 → 上次主动插话的时间
         self.memory_engine = memory_engine
@@ -902,6 +910,7 @@ class ReplyGenerator:
         self.last_voice_meta = None
         self.last_go_online = False
         self.last_chime_in = False
+        self.last_chime_in_dropped = False
         if not unreplied:
             self._submit_to_judge(tick_id, [], unreplied, all_messages, is_group)
             return []
@@ -1085,16 +1094,11 @@ class ReplyGenerator:
         # 更新最终观测字段
         replies = _apply_laugh_cooldown(replies, all_messages)
         replies = _apply_emoji_cooldown(replies, all_messages)
-        fresh = False
-        if is_group and replies and self.last_chime_in and not self._has_reply_trigger(chat_name, unreplied):
-            if self.chime_in_allowed(chat_name):
-                self.chime_in_last[chat_name] = time.time()
-                fresh = True
-            else:
-                _logger.info("[ChimeIn] '%s' 冷却中，丢弃主动插话: %s", chat_name, replies)
-                replies = []
+        fresh_targets: set = set()
+        if is_group and replies and self.last_chime_in:
+            replies, fresh_targets = self._apply_chime_in_limit(chat_name, unreplied, replies)
         if is_group:
-            self.followup.record(chat_name, unreplied, replies, fresh=fresh)
+            self.followup.record(chat_name, unreplied, replies, fresh_targets=fresh_targets)
             replies = _apply_at_policy(replies)
         self.last_llm_messages = [dict(m) for m in final_messages]
         # last_raw_response 保留原始 generation 的 raw_response，self-refine 的原文单独存
@@ -1110,8 +1114,33 @@ class ReplyGenerator:
     def chime_in_allowed(self, chat_name: str) -> bool:
         return time.time() - self.chime_in_last.get(chat_name, float("-inf")) >= self.chime_in_cooldown
 
+    def _apply_chime_in_limit(self, chat_name: str, unreplied: List[ChatMessage],
+                              replies: List[str]) -> Tuple[List[str], set]:
+        """LLM 标了 chime_in 时逐条判断：对象有现有触发的照常发；其余算主动插话，冷却中丢弃，放行则开始冷却。"""
+        allowed = self.chime_in_allowed(chat_name)
+        kept, fresh_targets, dropped, chimed = [], set(), [], False
+        for reply in replies:
+            target = _reply_target(reply, unreplied)
+            # 认不出对象时按整批判断（偏保守：批里有触发就不当插话）
+            msgs = [m for m in unreplied if _same_person(m.sender, target)] if target else unreplied
+            if self._has_reply_trigger(chat_name, msgs):
+                kept.append(reply)
+            elif allowed:
+                kept.append(reply)
+                chimed = True
+                if target:
+                    fresh_targets.add(target)
+            else:
+                dropped.append(reply)
+        if chimed:
+            self.chime_in_last[chat_name] = time.time()
+        if dropped:
+            self.last_chime_in_dropped = True
+            _logger.info("[ChimeIn] '%s' 冷却中，丢弃主动插话: %s", chat_name, dropped)
+        return kept, fresh_targets
+
     def _has_reply_trigger(self, chat_name: str, unreplied: List[ChatMessage]) -> bool:
-        """未读里有现有触发（@ 我、提到我、引用、接话名单里的人），这时回复不算主动插话，不丢也不计冷却。"""
+        """这些消息里有现有触发（@ 我、提到我、引用、接话名单里的人），对应回复不算主动插话。"""
         candidates = [s for s, _ in self.followup.candidates(chat_name)]
         return any(
             mentions_bot(m.text) or getattr(m, "quoted_text", "")
