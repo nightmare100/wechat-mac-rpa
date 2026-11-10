@@ -45,6 +45,8 @@ tools = registry.to_openai_schemas()
 persona_path = PROJECT_ROOT / "data" / "persona.md"
 with open(persona_path, encoding="utf-8") as f:
     system_prompt = f.read()
+from src.utils.identity import render_persona
+system_prompt = render_persona(system_prompt)
 
 # 替换模板变量
 tools_desc = "\n".join(f"- {t.name}：{t.description}" for t in registry._tools.values())

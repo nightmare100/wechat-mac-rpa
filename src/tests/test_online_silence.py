@@ -4,24 +4,25 @@ import time
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-from src.bot.wechat_bot import WeChatBot, _is_oborozuki
+import pytest
+
+from src.bot.wechat_bot import WeChatBot
 from src.reply.generator import ReplyGenerator
 from src.tools import get_registry
 
 
-def _msg(sender, at=False):
-    return SimpleNamespace(sender=sender, is_at_me=at, text="x")
+def _msg(sender, at=False, text="x"):
+    return SimpleNamespace(sender=sender, is_at_me=at, text=text)
+
+
+@pytest.fixture(autouse=True)
+def identity_env(monkeypatch):
+    monkeypatch.setenv("BOT_AT_KEYWORD", "囡囡")
+    monkeypatch.setenv("BUDDY_MATCH", "朧月,胧月")
 
 
 def _bot():
     return SimpleNamespace(logger=Mock(), global_store=Mock(), _online_until={})
-
-
-def test_oborozuki_name_variants():
-    for name in ["Mr丿朧月", "Mrゞ胧月", "Mr✕朧月", "Mr乚胧月"]:
-        assert _is_oborozuki(name)
-    assert not _is_oborozuki("李桑")
-    assert not _is_oborozuki("")
 
 
 def test_start_requires_oborozuki_in_batch():
@@ -43,13 +44,24 @@ def test_no_silence_passes_through():
 def test_silence_only_allows_oborozuki_at():
     bot = _bot()
     bot._online_until["群"] = time.monotonic() + 600
-    obo_at = _msg("Mr丿朧月", at=True)
+    obo_at = _msg("Mr丿朧月", at=True, text="@『宵桜』囡囡 上了没")
     obo_plain = _msg("Mr丿朧月")
-    other_at = _msg("李桑", at=True)
+    other_at = _msg("李桑", at=True, text="@『宵桜』囡囡 在吗")
     unreplied = [obo_plain, other_at, obo_at]
     assert WeChatBot._filter_online_silence(bot, "群", unreplied, unreplied) == [obo_at]
     marked = [c.args[1] for c in bot.global_store.mark_replied.call_args_list]
     assert marked == [obo_plain, other_at]
+
+
+def test_silence_skips_oborozuki_at_someone_else():
+    """is_at_me 只表示消息里有 @；朧月 @ 别人或 @所有人不放行，OCR 认错昵称里的字仍放行。"""
+    bot = _bot()
+    bot._online_until["群"] = time.monotonic() + 600
+    at_other = _msg("Mr丿朧月", at=True, text="@李桑 来打boss")
+    at_all = _msg("Mr丿朧月", at=True, text="@所有人 发船了")
+    at_ocr_variant = _msg("Mr丿朧月", at=True, text="@『宵桉』囡囡 好了没")
+    unreplied = [at_other, at_all, at_ocr_variant]
+    assert WeChatBot._filter_online_silence(bot, "群", unreplied, unreplied) == [at_ocr_variant]
 
 
 def test_silence_expires():

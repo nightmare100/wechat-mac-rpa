@@ -4,7 +4,6 @@
 import logging as _logging
 import os
 import random
-import re
 import time
 from datetime import datetime
 from pathlib import Path
@@ -28,15 +27,11 @@ from src.session.global_store import GlobalStore
 from src.tools import get_registry, register_builtin_tools
 from src.utils.chat_utils import _is_group_chat_name, _normalize_chat_name
 from src.utils.debug_logger import DebugLogger
+from src.utils.identity import is_at_bot, is_buddy
 
 SLEEP_CHECK_SECONDS = 30  # 休眠中多久检查一次是否到点醒来
 WAKE_BACKLOG_SECONDS = 1800  # 醒来后多长时间内，聊天第一次看到的未回复消息算夜里积压
 ONLINE_SILENCE_MINUTES = (20, 30)  # 答应朧月上线后静默多少分钟（随机）
-_OBOROZUKI_RE = re.compile(r"[朧胧]月")  # 朧月的昵称，「Mr」后的符号常被识别成别的字
-
-
-def _is_oborozuki(sender: str) -> bool:
-    return bool(_OBOROZUKI_RE.search(sender or ""))
 
 
 def _raw_with_thinking(raw_response: str, thinking: str) -> str:
@@ -121,6 +116,7 @@ class WeChatBot:
             enable_timestamps=True,
             voice_prompt=voice_prompt,
         )
+        self.generator._system_prompt()  # persona 占位符（BOT_NAME 等）未配置时启动即报错
         self.sender = WeChatMessageSender(silent_mode=os.environ.get("WECHAT_SILENT_MODE") == "1")
         # 定时推送：目标群为 SILENT_WHITELIST，配置见 src/bot/scheduled_push.py
         self.scheduled_pusher = ScheduledPusher(
@@ -959,7 +955,7 @@ class WeChatBot:
 
     def _start_online_silence(self, chat_name: str, replied_to: list) -> None:
         """回复里答应了上线（go_online）且这批消息里有朧月发的话，开始随机 20–30 分钟静默。"""
-        if not any(_is_oborozuki(m.sender) for m in replied_to):
+        if not any(is_buddy(m.sender) for m in replied_to):
             self.logger.info("🎮 回复带 go_online 但本批没有朧月的消息，忽略")
             return
         minutes = random.uniform(*ONLINE_SILENCE_MINUTES)
@@ -976,7 +972,7 @@ class WeChatBot:
             del self._online_until[chat_name]
             self.logger.info(f"🎮 '{chat_name}' 上线静默结束，恢复正常回复")
             return to_reply
-        allowed = [m for m in to_reply if _is_oborozuki(m.sender) and getattr(m, "is_at_me", False)]
+        allowed = [m for m in to_reply if is_buddy(m.sender) and is_at_bot(m.text)]
         allowed_ids = {id(m) for m in allowed}
         skipped = [m for m in unreplied if id(m) not in allowed_ids]
         for msg in skipped:

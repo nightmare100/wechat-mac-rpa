@@ -17,6 +17,7 @@ from src.reply.evidence_utils import strip_assistant_history_lines
 from src.reply.few_shot import PersonaFewShotRetriever
 from src.reply.session_memory import SessionMemory, _extract_query_key
 from src.tools import get_registry
+from src.utils.identity import render_persona, unresolved_persona_vars
 from src.utils.time_window import in_sleep_window, parse_sleep_hours
 
 _logger = logging.getLogger("src.reply.generator")
@@ -1307,6 +1308,10 @@ class ReplyGenerator:
             # fallback 到默认 prompt
             prompt = "<instructions><persona>你是示例用户甲本人。用户不是在跟AI聊天，是在微信上给示例用户甲发消息。</persona></instructions>"
 
+        prompt = render_persona(prompt)
+        missing = unresolved_persona_vars(prompt)
+        if missing:
+            raise RuntimeError(f"persona 用到的 {', '.join(missing)} 未在 .env 中配置（见 .env.example）")
         return prompt
 
     def _build_tools_context(self, chat_name: str) -> str:
