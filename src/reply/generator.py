@@ -17,7 +17,7 @@ from src.reply.evidence_utils import strip_assistant_history_lines
 from src.reply.few_shot import PersonaFewShotRetriever
 from src.reply.session_memory import SessionMemory, _extract_query_key
 from src.tools import get_registry
-from src.utils.identity import render_persona, unresolved_persona_vars
+from src.utils.identity import mentions_bot, render_persona, unresolved_persona_vars
 from src.utils.time_window import in_sleep_window, parse_sleep_hours
 
 _logger = logging.getLogger("src.reply.generator")
@@ -111,7 +111,8 @@ class FollowupTracker:
         now = self.now()
         return [(s, r) for s, (r, t) in self.threads.get(chat, {}).items() if r > 0 and now - t <= self.ttl]
 
-    def record(self, chat: str, unreplied: List[ChatMessage], replies: List[str]) -> None:
+    def record(self, chat: str, unreplied: List[ChatMessage], replies: List[str], fresh: bool = False) -> None:
+        """fresh=True：本次是放行的主动插话，和被 @ 一样给新的接话额度。"""
         senders = {m.sender for m in unreplied if m.sender_type == SenderType.OTHER}
         for reply in replies:
             m = _LEADING_AT_RE.match(reply)
@@ -123,7 +124,7 @@ class FollowupTracker:
                 continue
             chat_threads = self.threads.setdefault(chat, {})
             key = self._find(chat, target)
-            if any("@" in (u.text or "") or getattr(u, "quoted_text", "") for u in msgs):
+            if fresh or any(mentions_bot(u.text) or getattr(u, "quoted_text", "") for u in msgs):
                 if key:
                     del chat_threads[key]
                 chat_threads[target] = [self.randint(*self.rounds), self.now()]
@@ -223,6 +224,9 @@ class ReplyGenerator:
         self.voice_prompt = voice_prompt  # 回复语音：启用时追加到群聊 system prompt（见 src/reply/voice_policy.py）
         self.last_voice_meta: Optional[Dict] = None
         self.last_go_online: bool = False  # 本次回复是否答应朧月上线（触发静默）
+        self.last_chime_in: bool = False  # 本次回复 LLM 是否标了主动插话
+        self.chime_in_cooldown = _env_int("CHIME_IN_COOLDOWN_MINUTES", 60, 0, 1440) * 60  # 每个群主动插话的冷却（秒）
+        self.chime_in_last: Dict[str, float] = {}  # 聊天名 → 上次主动插话的时间
         self.memory_engine = memory_engine
         self.tool_registry = tool_registry or get_registry()
         self.judge_worker = judge_worker
@@ -830,6 +834,7 @@ class ReplyGenerator:
                     if replies:
                         parsed_json = self._extract_json(text)
                         self.last_go_online = isinstance(parsed_json, dict) and parsed_json.get("go_online") is True
+                        self.last_chime_in = isinstance(parsed_json, dict) and parsed_json.get("chime_in") is True
                     if replies and self.voice_prompt and self.last_voice_meta is None:
                         from src.reply.voice_policy import parse_voice_meta
                         self.last_voice_meta = parse_voice_meta((self._extract_json(text) or {}).get("voice"))
@@ -896,6 +901,7 @@ class ReplyGenerator:
         self.last_generation_failed = False
         self.last_voice_meta = None
         self.last_go_online = False
+        self.last_chime_in = False
         if not unreplied:
             self._submit_to_judge(tick_id, [], unreplied, all_messages, is_group)
             return []
@@ -1079,8 +1085,16 @@ class ReplyGenerator:
         # 更新最终观测字段
         replies = _apply_laugh_cooldown(replies, all_messages)
         replies = _apply_emoji_cooldown(replies, all_messages)
+        fresh = False
+        if is_group and replies and self.last_chime_in and not self._has_reply_trigger(chat_name, unreplied):
+            if self.chime_in_allowed(chat_name):
+                self.chime_in_last[chat_name] = time.time()
+                fresh = True
+            else:
+                _logger.info("[ChimeIn] '%s' 冷却中，丢弃主动插话: %s", chat_name, replies)
+                replies = []
         if is_group:
-            self.followup.record(chat_name, unreplied, replies)
+            self.followup.record(chat_name, unreplied, replies, fresh=fresh)
             replies = _apply_at_policy(replies)
         self.last_llm_messages = [dict(m) for m in final_messages]
         # last_raw_response 保留原始 generation 的 raw_response，self-refine 的原文单独存
@@ -1092,6 +1106,18 @@ class ReplyGenerator:
                      self.last_feedback_decision, self.last_iterate_count)
         self._submit_to_judge(tick_id, replies, unreplied, all_messages, is_group)
         return replies
+
+    def chime_in_allowed(self, chat_name: str) -> bool:
+        return time.time() - self.chime_in_last.get(chat_name, float("-inf")) >= self.chime_in_cooldown
+
+    def _has_reply_trigger(self, chat_name: str, unreplied: List[ChatMessage]) -> bool:
+        """未读里有现有触发（@ 我、提到我、引用、接话名单里的人），这时回复不算主动插话，不丢也不计冷却。"""
+        candidates = [s for s, _ in self.followup.candidates(chat_name)]
+        return any(
+            mentions_bot(m.text) or getattr(m, "quoted_text", "")
+            or any(_same_person(m.sender, s) for s in candidates)
+            for m in unreplied
+        )
 
     def _truncate_messages(self, messages: List[Dict]) -> List[Dict]:
         """截断 OpenAI message 数组，防止 debug JSON 过大。
@@ -1448,6 +1474,8 @@ class ReplyGenerator:
             f"<chat_type>{'group' if is_group else 'private'}</chat_type>",
             f"<mentioned>{str(is_at).lower()}</mentioned>",
         ]
+        if is_group:
+            session_fields.append(f"<chime_in_allowed>{str(self.chime_in_allowed(chat_name)).lower()}</chime_in_allowed>")
         if enable_time_awareness:
             session_fields.append(f"<current_time>{now_dt.strftime('%Y-%m-%d %H:%M')}</current_time>")
             session_fields.append("<timestamp_semantics>消息时间是绝对时间，不代表消息刚刚发出。</timestamp_semantics>")

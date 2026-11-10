@@ -22,6 +22,12 @@ def is_at_bot(text: str) -> bool:
     return bool(keyword) and re.search(r"@\S{0,6}" + re.escape(keyword), text or "") is not None
 
 
+def mentions_bot(text: str) -> bool:
+    """消息文字里提到了 bot（BOT_AT_KEYWORD），带不带 @ 都算。"""
+    keyword = os.environ.get("BOT_AT_KEYWORD", "").strip()
+    return bool(keyword) and keyword in (text or "")
+
+
 def is_buddy(sender: str) -> bool:
     """发送者昵称含 BUDDY_MATCH 里任一写法（逗号分隔）。"""
     variants = [v.strip() for v in os.environ.get("BUDDY_MATCH", "").split(",") if v.strip()]

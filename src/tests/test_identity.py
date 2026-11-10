@@ -66,3 +66,13 @@ def test_system_prompt_raises_when_placeholder_unresolved(no_identity_env, tmp_p
         gen._system_prompt()
     no_identity_env.setenv("BOT_NAME", "囡囡")
     assert gen._system_prompt() == "你是「囡囡」"
+
+
+def test_mentions_bot_with_or_without_at(no_identity_env):
+    from src.utils.identity import mentions_bot
+    no_identity_env.setenv("BOT_AT_KEYWORD", "囡囡")
+    assert mentions_bot("完蛋 囡囡不见了")
+    assert mentions_bot("@『宵桜』囡囡 在吗")
+    assert not mentions_bot("@李桑 来打boss")
+    no_identity_env.delenv("BOT_AT_KEYWORD")
+    assert not mentions_bot("囡囡呢")

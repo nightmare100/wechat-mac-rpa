@@ -67,3 +67,23 @@ def test_rounds_are_random_between_3_and_5():
         t.record("g", [_m(f"人{i:03d}", "@囡囡 hi")], [f"@人{i:03d} 嗨"])
     seen = {r for _, r in t.candidates("g")}
     assert seen == {3, 4, 5}
+
+
+def test_at_someone_else_does_not_open_thread():
+    t, _ = _tracker(rounds=3)
+    t.record("g", [_m("相缺", "@李桑 来打boss")], ["@相缺 冲呀"])
+    assert t.candidates("g") == []
+
+
+def test_named_without_at_opens_thread():
+    t, _ = _tracker(rounds=3)
+    t.record("g", [_m("Mr乂朧月", "完蛋 囡囡不见了")], ["@Mr乂朧月 在哒"])
+    assert t.candidates("g") == [("Mr乂朧月", 3)]
+
+
+def test_chime_in_opens_thread_like_at():
+    t, _ = _tracker(rounds=3)
+    t.record("g", [_m("得闲射击", "100 抽 5 件套")], ["@得闲射击 欧皇"], fresh=True)
+    assert t.candidates("g") == [("得闲射击", 3)]
+    t.record("g", [_m("得闲射击", "哈哈 运气好")], ["@得闲射击 羡慕"])
+    assert t.candidates("g") == [("得闲射击", 2)]
