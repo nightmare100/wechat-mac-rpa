@@ -87,6 +87,23 @@ def test_plain_reply_without_flag_is_untouched():
     assert gen.chime_in_allowed("群")
 
 
+def test_unflagged_chime_in_still_counts():
+    """LLM 没标 chime_in、但回复对象没有任何触发：照样算插话，开始冷却；冷却中丢弃。"""
+    gen = _gen('{"replies":["@花间灼晚意 摸摸 明天再排一次"]}')
+    assert _run(gen, _m("花间灼晚意", "昨天上船今天3票没上车"))
+    assert not gen.chime_in_allowed("群")
+    gen.llm_client.content = '{"replies":["@许愿大王 明天再排一次"]}'
+    assert _run(gen, _m("许愿大王", "明天也没上怎么办")) == []
+    assert gen.last_chime_in_dropped is True
+
+
+def test_unmatched_target_falls_back_to_whole_batch():
+    """回复里 @ 的昵称对不上任何未读发送者时按整批判断，批里有 @ 就不当插话丢弃。"""
+    gen = _gen('{"replies":["@相缺缺缺 在哒"]}')
+    gen.chime_in_last["群"] = time.time()
+    assert _run(gen, _m("相缺", "@『宵桜』囡囡 在吗"))
+
+
 def test_session_tells_llm_whether_chime_in_allowed():
     gen = _gen()
     msg = _m("得闲射击", "100 抽 5 件套")

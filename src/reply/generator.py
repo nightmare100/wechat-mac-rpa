@@ -1095,7 +1095,7 @@ class ReplyGenerator:
         replies = _apply_laugh_cooldown(replies, all_messages)
         replies = _apply_emoji_cooldown(replies, all_messages)
         fresh_targets: set = set()
-        if is_group and replies and self.last_chime_in:
+        if is_group and replies:
             replies, fresh_targets = self._apply_chime_in_limit(chat_name, unreplied, replies)
         if is_group:
             self.followup.record(chat_name, unreplied, replies, fresh_targets=fresh_targets)
@@ -1116,13 +1116,14 @@ class ReplyGenerator:
 
     def _apply_chime_in_limit(self, chat_name: str, unreplied: List[ChatMessage],
                               replies: List[str]) -> Tuple[List[str], set]:
-        """LLM 标了 chime_in 时逐条判断：对象有现有触发的照常发；其余算主动插话，冷却中丢弃，放行则开始冷却。"""
+        """群聊回复逐条判断（不管 LLM 标没标 chime_in）：对象有现有触发的照常发；其余算主动插话，冷却中丢弃，放行则开始冷却。"""
         allowed = self.chime_in_allowed(chat_name)
         kept, fresh_targets, dropped, chimed = [], set(), [], False
         for reply in replies:
             target = _reply_target(reply, unreplied)
-            # 认不出对象时按整批判断（偏保守：批里有触发就不当插话）
-            msgs = [m for m in unreplied if _same_person(m.sender, target)] if target else unreplied
+            # 认不出对象、或对象对不上任何未读时按整批判断（偏保守：批里有触发就不当插话）
+            msgs = [m for m in unreplied if _same_person(m.sender, target)] if target else []
+            msgs = msgs or unreplied
             if self._has_reply_trigger(chat_name, msgs):
                 kept.append(reply)
             elif allowed:
