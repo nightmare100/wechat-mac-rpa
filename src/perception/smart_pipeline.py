@@ -137,6 +137,11 @@ class _QwenAPIClient:
     def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None):
         self.api_key = api_key or os.environ.get("DASHSCOPE_API_KEY")
         self.model = model or os.environ.get("VISION_MODEL", "qwen3.6-flash")
+        # 截图送 API 前按此比例缩小（图片 token 按像素计），1 为原图
+        try:
+            self.image_scale = min(1.0, max(0.3, float(os.environ.get("VISION_IMAGE_SCALE", "0.5"))))
+        except ValueError:
+            self.image_scale = 0.5
         if not self.api_key:
             raise RuntimeError("DASHSCOPE_API_KEY not set")
         try:
@@ -161,7 +166,7 @@ class _QwenAPIClient:
 
     def recognize_with_debug(self, image_path: str) -> tuple:
         """识别并返回 (parsed_result, prompt, raw_response, thinking)。"""
-        b64 = self._image_to_base64(image_path)
+        b64 = self._image_to_base64(image_path, self.image_scale)
         prompt = QWEN_SYSTEM_PROMPT
         messages: list[Any] = [
             {
@@ -176,7 +181,7 @@ class _QwenAPIClient:
             model=self.model,
             messages=messages,
             temperature=0.0,
-            max_tokens=4096,
+            max_tokens=2048,
             extra_body={"enable_thinking": False},
         )
         msg = response.choices[0].message
@@ -185,9 +190,16 @@ class _QwenAPIClient:
         return self._extract_json(raw), prompt, raw, thinking
 
     @staticmethod
-    def _image_to_base64(path: str) -> str:
-        with open(path, "rb") as f:
-            return base64.b64encode(f.read()).decode("utf-8")
+    def _image_to_base64(path: str, scale: float = 1.0) -> str:
+        if scale >= 1.0:
+            with open(path, "rb") as f:
+                return base64.b64encode(f.read()).decode("utf-8")
+        import io
+        with Image.open(path) as img:
+            size = (max(1, round(img.width * scale)), max(1, round(img.height * scale)))
+            buf = io.BytesIO()
+            img.resize(size, Image.LANCZOS).save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode("utf-8")
 
     @staticmethod
     def _extract_json(text: str) -> dict:
