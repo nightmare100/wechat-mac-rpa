@@ -240,6 +240,7 @@ class ReplyGenerator:
         self.last_chime_in_dropped: bool = False  # 本次是否有主动插话因冷却被丢弃（bot 记录原因用）
         self.chime_in_cooldown = _env_int("CHIME_IN_COOLDOWN_MINUTES", 60, 0, 1440) * 60  # 每个群主动插话的冷却（秒）
         self.chime_in_last: Dict[str, float] = {}  # 聊天名 → 上次主动插话的时间
+        self._started_at = time.time()  # 启动即视为刚插过话：开机后屏幕上的旧消息不插话
         self.memory_engine = memory_engine
         self.tool_registry = tool_registry or get_registry()
         self.judge_worker = judge_worker
@@ -1117,7 +1118,7 @@ class ReplyGenerator:
         return replies
 
     def chime_in_allowed(self, chat_name: str) -> bool:
-        return time.time() - self.chime_in_last.get(chat_name, float("-inf")) >= self.chime_in_cooldown
+        return time.time() - self.chime_in_last.get(chat_name, self._started_at) >= self.chime_in_cooldown
 
     def _apply_chime_in_limit(self, chat_name: str, unreplied: List[ChatMessage],
                               replies: List[str]) -> Tuple[List[str], set]:

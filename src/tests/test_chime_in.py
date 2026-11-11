@@ -21,7 +21,9 @@ CHIME = '{"replies":["@得闲射击 欧皇"],"chime_in":true}'
 
 
 def _gen(content=CHIME):
-    return ReplyGenerator(llm_client=_LLM(content), tool_registry=get_registry())
+    gen = ReplyGenerator(llm_client=_LLM(content), tool_registry=get_registry())
+    gen._started_at -= gen.chime_in_cooldown + 1  # 跳过启动冷却
+    return gen
 
 
 def _m(sender, text):
@@ -146,3 +148,12 @@ def test_dropped_flag_resets_on_next_generate():
     gen.llm_client.content = '{"replies":["@相缺 在哒"]}'
     _run(gen, _m("相缺", "@『宵桜』囡囡 在吗"))
     assert gen.last_chime_in_dropped is False
+
+
+def test_no_chime_in_right_after_startup():
+    """刚启动时视为刚插过话：屏幕上的旧消息不插话，被 @ 照常回。"""
+    gen = ReplyGenerator(llm_client=_LLM(CHIME), tool_registry=get_registry())
+    assert not gen.chime_in_allowed("群")
+    assert _run(gen, _m("得闲射击", "100 抽 5 件套")) == []
+    gen.llm_client.content = '{"replies":["@相缺 在哒"]}'
+    assert _run(gen, _m("相缺", "@『宵桜』囡囡 在吗"))
