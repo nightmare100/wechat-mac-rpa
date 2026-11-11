@@ -359,7 +359,7 @@ def test_waits_while_group_is_chatting_then_sends(tmp_path):
     from datetime import date, timedelta, time as dtime
     cfg = {"schedules": [{"time": "22:00", "messages": ["a"]}]}
     send = Mock(return_value=ActionResult(success=True))
-    chat_until = datetime(2026, 11, 3, 22, 3)  # 群里一直聊到 22:03
+    chat_until = datetime(2026, 11, 3, 22, 1)  # 群里一直聊到 22:01
     clock = {"now": None}
 
     def last_activity(group):
@@ -394,7 +394,7 @@ def test_sends_before_window_ends_even_if_still_chatting(tmp_path):
             sent_at = now
         now += timedelta(seconds=15)
     assert send.call_count == 1
-    assert sent_at == datetime(2026, 11, 3, 22, 8)
+    assert sent_at == datetime(2026, 11, 3, 22, 5)  # 最多等 5 分钟，给迟发窗口留 5 分钟余量
 
 
 def test_quiet_or_unknown_activity_sends_immediately(tmp_path):
