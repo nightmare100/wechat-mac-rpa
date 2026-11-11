@@ -124,6 +124,7 @@ class WeChatBot:
             open_chat=ChatOpener(self.perception).open,
             send=self.send_to_chat,
             send_voice=self._send_voice_line,
+            last_activity=self.global_store.last_message_time,
         )
         # 休眠时段（.env 的 SLEEP_HOURS），见 src/utils/time_window.py
         try:

@@ -412,3 +412,15 @@ class TestGlobalStoreDbSync:
 
             assert "bulk_sync_chat" in calls
             assert "sync_chat" not in calls
+
+
+def test_last_message_time_ignores_self_and_missing_time():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        store = GlobalStore(state_file=os.path.join(tmpdir, "state.json"))
+        assert store.last_message_time("群1") is None
+        store.merge_tick("群1", [
+            ChatMessage(text="a", sender="A", sender_type=SenderType.OTHER, chat_name="群1", create_time=100),
+            ChatMessage(text="b", sender="B", sender_type=SenderType.OTHER, chat_name="群1", create_time=None),
+            ChatMessage(text="c", sender="自己", sender_type=SenderType.SELF, chat_name="群1", create_time=300),
+        ], is_group=True)
+        assert store.last_message_time("群1") == 100

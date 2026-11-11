@@ -263,3 +263,145 @@ def test_mood_styles_fill_lines_without_style(tmp_path):
     assert lines[0]["style"] == ["元气", "笑意"]      # 用心情候选
     assert lines[1]["style"] == ["自带"]              # 句子自己的优先
     assert "style" not in lines[2] and "style" not in lines[3]  # 空列表被跳过 / 没配候选
+
+
+# ---- 时间浮动 / 按条 @所有人 / 等聊天停一下 ----
+
+def _cfg_pusher(tmp_path, cfg, send=None, last_activity=None, groups=("群",)):
+    path = tmp_path / "scheduled_messages.json"
+    path.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+    return ScheduledPusher(list(groups), Mock(return_value=True),
+                           send or Mock(return_value=ActionResult(success=True)),
+                           config_path=path, state_path=tmp_path / "state.json", sleep=Mock(),
+                           last_activity=last_activity)
+
+
+def _sweep(pusher, day, start, end):
+    """从 start 到 end 每 15 秒调一次 run_due。"""
+    from datetime import timedelta
+    now = datetime.combine(day, start)
+    stop = datetime.combine(day, end)
+    while now <= stop:
+        pusher.run_due(now)
+        now += timedelta(seconds=15)
+
+
+def test_jitter_sends_once_within_range_and_spreads_over_days(tmp_path):
+    from datetime import date, time as dtime
+    cfg = {"schedules": [{"time": "08:00", "jitter_minutes": 20, "messages": ["a"]}]}
+    send = Mock(return_value=ActionResult(success=True))
+    pusher = _cfg_pusher(tmp_path, cfg, send=send)
+    starts = set()
+    for d in range(1, 11):
+        day = date(2026, 12, d)
+        start = pusher.planned_start("08:00", frozenset(), day)
+        assert datetime.combine(day, dtime(7, 40)) <= start <= datetime.combine(day, dtime(8, 20))
+        starts.add(start.time())
+        before = send.call_count
+        _sweep(pusher, day, dtime(7, 30), dtime(8, 40))
+        assert send.call_count == before + 1
+    assert len(starts) > 1
+
+
+def test_jitter_start_stable_across_restart(tmp_path):
+    from datetime import date
+    cfg = {"schedules": [{"time": "08:00", "jitter_minutes": 20, "messages": ["a"]}]}
+    a = _cfg_pusher(tmp_path, cfg).planned_start("08:00", frozenset(), date(2026, 12, 1))
+    b = _cfg_pusher(tmp_path, cfg).planned_start("08:00", frozenset(), date(2026, 12, 1))
+    assert a == b
+
+
+def test_jitter_stays_within_same_day(tmp_path):
+    from datetime import date, time as dtime
+    cfg = {"schedules": [{"time": "00:05", "jitter_minutes": 30, "messages": ["a"]},
+                         {"time": "23:55", "jitter_minutes": 30, "messages": ["b"]}]}
+    pusher = _cfg_pusher(tmp_path, cfg)
+    for d in range(1, 31):
+        day = date(2026, 12, d)
+        assert pusher.planned_start("00:05", frozenset(), day).date() == day
+        late = pusher.planned_start("23:55", frozenset(), day)
+        assert late.date() == day and late.time() <= dtime(23, 49)
+
+
+def test_no_jitter_keeps_exact_time(tmp_path):
+    from datetime import date
+    pusher = _cfg_pusher(tmp_path, {"schedules": [{"time": "08:00", "messages": ["a"]}]})
+    assert pusher.planned_start("08:00", frozenset(), date(2026, 12, 1)) == datetime(2026, 12, 1, 8, 0)
+
+
+def test_invalid_jitter_treated_as_zero(tmp_path):
+    from datetime import date
+    for bad in (-5, 121, "10", 1.5, True):
+        cfg = {"schedules": [{"time": "08:00", "jitter_minutes": bad, "messages": ["a"]}]}
+        pusher = _cfg_pusher(tmp_path, cfg)
+        assert pusher.planned_start("08:00", frozenset(), date(2026, 12, 1)) == datetime(2026, 12, 1, 8, 0)
+
+
+def test_mention_all_per_schedule_overrides_top_level(tmp_path):
+    cfg = {"mention_all": True, "schedules": [
+        {"time": "08:00", "messages": ["早"], "mention_all": False},
+        {"time": "21:30", "messages": ["周活动"]},
+    ]}
+    send = Mock(return_value=ActionResult(success=True))
+    pusher = _cfg_pusher(tmp_path, cfg, send=send)
+    pusher.run_due(datetime(2026, 11, 3, 8, 0))
+    pusher.run_due(datetime(2026, 11, 3, 21, 30))
+    assert [c.args[1] for c in send.call_args_list] == ["早", "@所有人 周活动"]
+
+    send2 = Mock(return_value=ActionResult(success=True))
+    cfg2 = {"schedules": [{"time": "08:00", "messages": ["早"], "mention_all": True}]}
+    (tmp_path / "x").mkdir()
+    _cfg_pusher(tmp_path / "x", cfg2, send=send2).run_due(datetime(2026, 11, 3, 8, 0))
+    send2.assert_called_once_with("群", "@所有人 早")
+
+
+def test_waits_while_group_is_chatting_then_sends(tmp_path):
+    from datetime import date, timedelta, time as dtime
+    cfg = {"schedules": [{"time": "22:00", "messages": ["a"]}]}
+    send = Mock(return_value=ActionResult(success=True))
+    chat_until = datetime(2026, 11, 3, 22, 3)  # 群里一直聊到 22:03
+    clock = {"now": None}
+
+    def last_activity(group):
+        now = clock["now"]
+        return min(now, chat_until).timestamp()
+
+    pusher = _cfg_pusher(tmp_path, cfg, send=send, last_activity=last_activity)
+    now = datetime(2026, 11, 3, 22, 0)
+    sent_at = None
+    while now <= datetime(2026, 11, 3, 22, 10):
+        clock["now"] = now
+        pusher.run_due(now)
+        if send.called and sent_at is None:
+            sent_at = now
+        now += timedelta(seconds=15)
+    assert send.call_count == 1
+    assert sent_at == chat_until + timedelta(seconds=120)
+
+
+def test_sends_before_window_ends_even_if_still_chatting(tmp_path):
+    from datetime import timedelta
+    cfg = {"schedules": [{"time": "22:00", "messages": ["a"]}]}
+    send = Mock(return_value=ActionResult(success=True))
+    clock = {"now": None}
+    pusher = _cfg_pusher(tmp_path, cfg, send=send, last_activity=lambda g: clock["now"].timestamp())
+    now = datetime(2026, 11, 3, 22, 0)
+    sent_at = None
+    while now <= datetime(2026, 11, 3, 22, 10):
+        clock["now"] = now
+        pusher.run_due(now)
+        if send.called and sent_at is None:
+            sent_at = now
+        now += timedelta(seconds=15)
+    assert send.call_count == 1
+    assert sent_at == datetime(2026, 11, 3, 22, 8)
+
+
+def test_quiet_or_unknown_activity_sends_immediately(tmp_path):
+    cfg = {"schedules": [{"time": "22:00", "messages": ["a"]}]}
+    for activity in (None, lambda g: None, lambda g: datetime(2026, 11, 3, 21, 50).timestamp()):
+        send = Mock(return_value=ActionResult(success=True))
+        sub = tmp_path / str(id(activity))
+        sub.mkdir()
+        _cfg_pusher(sub, cfg, send=send, last_activity=activity).run_due(datetime(2026, 11, 3, 22, 0))
+        assert send.call_count == 1

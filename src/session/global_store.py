@@ -584,6 +584,13 @@ class GlobalStore:
             if not m.replied and m.sender_type != SenderType.SELF
         ]
 
+    def last_message_time(self, chat_name: str) -> Optional[float]:
+        """别人最后一条消息的时间（create_time），没有则 None。定时推送据此判断群里是否正在聊天。"""
+        state = self.chats.get(chat_name)
+        times = [m.create_time for m in state.messages
+                 if m.sender_type != SenderType.SELF and m.create_time] if state else []
+        return max(times) if times else None
+
     def last_reply_time(self, chat_name: str) -> Optional[float]:
         """最后回复时间（从消息中推导）"""
         state = self.chats.get(chat_name)

@@ -20,6 +20,11 @@
   重启或中途异常都不会重复发送（宁可漏发，不重复发）。
 - 超过时间点 GRACE_MINUTES 分钟仍未发出（如 bot 未运行），当天跳过，不补发。
 - 打开群失败（标题校验不通过）则跳过该群，绝不发到其他会话。
+- jitter_minutes 可选（0～120）：每天在「时间点 ± jitter_minutes」里随机定一个发送时刻（按日期固定，重启不变，
+  不跨天），迟发窗口从这个时刻算起。
+- mention_all 可在每条里单独配置，覆盖顶层。
+- 到点时群里 QUIET_SECONDS 秒内还有人说话，就往后推，等聊天停下再发；推到窗口结束前
+  FORCE_BEFORE_END_MINUTES 分钟仍在聊则照发。
 
 语音（可选）：文字发送成功后，按概率再补一条语音（每个群各自掷概率）。
     "voice_probability": 0.3,                     # 顶层默认概率，不配为 0（不发语音）
@@ -42,9 +47,9 @@ import json
 import logging
 import random
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Optional
 
 from src.action.voice_sender import DEFAULT_MOOD, MOODS, build_tts_input
 from src.models.base import ActionResult
@@ -56,6 +61,9 @@ CONFIG_PATH = PROJECT_ROOT / "data" / "scheduled_messages.json"
 STATE_PATH = PROJECT_ROOT / "data" / "scheduled_state.json"
 GRACE_MINUTES = 10
 SEND_RETRIES = 2
+MAX_JITTER_MINUTES = 120
+QUIET_SECONDS = 120
+FORCE_BEFORE_END_MINUTES = 2
 
 
 def _read_config(path: Path) -> dict:
@@ -195,14 +203,50 @@ def load_voice_plans(path: Path = CONFIG_PATH) -> dict[tuple[str, frozenset[int]
     return plans
 
 
-def due_schedules(schedules: list[Schedule], now: datetime) -> list[Schedule]:
-    """返回今天需要发送、且当前处于发送窗口 [时间点, 时间点 + GRACE_MINUTES] 内的条目。"""
+def load_schedule_options(path: Path = CONFIG_PATH) -> dict[tuple[str, frozenset[int]], dict]:
+    """每条的 jitter_minutes（非法按 0）和 mention_all（不配用顶层），键为 (HH:MM, 星期几)。"""
+    data = _read_config(path)
+    top_mention = bool(data.get("mention_all"))
+    options = {}
+    for item in data.get("schedules", []):
+        at = str(item.get("time", "")).strip()
+        jitter = item.get("jitter_minutes", 0)
+        if isinstance(jitter, bool) or not isinstance(jitter, int) or not 0 <= jitter <= MAX_JITTER_MINUTES:
+            _logger.error(f"[ScheduledPush] {at} 的 jitter_minutes 需为 0～{MAX_JITTER_MINUTES} 的整数，已按 0 处理: {jitter}")
+            print(f"❌ 定时推送 {at} 的 jitter_minutes 需为 0～{MAX_JITTER_MINUTES} 的整数，已按 0 处理: {jitter}")
+            jitter = 0
+        mention = item.get("mention_all", top_mention)
+        if not isinstance(mention, bool):
+            _logger.error(f"[ScheduledPush] {at} 的 mention_all 需为 true/false，已用顶层设置: {mention}")
+            print(f"❌ 定时推送 {at} 的 mention_all 需为 true/false，已用顶层设置: {mention}")
+            mention = top_mention
+        weekdays = item.get("weekdays") or []
+        key = (at, frozenset(weekdays) if isinstance(weekdays, list) else frozenset())
+        options[key] = {"jitter": jitter, "mention_all": mention}
+    return options
+
+
+def planned_start(at: str, day: date, jitter_minutes: int = 0) -> datetime:
+    """当天的实际发送时刻：时间点 ± jitter_minutes 内按日期固定的随机时刻，限制在当天、留出迟发窗口。"""
+    hour, minute = map(int, at.split(":"))
+    base = datetime(day.year, day.month, day.day, hour, minute)
+    if not jitter_minutes:
+        return base
+    span = jitter_minutes * 60
+    start = base + timedelta(seconds=random.Random(f"{day.isoformat()}|{at}").randint(-span, span))
+    midnight = datetime(day.year, day.month, day.day)
+    latest = midnight + timedelta(days=1) - timedelta(minutes=GRACE_MINUTES + 1)
+    return max(midnight, min(start, latest))
+
+
+def due_schedules(schedules: list[Schedule], now: datetime,
+                  start_of: Optional[Callable[[Schedule, date], datetime]] = None) -> list[Schedule]:
+    """返回今天需要发送、且当前处于发送窗口 [发送时刻, 发送时刻 + GRACE_MINUTES] 内的条目。"""
     due = []
     for at, messages, weekdays in schedules:
         if weekdays and now.isoweekday() not in weekdays:
             continue
-        hour, minute = map(int, at.split(":"))
-        start = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        start = start_of((at, messages, weekdays), now.date()) if start_of else planned_start(at, now.date())
         if start <= now <= start + timedelta(minutes=GRACE_MINUTES):
             due.append((at, messages, weekdays))
     return due
@@ -218,6 +262,7 @@ class ScheduledPusher:
         state_path: Path = STATE_PATH,
         sleep: Callable[[float], None] = time.sleep,
         send_voice: Callable[[VoiceLine], ActionResult] | None = None,
+        last_activity: Callable[[str], Optional[float]] | None = None,
     ):
         self.groups = groups
         self.open_chat = open_chat
@@ -225,9 +270,12 @@ class ScheduledPusher:
         self.state_path = state_path
         self.sleep = sleep
         self.send_voice = send_voice
+        self.last_activity = last_activity
         self.schedules = load_schedules(config_path)
         self.prefixes = load_prefixes(config_path) if self.schedules else []
         self.mention_all = bool(_read_config(config_path).get("mention_all")) if self.schedules else False
+        self.options = load_schedule_options(config_path) if self.schedules else {}
+        self._waiting: set[str] = set()
         self.voice_plans = load_voice_plans(config_path) if self.schedules and send_voice else {}
         self.rate_jitter = load_rate_jitter(config_path) if self.voice_plans else 0.0
         self.sent = self._load_state()
@@ -252,26 +300,44 @@ class ScheduledPusher:
         except OSError as e:
             _logger.error(f"[ScheduledPush] 发送记录写入失败: {e}")
 
+    def planned_start(self, at: str, weekdays: frozenset[int], day: date) -> datetime:
+        return planned_start(at, day, self.options.get((at, weekdays), {}).get("jitter", 0))
+
+    def _busy(self, group: str, now: datetime) -> bool:
+        """群里 QUIET_SECONDS 秒内有人说话。拿不到活跃时间视为不忙。"""
+        last = self.last_activity(group) if self.last_activity else None
+        return last is not None and now.timestamp() - last < QUIET_SECONDS
+
     def run_due(self, now: datetime | None = None) -> None:
         """在主循环每轮调用：发送所有到点且今天未发过的内容。"""
         if not self.schedules or not self.groups:
             return
         now = now or datetime.now()
         day = now.strftime("%Y-%m-%d")
-        for at, messages, weekdays in due_schedules(self.schedules, now):
+        start_of = lambda s, d: self.planned_start(s[0], s[2], d)  # noqa: E731
+        for at, messages, weekdays in due_schedules(self.schedules, now, start_of):
+            force_at = start_of((at, messages, weekdays), now.date()) + timedelta(
+                minutes=GRACE_MINUTES - FORCE_BEFORE_END_MINUTES)
             for group in self.groups:
                 key = f"{at}|{group}"
                 if self.sent.get(key) == day:
                     continue
+                if now < force_at and self._busy(group, now):
+                    if f"{key}|{day}" not in self._waiting:
+                        self._waiting.add(f"{key}|{day}")
+                        _logger.info(f"[ScheduledPush] {at} '{group}' 正在聊天，等停下再发")
+                    continue
                 self._mark_sent(key, day)
-                self._push(at, group, messages, self.voice_plans.get((at, weekdays)))
+                mention = self.options.get((at, weekdays), {}).get("mention_all", self.mention_all)
+                self._push(at, group, messages, self.voice_plans.get((at, weekdays)), mention)
 
-    def _push(self, at: str, group: str, messages: list[str], voice: VoicePlan | None = None) -> None:
+    def _push(self, at: str, group: str, messages: list[str], voice: VoicePlan | None = None,
+              mention_all: bool | None = None) -> None:
         text = random.choice(messages)
         _logger.info(f"[ScheduledPush] {at} 开始推送到 '{group}'（从 {len(messages)} 条中随机选 1 条）")
         if self.prefixes:
             text = f"{random.choice(self.prefixes)}：{text}"
-        if self.mention_all:
+        if self.mention_all if mention_all is None else mention_all:
             text = f"@所有人 {text}"
         if not self._send_with_retry(group, text):
             _logger.error(f"[ScheduledPush] {at} 推送到 '{group}' 失败")
