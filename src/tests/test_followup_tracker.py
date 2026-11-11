@@ -58,7 +58,7 @@ def test_followup_without_open_thread_does_nothing_and_ttl_expires():
     assert t.candidates("g") == []
 
 
-def test_rounds_are_random_between_3_and_5():
+def test_rounds_are_random_between_2_and_4():
     import random
     rng = random.Random(1)
     t = FollowupTracker(randint=rng.randint)
@@ -66,7 +66,7 @@ def test_rounds_are_random_between_3_and_5():
     for i in range(200):
         t.record("g", [_m(f"人{i:03d}", "@囡囡 hi")], [f"@人{i:03d} 嗨"])
     seen = {r for _, r in t.candidates("g")}
-    assert seen == {3, 4, 5}
+    assert seen == {2, 3, 4}
 
 
 def test_at_someone_else_does_not_open_thread():
@@ -87,3 +87,10 @@ def test_chime_in_opens_thread_like_at():
     assert t.candidates("g") == [("得闲射击", 3)]
     t.record("g", [_m("得闲射击", "哈哈 运气好")], ["@得闲射击 羡慕"])
     assert t.candidates("g") == [("得闲射击", 2)]
+
+
+def test_chime_in_target_gets_fewer_rounds_than_at():
+    t = FollowupTracker(randint=lambda a, b: b, now=lambda: 1000.0, rounds=(2, 3), chime_rounds=(1, 2))
+    t.record("g", [_m("得闲射击", "100 抽 5 件套")], ["@得闲射击 欧皇"], fresh_targets={"得闲射击"})
+    t.record("g", [_m("相缺", "@『宵桜』囡囡 在吗")], ["@相缺 在哒"])
+    assert dict(t.candidates("g")) == {"得闲射击": 2, "相缺": 3}

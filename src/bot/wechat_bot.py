@@ -27,11 +27,13 @@ from src.session.global_store import GlobalStore
 from src.tools import get_registry, register_builtin_tools
 from src.utils.chat_utils import _is_group_chat_name, _normalize_chat_name
 from src.utils.debug_logger import DebugLogger
-from src.utils.identity import is_at_bot, is_buddy
+from src.utils.identity import is_at_bot, is_buddy, mentions_bot
 
 SLEEP_CHECK_SECONDS = 30  # 休眠中多久检查一次是否到点醒来
 WAKE_BACKLOG_SECONDS = 1800  # 醒来后多长时间内，聊天第一次看到的未回复消息算夜里积压
 ONLINE_SILENCE_MINUTES = (20, 30)  # 答应朧月上线后静默多少分钟（随机）
+BURST_QUIET_SECONDS = 10  # 群里没 @ 我的消息：最新一条出现后这么久没新消息再回，把连发的几条合并成一次回复
+BURST_MAX_WAIT_SECONDS = 90  # 最早一条出现后最多等这么久，一直有人说话也照回
 
 
 def _raw_with_thinking(raw_response: str, thinking: str) -> str:
@@ -142,6 +144,7 @@ class WeChatBot:
         self._woke_at: Optional[float] = None
         self._backlog_skipped_chats: set = set()
         self._online_until: dict = {}  # 聊天名 → 静默截止（monotonic），答应朧月上线后设置
+        self._first_seen: dict = {}  # 聊天名 → {id(消息): 第一次看到的 monotonic 时间}，合并连发用
 
         # 动态注册 send_file 工具（需要 sender 实例）
         def _load_shareable_files() -> dict:
@@ -506,6 +509,15 @@ class WeChatBot:
                     latest_text=unreplied[-1].text if unreplied else "",
                 )
                 self.debug_logger.log_action("none", action_input="", success=False, error="上线静默中")
+                return
+
+            # 群里没 @ 我时，等对方连发的几条说完再一起回
+            if is_group and self._wait_for_burst(chat_name, to_reply):
+                self.logger.log_decision(
+                    tick_id, should_reply=False, reason="等对方说完再回",
+                    latest_text=unreplied[-1].text if unreplied else "",
+                )
+                self.debug_logger.log_action("none", action_input="", success=False, error="等对方说完再回")
                 return
 
             # 传递完整消息上下文 + 所有未读消息，让 AI 生成多条回复
@@ -957,6 +969,19 @@ class WeChatBot:
         except Exception as e:
             self.logger.warning(f"[Recovery] 点击返回按钮异常: {e}")
             return False
+
+    def _wait_for_burst(self, chat_name: str, to_reply: list, now: Optional[float] = None) -> bool:
+        """没 @、没提到我、没引用的群消息：最新一条看到不足 BURST_QUIET_SECONDS 秒、且最早一条不足 BURST_MAX_WAIT_SECONDS 秒时先不回。"""
+        now = time.monotonic() if now is None else now
+        first_seen = getattr(self, "_first_seen", None)
+        if first_seen is None:
+            first_seen = self._first_seen = {}
+        seen = first_seen.get(chat_name, {})
+        seen = {id(m): seen.get(id(m), now) for m in to_reply}
+        first_seen[chat_name] = seen
+        if not seen or any(mentions_bot(m.text) or getattr(m, "quoted_text", "") for m in to_reply):
+            return False
+        return now - max(seen.values()) < BURST_QUIET_SECONDS and now - min(seen.values()) < BURST_MAX_WAIT_SECONDS
 
     def _start_online_silence(self, chat_name: str, replied_to: list) -> None:
         """回复里答应了上线（go_online）且这批消息里有朧月发的话，开始随机 20–30 分钟静默。"""

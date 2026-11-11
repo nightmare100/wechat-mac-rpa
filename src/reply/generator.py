@@ -83,8 +83,9 @@ def _apply_at_policy(replies: List[str], keep_rate: float = AT_KEEP_RATE,
     return result
 
 
-# 接话轮数：被 @ 或引用后随机给 2～4 轮不带 @ 的接话额度，每接一次减 1，30 分钟没动静作废
-FOLLOWUP_ROUNDS = (3, 5)
+# 接话轮数：被 @ 或引用后随机给 2～4 轮不带 @ 的接话额度（主动插话的对象也是 2～4 轮），每接一次减 1，30 分钟没动静作废
+FOLLOWUP_ROUNDS = (2, 4)
+CHIME_FOLLOWUP_ROUNDS = (2, 4)
 FOLLOWUP_TTL_SECONDS = 1800
 
 
@@ -108,8 +109,10 @@ def _reply_target(reply: str, unreplied: List[ChatMessage]) -> Optional[str]:
 
 class FollowupTracker:
     def __init__(self, rounds: Tuple[int, int] = FOLLOWUP_ROUNDS, ttl: float = FOLLOWUP_TTL_SECONDS,
-                 randint: Callable[[int, int], int] = random.randint, now: Callable[[], float] = time.time):
+                 randint: Callable[[int, int], int] = random.randint, now: Callable[[], float] = time.time,
+                 chime_rounds: Tuple[int, int] = CHIME_FOLLOWUP_ROUNDS):
         self.rounds, self.ttl, self.randint, self.now = rounds, ttl, randint, now
+        self.chime_rounds = chime_rounds
         self.threads: Dict[str, Dict[str, list]] = {}  # chat -> sender -> [remaining, updated_at]
 
     def _find(self, chat: str, sender: str) -> Optional[str]:
@@ -131,10 +134,12 @@ class FollowupTracker:
             chat_threads = self.threads.setdefault(chat, {})
             key = self._find(chat, target)
             fresh = any(_same_person(target, f) for f in fresh_targets)
-            if fresh or any(mentions_bot(u.text) or getattr(u, "quoted_text", "") for u in msgs):
+            triggered = any(mentions_bot(u.text) or getattr(u, "quoted_text", "") for u in msgs)
+            if fresh or triggered:
                 if key:
                     del chat_threads[key]
-                chat_threads[target] = [self.randint(*self.rounds), self.now()]
+                rounds = self.rounds if triggered else self.chime_rounds
+                chat_threads[target] = [self.randint(*rounds), self.now()]
             elif key and chat_threads[key][0] > 0:
                 chat_threads[key] = [chat_threads[key][0] - 1, self.now()]
 
