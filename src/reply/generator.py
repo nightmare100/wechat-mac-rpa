@@ -8,6 +8,7 @@ import random
 import re
 import threading
 import time
+from difflib import SequenceMatcher
 from html import escape as xml_escape
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -71,13 +72,14 @@ _UNKNOWN_SENDERS = {"未知", "未知昵称", "[未知]", "群成员昵称"}
 _LEADING_AT_RE = re.compile(r"^@(\S+)\s+")
 
 
-def _apply_at_policy(replies: List[str], keep_rate: float = AT_KEEP_RATE,
+def _apply_at_policy(replies: List[str], keep_rate: Optional[float] = AT_KEEP_RATE,
                      rand: Callable[[], float] = random.random) -> List[str]:
+    """占位昵称始终去掉 @；keep_rate=None 时保留所有可识别昵称。"""
     result = []
     for reply in replies:
         m = _LEADING_AT_RE.match(reply)
         if m and reply[m.end():].strip():
-            if m.group(1) in _UNKNOWN_SENDERS or rand() >= keep_rate:
+            if m.group(1) in _UNKNOWN_SENDERS or (keep_rate is not None and rand() >= keep_rate):
                 reply = reply[m.end():]
         result.append(reply)
     return result
@@ -107,6 +109,33 @@ def _reply_target(reply: str, unreplied: List[ChatMessage]) -> Optional[str]:
     return None if not target or target in _UNKNOWN_SENDERS else target
 
 
+def _quotes_self(msg: ChatMessage, history: List[ChatMessage]) -> bool:
+    """引用作者为 Bot，或无作者的引用与同会话 SELF 原文匹配，才算引用我。"""
+    quote = (msg.quoted_text or "").strip()
+    if not quote:
+        return False
+    author = re.match(r"^([^\n:：]+)[:：]\s*(.*)$", quote, re.S)
+    if author:
+        bot_name = os.environ.get("BOT_NAME", "").strip()
+        # 昵称允许已有的一字 OCR 容错，但不能仅因引用内容提到 Bot 就认作引用我。
+        return bool(bot_name) and _same_person(author.group(1).strip(), bot_name)
+
+    def normalize(text: str) -> str:
+        return re.sub(r"\s+", "", text or "")
+
+    quoted = normalize(quote)
+    for own in history:
+        if own.sender_type != SenderType.SELF or own.chat_name != msg.chat_name:
+            continue
+        content = normalize(own.text)
+        if content and (quoted == content or (
+            min(len(quoted), len(content)) >= 8
+            and SequenceMatcher(None, quoted, content).ratio() >= 0.9
+        )):
+            return True
+    return False
+
+
 class FollowupTracker:
     def __init__(self, rounds: Tuple[int, int] = FOLLOWUP_ROUNDS, ttl: float = FOLLOWUP_TTL_SECONDS,
                  randint: Callable[[int, int], int] = random.randint, now: Callable[[], float] = time.time,
@@ -122,7 +151,8 @@ class FollowupTracker:
         now = self.now()
         return [(s, r) for s, (r, t) in self.threads.get(chat, {}).items() if r > 0 and now - t <= self.ttl]
 
-    def record(self, chat: str, unreplied: List[ChatMessage], replies: List[str], fresh_targets=()) -> None:
+    def record(self, chat: str, unreplied: List[ChatMessage], replies: List[str], fresh_targets=(),
+               history: Optional[List[ChatMessage]] = None) -> None:
         """fresh_targets：放行的主动插话对象，和被 @ 一样给新的接话额度。"""
         for reply in replies:
             target = _reply_target(reply, unreplied)
@@ -134,7 +164,7 @@ class FollowupTracker:
             chat_threads = self.threads.setdefault(chat, {})
             key = self._find(chat, target)
             fresh = any(_same_person(target, f) for f in fresh_targets)
-            triggered = any(mentions_bot(u.text) or getattr(u, "quoted_text", "") for u in msgs)
+            triggered = any(mentions_bot(u.text) or _quotes_self(u, history or []) for u in msgs)
             if fresh or triggered:
                 if key:
                     del chat_threads[key]
@@ -1102,10 +1132,11 @@ class ReplyGenerator:
         replies = _apply_emoji_cooldown(replies, all_messages)
         fresh_targets: set = set()
         if is_group and replies:
-            replies, fresh_targets = self._apply_chime_in_limit(chat_name, unreplied, replies)
+            replies, fresh_targets = self._apply_chime_in_limit(chat_name, unreplied, replies, all_messages)
         if is_group:
-            self.followup.record(chat_name, unreplied, replies, fresh_targets=fresh_targets)
-            replies = _apply_at_policy(replies)
+            self.followup.record(chat_name, unreplied, replies, fresh_targets=fresh_targets, history=all_messages)
+        # 未知昵称不依赖聊天类型清理，避免类型误判时发出 @未知。
+        replies = _apply_at_policy(replies, keep_rate=AT_KEEP_RATE if is_group else None)
         self.last_llm_messages = [dict(m) for m in final_messages]
         # last_raw_response 保留原始 generation 的 raw_response，self-refine 的原文单独存
         # 在 last_feedback_raw / last_iterate_raw 中
@@ -1121,7 +1152,7 @@ class ReplyGenerator:
         return time.time() - self.chime_in_last.get(chat_name, self._started_at) >= self.chime_in_cooldown
 
     def _apply_chime_in_limit(self, chat_name: str, unreplied: List[ChatMessage],
-                              replies: List[str]) -> Tuple[List[str], set]:
+                              replies: List[str], history: Optional[List[ChatMessage]] = None) -> Tuple[List[str], set]:
         """群聊回复逐条判断（不管 LLM 标没标 chime_in）：对象有现有触发的照常发；其余算主动插话，冷却中丢弃，放行则开始冷却。"""
         allowed = self.chime_in_allowed(chat_name)
         kept, fresh_targets, dropped, chimed = [], set(), [], False
@@ -1130,7 +1161,7 @@ class ReplyGenerator:
             # 认不出对象、或对象对不上任何未读时按整批判断（偏保守：批里有触发就不当插话）
             msgs = [m for m in unreplied if _same_person(m.sender, target)] if target else []
             msgs = msgs or unreplied
-            if self._has_reply_trigger(chat_name, msgs):
+            if self._has_reply_trigger(chat_name, msgs, history):
                 kept.append(reply)
             elif allowed:
                 kept.append(reply)
@@ -1146,11 +1177,12 @@ class ReplyGenerator:
             _logger.info("[ChimeIn] '%s' 冷却中，丢弃主动插话: %s", chat_name, dropped)
         return kept, fresh_targets
 
-    def _has_reply_trigger(self, chat_name: str, unreplied: List[ChatMessage]) -> bool:
+    def _has_reply_trigger(self, chat_name: str, unreplied: List[ChatMessage],
+                           history: Optional[List[ChatMessage]] = None) -> bool:
         """这些消息里有现有触发（@ 我、提到我、引用、接话名单里的人），对应回复不算主动插话。"""
         candidates = [s for s, _ in self.followup.candidates(chat_name)]
         return any(
-            mentions_bot(m.text) or getattr(m, "quoted_text", "")
+            mentions_bot(m.text) or _quotes_self(m, history or [])
             or any(_same_person(m.sender, s) for s in candidates)
             for m in unreplied
         )

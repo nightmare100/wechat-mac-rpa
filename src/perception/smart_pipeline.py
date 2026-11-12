@@ -30,7 +30,7 @@ from src.layout.layout_parser import TIMESTAMP_PATTERNS, LayoutParser, UILayout
 from src.layout.profile import LayoutProfile
 from src.models.base import MEDIA_MESSAGE_TYPES, ChatListItem, ChatMessage, PerceptionResult, Rect, SenderType
 from src.ocr.vision_ocr import VisionOCREngine
-from src.utils.chat_utils import _is_group_chat_name
+from src.utils.chat_utils import _is_group_chat_name, _normalize_chat_name
 
 _logger = logging.getLogger("src.runtime.smart_pipeline")
 
@@ -626,6 +626,15 @@ class SmartPerceptionPipeline:
         api_response = api_result.get("response", "")
         api_thinking = api_result.get("thinking", "")
 
+        # API 可能省略标题中的群人数；同帧本地标题可确认群聊身份。
+        # 必须核对名称，避免将其他聊天的标题用于当前会话。
+        local_chat_name = getattr(layout, "chat_name", "") or ""
+        is_group = _is_group_chat_name(api_chat_name) or (
+            _is_group_chat_name(local_chat_name)
+            and bool(api_chat_name)
+            and _normalize_chat_name(local_chat_name) == _normalize_chat_name(api_chat_name)
+        )
+
         # 过滤误识别的未读角标（时间戳、群人数等）
         for item in api_chat_list:
             raw = item.get("unread_count", "")
@@ -651,7 +660,7 @@ class SmartPerceptionPipeline:
         # 3. 结合：本地 Layout 提供准确 rect，API 提供准确 nickname/unread_count
         t_merge_start = time.time()
         chat_list_items = self._merge_chat_list(local_chat_list, api_chat_list)
-        messages = self._convert_api_messages(api_messages, api_chat_name)
+        messages = self._convert_api_messages(api_messages, api_chat_name, is_group=is_group)
         t_merge_ms = (time.time() - t_merge_start) * 1000
 
         total_ms = (time.time() - t0) * 1000
@@ -672,7 +681,7 @@ class SmartPerceptionPipeline:
             messages=messages,
             chat_list_items=chat_list_items,
             screenshot_path=image_path,
-            is_group=_is_group_chat_name(api_chat_name),
+            is_group=is_group,
             window_rect=window_rect,
             scale_factor=scale_factor,
             debug_info=debug_info,
@@ -823,13 +832,16 @@ class SmartPerceptionPipeline:
     # 结果转换
     # -----------------------------------------------------------------------
 
-    def _convert_api_messages(self, raw_messages: list, chat_name: str) -> list[ChatMessage]:
+    def _convert_api_messages(
+        self, raw_messages: list, chat_name: str, *, is_group: Optional[bool] = None
+    ) -> list[ChatMessage]:
         """将 API 返回的 messages 转换为 ChatMessage 列表。
 
         支持图片/表情包识别和去重。
         私聊 sender 统一为 chat_name；群聊 sender 做校验防错。
         """
-        is_group = _is_group_chat_name(chat_name)
+        if is_group is None:
+            is_group = _is_group_chat_name(chat_name)
 
         messages = []
         last_left_sender = "对方"  # 群聊中上一个左侧白色气泡的 sender

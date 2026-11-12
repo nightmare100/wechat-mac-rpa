@@ -75,6 +75,12 @@ def test_at_someone_else_does_not_open_thread():
     assert t.candidates("g") == []
 
 
+def test_quote_of_someone_else_does_not_open_thread():
+    t, _ = _tracker(rounds=3)
+    t.record("g", [_m("相缺", "确实", quoted="李桑: 好哒")], ["@相缺 对哒"])
+    assert t.candidates("g") == []
+
+
 def test_named_without_at_opens_thread():
     t, _ = _tracker(rounds=3)
     t.record("g", [_m("Mr乂朧月", "完蛋 囡囡不见了")], ["@Mr乂朧月 在哒"])

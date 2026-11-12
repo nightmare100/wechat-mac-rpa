@@ -157,3 +157,60 @@ def test_no_chime_in_right_after_startup():
     assert _run(gen, _m("得闲射击", "100 抽 5 件套")) == []
     gen.llm_client.content = '{"replies":["@相缺 在哒"]}'
     assert _run(gen, _m("相缺", "@『宵桜』囡囡 在吗"))
+
+
+@pytest.mark.parametrize("quote", ["李桑: 今天手气不错", "今天手气不错", "李桑: 囡囡今天手气不错"])
+def test_quoting_others_does_not_bypass_cooldown(quote):
+    gen = _gen('{"replies":["@相缺 好哒"]}')
+    gen.chime_in_last["群"] = time.time()
+    msg = _m("相缺", "确实")
+    msg.quoted_text = quote
+    assert _run(gen, msg) == []
+    assert gen.followup.candidates("群") == []
+
+
+@pytest.mark.parametrize("quote", ["『宵桜』囡囡: 今天手气不错", "今天手气不错"])
+def test_quoting_self_bypasses_cooldown_and_opens_followup(quote):
+    gen = _gen('{"replies":["@相缺 好哒"]}')
+    gen.chime_in_last["群"] = time.time()
+    before = gen.chime_in_last["群"]
+    own = ChatMessage(text="今天手气不错", sender="自己", sender_type=SenderType.SELF, chat_name="群")
+    msg = _m("相缺", "确实")
+    msg.quoted_text = quote
+    assert gen.generate([msg], [own, msg], is_group=True)
+    assert gen.chime_in_last["群"] == before
+    assert dict(gen.followup.candidates("群"))["相缺"] >= 2
+
+
+def test_quote_by_other_author_is_not_self_even_with_identical_content():
+    gen = _gen('{"replies":["@相缺 好哒"]}')
+    gen.chime_in_last["群"] = time.time()
+    own = ChatMessage(text="今天手气不错", sender="自己", sender_type=SenderType.SELF, chat_name="群")
+    msg = _m("相缺", "确实")
+    msg.quoted_text = "李桑: 今天手气不错"
+    assert gen.generate([msg], [own, msg], is_group=True) == []
+
+
+def test_quoting_others_when_allowed_starts_chime_cooldown():
+    gen = _gen('{"replies":["@相缺 好哒"]}')
+    msg = _m("相缺", "确实")
+    msg.quoted_text = "李桑: 今天手气不错"
+    assert _run(gen, msg)
+    assert not gen.chime_in_allowed("群")
+
+
+@pytest.mark.parametrize(
+    "quote,own_text,own_chat,expected",
+    [
+        ("今天又打了好多关还是没出货", "今天又打了好多关还是没出货呀", "群", True),
+        ("今天手气不错", "今天手气不错", "别的群", False),
+        ("你好", "你好吗", "群", False),
+    ],
+)
+def test_unattributed_quote_matches_only_reliable_self_history(quote, own_text, own_chat, expected):
+    from src.reply.generator import _quotes_self
+
+    msg = _m("相缺", "确实")
+    msg.quoted_text = quote
+    own = ChatMessage(text=own_text, sender="自己", sender_type=SenderType.SELF, chat_name=own_chat)
+    assert _quotes_self(msg, [own]) is expected

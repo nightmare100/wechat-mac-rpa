@@ -101,6 +101,17 @@ def _make_generator(mock_llm_instance, enable_self_refine: bool = True) -> Reply
     return gen
 
 
+@pytest.mark.parametrize("sender", ["未知", "未知昵称", "[未知]", "群成员昵称", "Alice"])
+def test_unresolved_reply_target_never_mentioned_in_private_path(sender, sample_message):
+    import json
+
+    llm = MockLLM([json.dumps({"replies": [f"@{sender} 好哒"]}, ensure_ascii=False)])
+    gen = _make_generator(llm, enable_self_refine=False)
+    gen.enable_skills = False
+    replies = gen.generate([sample_message], [sample_message], is_group=False)
+    assert replies == (["@Alice 好哒"] if sender == "Alice" else ["好哒"])
+
+
 class TestSelfRefine:
     def test_self_refine_pass_skips_iterate(self, mock_llm, sample_message):
         mock_llm.responses = [
