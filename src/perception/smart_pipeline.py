@@ -181,7 +181,7 @@ class _QwenAPIClient:
             model=self.model,
             messages=messages,
             temperature=0.0,
-            max_tokens=2048,
+            max_tokens=4096,
             extra_body={"enable_thinking": False},
         )
         msg = response.choices[0].message
