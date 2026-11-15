@@ -62,6 +62,12 @@
 
 ## 按文件索引
 
+### `src/mumu/`
+- **定位**: 独立 MuMu 模拟器 Python 工具，后续可接 Bot 工具层；当前不注册 Bot
+- **入口**: `from src.mumu import MuMuEmulatorUtil`
+- **职责**: 实例及 App 启停、Android 操作、内部 PNG 截图和顺序执行
+- **用法与边界**: [MuMu 模块说明](../../src/mumu/README.md)
+
 ### `src/models/base.py`
 - **定位**: L1 领域模型
 - **改什么**: 基础数据结构变更

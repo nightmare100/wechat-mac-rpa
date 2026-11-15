@@ -21,6 +21,8 @@
 
 ## 快速开始
 
+MuMu 模拟器 Python 工具见 [src/mumu/README.md](src/mumu/README.md)，提供实例/App 管理、点击输入和 Android 原生截图；当前独立于微信 Bot 使用。
+
 - **环境**：macOS 12+，Python 3.10+，微信 Mac 版
 - **依赖**：`pip install -r requirements.txt`
 - **配置**：复制 `.env.example` 为 `.env`，填入 API Key；复制 `prompts/persona.md.example` 为 `data/persona.md`，填写本地人设
