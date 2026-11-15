@@ -11,9 +11,9 @@
 
 **中文** | [English](README_EN.md)
 
-让 AI 像人一样"看"着微信界面，自动回复消息。默认 OCR / SmartPipeline 模式**不碰协议、不读数据库、不注入代码**；可选 WeFlow 模式会读取用户授权的本地数据库副本，用于初始化历史记忆。
+通过 TraceMemo 本地 HTTP API 接收微信消息，或选择原有 OCR / SmartPipeline 视觉方案，自动生成回复。默认使用 TraceMemo，发送仍复用微信 GUI 操作。
 
-基于**多模态视觉感知**与**LLM Agent**的 macOS 微信自动化框架。默认模式不是协议逆向或 Hook，而是把微信当作纯黑盒 GUI 应用：用计算机视觉读取界面，用大语言模型理解对话，用系统级自动化操作界面。
+基于可切换的**消息感知**与**LLM Agent**的 macOS 微信自动化框架。视觉模式读取界面；TraceMemo 模式读取用户已授权连接的本地数据库。两种模式共用回复、人设、记忆和发送逻辑。
 
 核心设计：**感知 → 推理 → 行动 → 记忆 → 数据飞轮**，五个子系统构成完整的认知闭环。每一次认知循环的完整链路都被结构化日志逐条记录，形成**可追溯、可回归、可量化**的生产质量资产。
 
@@ -26,9 +26,15 @@
 - **配置**：复制 `.env.example` 为 `.env`，填入 API Key；复制 `prompts/persona.md.example` 为 `data/persona.md`，填写本地人设
 - **隐私**：`.env` 与 `data/` 默认不进入 Git；不要把 API Key、聊天记录或真实人设提交到仓库
 - **权限**：Bot 依赖 macOS 辅助功能/屏幕录制权限，详见下文[权限说明](#权限说明)
-- **启动**：`python3 run_bot.py`
+- **启动**：`python3 run_bot.py`（默认 TraceMemo，亦可显式指定 `--source tracememo`）
+- **原视觉方案**：`python3 run_bot.py --source vision`
+- **TraceMemo 准备**：启动 TraceMemo 并连接数据库，将 API Token 配置到本机环境变量 `TRACEMEMO_API_TOKEN`（兼容旧变量 `WECHATEXPLORER_API_TOKEN`）；不要把 Token 提交到仓库。默认 API 地址为 `http://127.0.0.1:6131/api/v1`，可用 `TRACEMEMO_BASE_URL` 指定本机地址。
+- **监听群**：`.env` 中配置 `TRACEMEMO_CHATS=群名或群ID,另一个群`，不配置则沿用 `SILENT_WHITELIST`。仅监听所列群，发送白名单规则保持有效；群不存在或存在同名歧义时拒绝启动。当前 TraceMemo 接收适配器仅支持群聊。
+- **接收行为**：每轮依次读取一个目标群，周期沿用 `POLL_INTERVAL`；启动前最近 30 分钟的消息仅用作上下文，不补回复历史。读取时间窗重叠 120 秒，按消息 ID 去重；API 故障时保留进度重试，不自动切换视觉。落库延迟超过重叠窗口的消息可能漏读。
+- **媒体边界**：TraceMemo 模式读取文字、引用作者、消息类型及已有语音转写；图片、表情和视频仅保留未解析占位，尚未接入媒体识别。需要现有图片理解能力时使用 `--source vision`。
+- **发送定位**：TraceMemo 可读取后台群消息；发送文字、文件或回复语音前，会打开并校验目标微信聊天，校验失败取消发送。微信仍须登录并可操作。
 - **长时间挂机启动（推荐）**：`caffeinate -d .venv/bin/python run_bot.py`
-  - Bot 靠截图读消息，显示器息屏或锁屏后截图会失败，Bot 就收不到消息
+  - 视觉模式靠截图读消息；TraceMemo 接收不依赖截图，但 UI 发送仍需窗口标题校验，建议保持显示器常亮
   - `caffeinate -d` 让显示器在 Bot 运行期间保持常亮，Bot 退出后恢复系统原设置
   - 手动锁屏、合上笔记本盖子仍会导致截图失败
 - **管理后台（LaunchAgent 常驻）**：

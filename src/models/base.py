@@ -74,6 +74,7 @@ class ChatMessage:
     create_time: Optional[int] = None  # 秒级时间戳
     raw_type: Optional[int] = None     # WeFlow localType
     sender_wxid: Optional[str] = None  # 原始 sender wxid
+    source: str = ""                  # 接收来源；TraceMemo 精确去重标记需随消息持久化
 
 
 @dataclass

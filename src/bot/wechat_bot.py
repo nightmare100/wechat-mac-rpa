@@ -20,6 +20,7 @@ from src.logging.bot_logger import BotLogger, get_logger
 from src.memory import MemoryEngine
 from src.models.base import ActionResult, ChatMessage, PerceptionResult, SenderType
 from src.perception.vision_pipeline import VisionPipeline
+from src.perception.tracememo_pipeline import TraceMemoError
 from src.reply.generator import ReplyGenerator, _get_judge_worker
 from src.reply.policy import ReplyPolicy
 from src.reply.voice_policy import VoiceDecision, VoiceReplyPolicy, load_voice_reply_config
@@ -170,6 +171,8 @@ class WeChatBot:
             abs_path = os.path.abspath(file_path)
             if not os.path.exists(abs_path):
                 return f"文件不存在: {file_path}"
+            if not self._prepare_send_target(chat_name):
+                return "发送失败: 无法校验目标聊天"
             result = self.sender.send_file(abs_path, chat_name=chat_name)
             if result.success:
                 return f"已发送文件: {file_name}"
@@ -231,7 +234,10 @@ class WeChatBot:
 
         # ===== WeFlow 全量初始化 =====
         self._weflow_mode = os.getenv("WEFLOW_MODE", "ocr")
-        print(f"[WeFlow] 模式检测: WEFLOW_MODE={self._weflow_mode}")
+        if getattr(self.perception, "source_name", None) == "tracememo":
+            self._weflow_mode = "tracememo"
+            self.enable_chat_switch = False
+        print(f"[Perception] 消息合并模式: {self._weflow_mode}")
         if self._weflow_mode in ("weflow", "hybrid"):
             try:
                 has_wf = hasattr(self.perception, '_weflow_pipeline')
@@ -293,6 +299,10 @@ class WeChatBot:
         try:
             try:
                 result = self.perception.perceive()
+            except TraceMemoError as exc:
+                self.logger.warning("%s；本轮暂停，下一轮重试，不切换消息来源", exc)
+                self.debug_logger.log_action("none", action_input="", success=False, error=str(exc))
+                return
             except WeChatNotReadyError:
                 recovery = self._login_handler.handle()
                 if recovery.status == LoginRecoveryStatus.SUCCESS:
@@ -393,6 +403,7 @@ class WeChatBot:
             state, unreplied = self.global_store.merge_tick(
                 chat_name, messages, mode=self._weflow_mode, is_group=is_group
             )
+            unreplied = self._skip_source_startup_backlog(chat_name, unreplied)
             unreplied = self._skip_wake_backlog(chat_name, unreplied)
 
             # 记录 Session 层输入输出
@@ -726,7 +737,7 @@ class WeChatBot:
                         if decision.scene == "要听语音":
                             replies = [decision.text]
             for i, reply in enumerate([] if voiced else replies):
-                action_result = self.sender.send(reply, chat_name=chat_name)
+                action_result = self._send_text(chat_name, reply)
                 if action_result.success:
                     sent_replies.append(reply)
                     self.logger.log_send(tick_id, success=True, text=reply)
@@ -1168,6 +1179,8 @@ class WeChatBot:
         if self.sender.silent_mode and not self.sender.in_silent_whitelist(chat_name):
             return ActionResult(success=False, error="静默模式非白名单，不发语音")
         try:
+            if not self._prepare_send_target(chat_name):
+                return ActionResult(success=False, error="无法校验目标聊天")
             if not ChatOpener(self.perception).is_current(chat_name):  # 只读校验，不切换会话
                 return ActionResult(success=False, error="当前窗口校验失败")
             if getattr(self, "_voice_sender", None) is None:
@@ -1186,9 +1199,39 @@ class WeChatBot:
         tune = {k: v for k, v in line.items() if k not in ("text", "mood")}
         return self._voice_sender.send(line["text"], line["mood"], **tune)
 
+    def _skip_source_startup_backlog(self, chat_name, messages):
+        """旧 DB 中遗留的未回复消息也不能在切换来源/重启时补回。"""
+        if getattr(self.perception, "source_name", None) != "tracememo":
+            return messages
+        fresh = []
+        for msg in messages:
+            if msg.create_time is None or msg.create_time < self.perception.started_at:
+                self.global_store.mark_replied(chat_name, msg, "(启动前历史，不补回)")
+            else:
+                fresh.append(msg)
+        return fresh
+
+    def _prepare_send_target(self, chat_name: str) -> bool:
+        if getattr(self.perception, "source_name", None) != "tracememo":
+            return True
+        if not chat_name:
+            return False
+        if self.sender.silent_mode and not self.sender.in_silent_whitelist(chat_name):
+            return False
+        try:
+            return ChatOpener(self.perception).open(chat_name)
+        except Exception:
+            self.logger.warning("无法打开或校验目标聊天，取消发送")
+            return False
+
+    def _send_text(self, chat_name: str, text: str) -> ActionResult:
+        if not self._prepare_send_target(chat_name):
+            return ActionResult(success=False, error="无法打开或校验目标聊天")
+        return self.sender.send(text, chat_name=chat_name)
+
     def send_to_chat(self, chat_name: str, text: str) -> ActionResult:
         """外部系统调用此接口主动发消息到指定聊天。"""
-        result = self.sender.send(text, chat_name=chat_name)
+        result = self._send_text(chat_name, text)
         if result.success:
             norm = _normalize_chat_name(chat_name)
             # 创建一条虚拟的已回复消息记录，放入 pending 等感知层确认

@@ -25,9 +25,11 @@ class ChatState:
     chat_id: str
     chat_name: str
     is_group: bool = False
+    merge_mode: str = "ocr"
     messages: List[ChatMessage] = field(default_factory=list)
     _msg_ids: set = field(default_factory=set)  # 去重集合（不序列化）
     pending_self_messages: List[ChatMessage] = field(default_factory=list)  # Bot 发送成功但尚未被感知层确认的消息（诊断用，不序列化）
+    _api_seen: dict = field(default_factory=dict)  # 完整重叠批次的身份；独立于上下文裁剪，不序列化
 
 
 def _normalize_text(text: str) -> str:
@@ -380,9 +382,10 @@ class GlobalStore:
         """
         合并 tick 检测到的消息，返回 (state, 未回复的消息列表).
 
-        mode: "ocr" | "weflow" | "hybrid"
+        mode: "ocr" | "weflow" | "hybrid" | "tracememo"
             - ocr: 使用原有 LCS + 模糊匹配去重
             - weflow/hybrid: 使用 localId 精确去重（如果消息有 local_id）
+            - tracememo: serverId/localId 精确去重，保留重复内容的新消息
         """
         if chat_name not in self.chats:
             self.chats[chat_name] = ChatState(
@@ -392,13 +395,16 @@ class GlobalStore:
             )
 
         state = self.chats[chat_name]
+        state.merge_mode = mode
         # 如果传入的 is_group 与当前状态不同，更新状态
         if state.is_group != is_group:
             state.is_group = is_group
             self._dirty.add(chat_name)
 
         # 选择去重策略
-        if mode in ("weflow", "hybrid"):
+        if mode == "tracememo":
+            new_messages = self._merge_tick_tracememo(state, messages)
+        elif mode in ("weflow", "hybrid"):
             _logger.info("[GlobalStore] %s 使用 WeFlow 精确去重 (%d 条)", chat_name, len(messages))
             new_messages = self._merge_tick_weflow(chat_name, messages)
         else:
@@ -440,10 +446,16 @@ class GlobalStore:
         now = time.time()
 
         # 用 is 匹配（target_msg 就是 state.messages 中的对象引用）
-        # 如果 is 匹配不到，再用 text+sender 兜底
+        # 数据库消息按 ID；视觉消息才按 text+sender 兜底。
         marked = False
+        server_id = target_msg.server_id if target_msg.server_id != "0" else None
+        exact_id = server_id is not None or target_msg.local_id is not None
         for msg in state.messages:
-            if msg is target_msg or (msg.text == target_msg.text and msg.sender == target_msg.sender):
+            same_id = exact_id and msg.chatroom_id == target_msg.chatroom_id and (
+                msg.server_id == server_id if server_id else msg.local_id == target_msg.local_id
+            )
+            text_fallback = state.merge_mode != "tracememo" and not exact_id and msg.text == target_msg.text and msg.sender == target_msg.sender
+            if msg is target_msg or same_id or text_fallback:
                 msg.replied = True
                 msg.reply_text = reply_text
                 msg.reply_time = now
@@ -451,6 +463,30 @@ class GlobalStore:
                 # 不 break，继续标记所有匹配的消息（OCR 不稳定可能导致同一条消息存了多份）
         if marked:
             self._dirty.add(chat_name)
+
+    @staticmethod
+    def _merge_tick_tracememo(state: ChatState, messages: List[ChatMessage]) -> List[ChatMessage]:
+        def identity(msg):
+            if msg.server_id and msg.server_id != "0":
+                return (msg.chatroom_id, "server", msg.server_id)
+            return (msg.chatroom_id, "local", msg.local_id)
+
+        for msg in state.messages:
+            if msg.server_id or msg.local_id is not None:
+                state._api_seen.setdefault(identity(msg), msg.create_time)
+        # /chatlog returns the complete range and its lower bound only advances.
+        # Keep the entire incoming overlap even when it exceeds max_messages.
+        times = [m.create_time for m in messages if m.create_time is not None]
+        if times:
+            oldest = min(times)
+            state._api_seen = {k: t for k, t in state._api_seen.items() if t is None or t >= oldest}
+        new = []
+        for msg in messages:
+            key = identity(msg)
+            if key not in state._api_seen:
+                state._api_seen[key] = msg.create_time
+                new.append(msg)
+        return new
 
     def _merge_tick_weflow(self, chat_name: str, messages: List[ChatMessage]) -> List[ChatMessage]:
         """WeFlow 精确去重：基于 localId + Bot 消息 text 去重。
@@ -636,6 +672,7 @@ class GlobalStore:
             create_time=db_msg.create_time,
             raw_type=db_msg.raw_type,
             sender_wxid=db_msg.wxid,
+            source=db_msg.source or "",
         )
 
     def _load_from_db(self):
@@ -693,6 +730,7 @@ class GlobalStore:
             "raw_type": m.raw_type,
             "sender_wxid": m.sender_wxid,
             "chatroom_id": m.chatroom_id,
+            "source": m.source,
         }
 
     def save(self):
@@ -740,7 +778,9 @@ class GlobalStore:
             chat_type = "group" if state.is_group else "single"
             # OCR 模式可能没有 sender_wxid，用 sender 显示名做占位 wxid
             for d in msg_dicts:
-                if not d.get("wxid") and d.get("sender"):
+                if d.get("sender_wxid"):
+                    d["wxid"] = d["sender_wxid"]
+                elif not d.get("wxid") and d.get("sender"):
                     d["wxid"] = f"_sender_{d['sender']}"
             try:
                 stats = self._chat_repo.bulk_sync_chat(

@@ -314,6 +314,14 @@ class ChatHistoryRepository:
                     if is_self is None:
                         is_self = msg.get("sender_type") == "self"
 
+                    hash_input = content
+                    if msg.get("source") == "tracememo":
+                        sid = msg.get("server_id")
+                        identity = f"server:{sid}" if sid and sid != "0" else f"local:{msg.get('local_id')}"
+                        # Preserve identical messages in the same second without
+                        # changing the existing SQLite unique constraint.
+                        if (sid and sid != "0") or msg.get("local_id") is not None:
+                            hash_input = f"tracememo:{identity}\0{content}"
                     message_values.append({
                         "chatroom_id": chatroom.id,
                         "local_id": msg.get("local_id"),
@@ -332,7 +340,8 @@ class ChatHistoryRepository:
                         "create_time": create_time,
                         "raw_type": msg.get("raw_type"),
                         "source_file": source_file,
-                        "content_hash": self._content_hash(content),
+                        "source": msg.get("source"),
+                        "content_hash": self._content_hash(hash_input),
                         "created_at": now,
                     })
 

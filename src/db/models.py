@@ -66,6 +66,7 @@ class Message(Base):
     create_time: Mapped[float] = mapped_column(Float, nullable=False)
     raw_type: Mapped[int | None] = mapped_column(Integer, nullable=True)
     source_file: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source: Mapped[str | None] = mapped_column(Text, nullable=True)
     content_hash: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[float | None] = mapped_column(Float, nullable=True)
 

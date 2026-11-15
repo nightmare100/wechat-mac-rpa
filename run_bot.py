@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """wechat-twin Bot — 合并重构版本"""
 import logging
+import argparse
 import sys, os, fcntl, signal
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -14,11 +15,6 @@ if env_file.exists():
             if line and not line.startswith("#") and "=" in line:
                 k, v = line.split("=", 1)
                 os.environ.setdefault(k.strip(), v.strip())
-
-from src.bot.wechat_bot import WeChatBot
-from src.layout.profile import PROFILE_WECHAT_MAC_1760X1280
-from src.perception.smart_pipeline import SmartPerceptionPipeline
-from src.utils.qwen_client import QwenClient
 
 _logger = logging.getLogger(__name__)
 
@@ -58,7 +54,28 @@ class SingleInstanceLock:
                 _logger.warning("remove pid file failed: %s", e)
 
 
-def main():
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="微信 Bot：选择消息接收方案，发送仍使用微信 UI")
+    parser.add_argument("--source", choices=("tracememo", "vision"), default="tracememo",
+                        help="消息来源（默认 tracememo；vision 保留原视觉识别）")
+    return parser.parse_args(argv)
+
+
+def create_perception(source, profile):
+    if source == "tracememo":
+        from src.perception.tracememo_pipeline import TraceMemoPipeline
+        return TraceMemoPipeline(profile)
+    from src.perception.smart_pipeline import SmartPerceptionPipeline
+    return SmartPerceptionPipeline(profile)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    from src.bot.wechat_bot import WeChatBot
+    from src.layout.profile import PROFILE_WECHAT_MAC_1760X1280
+    from src.utils.qwen_client import QwenClient
+    from src.perception.tracememo_pipeline import TraceMemoError
+
     with SingleInstanceLock():
         print("=" * 60)
         print("🤖 wechat-twin Bot")
@@ -75,13 +92,19 @@ def main():
             print("  ⚠️ POLL_INTERVAL 不是数字，使用默认 5 秒")
             interval = 5.0
         print(f"  • 轮询: 每 {interval:g} 秒")
+        print(f"  • 消息来源: {args.source}")
 
+        try:
+            perception = create_perception(args.source, PROFILE_WECHAT_MAC_1760X1280)
+        except TraceMemoError as exc:
+            print(f"❌ {exc}")
+            return 1
         llm = QwenClient()
-        perception = SmartPerceptionPipeline(PROFILE_WECHAT_MAC_1760X1280)
         bot = WeChatBot(
             profile=PROFILE_WECHAT_MAC_1760X1280,
             llm_client=llm,
             perception=perception,
+            enable_chat_switch=args.source == "vision",
         )
 
         def _request_stop(signum, _frame):
@@ -104,4 +127,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
