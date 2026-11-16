@@ -61,7 +61,7 @@ class WeChatBot:
         if _quotes_self(message, history):
             return True
         followup = getattr(self.generator, "followup", None)
-        candidates = followup.candidates(chat_name) if followup is not None else []
+        candidates = followup.keyword_candidates(chat_name) if followup is not None else []
         if not isinstance(candidates, (list, tuple)):
             return False
         return any(_same_person(message.sender, sender) for sender, _ in candidates)

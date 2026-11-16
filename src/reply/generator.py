@@ -18,7 +18,7 @@ from src.reply.evidence_utils import strip_assistant_history_lines
 from src.reply.few_shot import PersonaFewShotRetriever
 from src.reply.session_memory import SessionMemory, _extract_query_key
 from src.tools import get_registry
-from src.utils.identity import mentions_bot, render_persona, unresolved_persona_vars
+from src.utils.identity import is_at_bot, mentions_bot, render_persona, unresolved_persona_vars
 from src.utils.time_window import in_sleep_window, parse_sleep_hours
 
 _logger = logging.getLogger("src.reply.generator")
@@ -142,6 +142,7 @@ class FollowupTracker:
                  chime_rounds: Tuple[int, int] = CHIME_FOLLOWUP_ROUNDS):
         self.rounds, self.ttl, self.randint, self.now = rounds, ttl, randint, now
         self.chime_rounds = chime_rounds
+        self.keyword_targets: Dict[str, set] = {}  # 仅明确 @Bot/引用 Bot 建立的检索资格
         self.threads: Dict[str, Dict[str, list]] = {}  # chat -> sender -> [remaining, updated_at]
 
     def _find(self, chat: str, sender: str) -> Optional[str]:
@@ -150,6 +151,10 @@ class FollowupTracker:
     def candidates(self, chat: str) -> List[Tuple[str, int]]:
         now = self.now()
         return [(s, r) for s, (r, t) in self.threads.get(chat, {}).items() if r > 0 and now - t <= self.ttl]
+
+    def keyword_candidates(self, chat: str) -> List[Tuple[str, int]]:
+        eligible = self.keyword_targets.get(chat, set())
+        return [(sender, rounds) for sender, rounds in self.candidates(chat) if sender in eligible]
 
     def record(self, chat: str, unreplied: List[ChatMessage], replies: List[str], fresh_targets=(),
                history: Optional[List[ChatMessage]] = None) -> None:
@@ -166,6 +171,16 @@ class FollowupTracker:
             fresh = any(_same_person(target, f) for f in fresh_targets)
             triggered = any(mentions_bot(u.text) or _quotes_self(u, history or []) for u in msgs)
             if fresh or triggered:
+                eligible = self.keyword_targets.setdefault(chat, set())
+                # 主动插话不能建立关键词检索资格；资格只来自明确 @ 或引用我。
+                direct = any(is_at_bot(u.text) or _quotes_self(u, history or []) for u in msgs)
+                inherited = any(s == key for s, _ in self.keyword_candidates(chat))
+                if key:
+                    eligible.discard(key)
+                if direct or (inherited and not fresh):
+                    eligible.add(target)
+                else:
+                    eligible.discard(target)
                 if key:
                     del chat_threads[key]
                 rounds = self.rounds if triggered else self.chime_rounds
