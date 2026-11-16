@@ -56,13 +56,37 @@ def _try_create_openclaw_client():
 
 
 class WeChatBot:
+    def _fixed_flow_addressed(self, chat_name, message, history):
+        from src.reply.generator import _quotes_self, _same_person
+        if _quotes_self(message, history):
+            return True
+        followup = getattr(self.generator, "followup", None)
+        candidates = followup.candidates(chat_name) if followup is not None else []
+        if not isinstance(candidates, (list, tuple)):
+            return False
+        return any(_same_person(message.sender, sender) for sender, _ in candidates)
+
     def _handle_fixed_flow(self, chat_name, messages, tick_id):
-        matched = [(msg, self.fixed_flow.match(msg)) for msg in messages]
+        state = self.global_store.chats.get(chat_name)
+        history = getattr(state, "messages", [])
+        if not isinstance(history, list):
+            history = []
+        matched = [(msg, self.fixed_flow.match(
+            msg, addressed=self._fixed_flow_addressed(chat_name, msg, history),
+        )) for msg in messages]
         matched = [(msg, keyword) for msg, keyword in matched if keyword is not None]
         if not matched:
             return False
         for msg, keyword in matched:
-            reply = self.fixed_flow.reply(msg, keyword)
+            now = time.monotonic()
+            recent = getattr(self, "_fixed_flow_recent", {})
+            # 同群同关键词共享窗口；只从攻略真实发送成功时开始计时。
+            recent = {key: sent_at for key, sent_at in recent.items() if now - sent_at < 300}
+            self._fixed_flow_recent = recent
+            repeat_key = (getattr(msg, "chatroom_id", None) or _normalize_chat_name(chat_name), keyword)
+            is_repeat = repeat_key in recent
+            reply = ("回复过啦，请看上面的消息" if is_repeat
+                     else self.fixed_flow.reply(msg, keyword))
             self.logger.info("[FixedFlow] chat=%s keyword=%s", chat_name, keyword)
             result = self._send_text(chat_name, reply)
             self.logger.log_send(tick_id, success=result.success, text=reply, error=result.error)
@@ -72,6 +96,14 @@ class WeChatBot:
                 break  # 发送失败不标记，不回落模型，下一轮重试。
             self.global_store.mark_replied(chat_name, msg, reply if result.success else "")
             if result.success:
+                followup = getattr(self.generator, "followup", None)
+                if followup is not None:
+                    followup.record(chat_name, [msg], [reply], history=history)
+                # 空结果或失败提示不算发过攻略；提醒本身也不延长窗口。
+                if not is_repeat and any(url in reply for url in (
+                    "https://archero2hub.com/", "https://archero.wiki/",
+                )):
+                    recent[repeat_key] = time.monotonic()
                 state = self.global_store.chats.get(chat_name)
                 if state is not None:
                     state.pending_self_messages.append(ChatMessage(

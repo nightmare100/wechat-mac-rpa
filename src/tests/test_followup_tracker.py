@@ -1,3 +1,12 @@
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def bot_identity(monkeypatch):
+    monkeypatch.setenv("BOT_AT_KEYWORD", "囡囡")
+    monkeypatch.setenv("BOT_NAME", "『宵桜』囡囡")
+
+
 from src.models.base import ChatMessage, SenderType
 from src.reply.generator import FollowupTracker, _same_person
 

@@ -60,3 +60,13 @@ def test_japanese_source_failure_preserves_chinese(monkeypatch):
     reply = FixedFlow().reply(msg('@囡囡 钓鱼'), '钓鱼')
     assert '钓鱼攻略' in reply
     assert '暂时读取失败' in reply
+
+
+def test_addressed_followup_matches_without_at(monkeypatch):
+    monkeypatch.setenv('BOT_AT_KEYWORD', '囡囡')
+    flow = FixedFlow(('符文',))
+    assert flow.match(msg('符文怎么选'), addressed=True) == '符文'
+    assert flow.match(msg('符文怎么选')) is None
+    quoted = msg('那装备呢')
+    quoted.quoted_text = '囡囡：符文攻略'
+    assert flow.match(quoted, addressed=True) is None

@@ -22,9 +22,9 @@ class FixedFlow:
             raise ValueError('FIXED_FLOW_KEYWORDS 必须是非空字符串组成的 JSON 数组')
         return cls(tuple(dict.fromkeys(v.strip() for v in values)))
 
-    def match(self, message):
+    def match(self, message, *, addressed: bool = False):
         text = message.text or ''
-        if message.sender_type != SenderType.OTHER or not is_at_bot(text):
+        if message.sender_type != SenderType.OTHER or not (is_at_bot(text) or addressed):
             return None
         # 去掉 @昵称，避免昵称中的关键字被当成指令。引用内容不参与匹配。
         body = re.sub(r'@[^\s\u2005]+', '', text)
