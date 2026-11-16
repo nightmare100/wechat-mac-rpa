@@ -13,6 +13,7 @@ from src.action.chat_list_clicker import ChatListClicker
 from src.action.chat_opener import ChatOpener
 from src.action.login_recovery import LoginRecoveryStatus, WeChatLoginHandler
 from src.action.message_sender import WeChatMessageSender
+from src.bot.fixed_flow import FixedFlow
 from src.bot.scheduled_push import ScheduledPusher, load_mood_styles, load_rate_jitter
 from src.utils.time_window import in_sleep_window, parse_sleep_hours
 from src.capture.window_capture import WeChatNotReadyError
@@ -55,6 +56,31 @@ def _try_create_openclaw_client():
 
 
 class WeChatBot:
+    def _handle_fixed_flow(self, chat_name, messages, tick_id):
+        matched = [(msg, self.fixed_flow.match(msg)) for msg in messages]
+        matched = [(msg, keyword) for msg, keyword in matched if keyword is not None]
+        if not matched:
+            return False
+        for msg, keyword in matched:
+            reply = self.fixed_flow.reply(msg, keyword)
+            self.logger.info("[FixedFlow] chat=%s keyword=%s", chat_name, keyword)
+            result = self._send_text(chat_name, reply)
+            self.logger.log_send(tick_id, success=result.success, text=reply, error=result.error)
+            self.debug_logger.log_action("fixed_flow", action_input=keyword,
+                                         success=result.success, error=result.error or "")
+            if not result.success and not result.skipped:
+                break  # 发送失败不标记，不回落模型，下一轮重试。
+            self.global_store.mark_replied(chat_name, msg, reply if result.success else "")
+            if result.success:
+                state = self.global_store.chats.get(chat_name)
+                if state is not None:
+                    state.pending_self_messages.append(ChatMessage(
+                        text=reply, sender="自己", sender_type=SenderType.SELF,
+                        chat_name=chat_name, replied=True, reply_text=reply,
+                        reply_time=time.time(), message_type="text",
+                    ))
+        return True
+
     def __init__(self, profile=None, on_message: Optional[Callable] = None, llm_client=None,
                  debug_mode: bool = False, use_openclaw: bool = True, perception=None,
                  enable_chat_switch: bool = True):
@@ -66,6 +92,7 @@ class WeChatBot:
             self.perception = VisionPipeline(profile)
         self.global_store = GlobalStore()
         self.policy = ReplyPolicy(require_at_in_group=False)
+        self.fixed_flow = FixedFlow.from_env()
 
         if llm_client is not None:
             actual_llm = llm_client
@@ -520,6 +547,10 @@ class WeChatBot:
                     latest_text=unreplied[-1].text if unreplied else "",
                 )
                 self.debug_logger.log_action("none", action_input="", success=False, error="上线静默中")
+                return
+
+            # 固定流程优先；只消费命中的消息，其余未读留待下一轮。
+            if self._handle_fixed_flow(chat_name, to_reply, tick_id):
                 return
 
             # 群里没 @ 我时，等对方连发的几条说完再一起回

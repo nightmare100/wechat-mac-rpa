@@ -358,6 +358,7 @@ VOICE_YES = VoiceDecision(True, "概率命中", "被夸感谢", "哼，算你有
 class TestVoiceReply:
     @pytest.fixture
     def bot(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("BOT_AT_KEYWORD", "囡囡")
         monkeypatch.chdir(tmp_path)
         monkeypatch.setattr("scripts.sync_knowledge.sync", lambda: False)
         monkeypatch.setattr("src.bot.wechat_bot.GlobalStore", Mock)
@@ -529,3 +530,33 @@ class TestSwitchRespectsSilentWhitelist:
         bot.sender.silent_mode = False
         result = self._result([self.item("弓箭2战神公会", "8"), self.item("人格测试", "2")])
         assert bot._try_switch_to_unread_chat(result) == "弓箭2战神公会"
+
+    @pytest.mark.parametrize('success', [True, False])
+    def test_fixed_flow_bypasses_generator(self, bot, monkeypatch, success):
+        from src.bot.fixed_flow import FixedFlow
+        monkeypatch.setenv('BOT_AT_KEYWORD', '囡囡')
+        bot.fixed_flow = FixedFlow(('宝藏',))
+        monkeypatch.setattr(FixedFlow, 'reply', lambda self, message, keyword: '收到，已进入固定处理流程（关键词：宝藏）')
+        fixed = ChatMessage(text='@囡囡 看宝藏', sender='A', sender_type=SenderType.OTHER, chat_name='测试群')
+        normal = ChatMessage(text='普通聊天', sender='B', sender_type=SenderType.OTHER, chat_name='测试群')
+        state = Mock(messages=[fixed, normal], pending_self_messages=[])
+        bot.perception.perceive.return_value = PerceptionResult(
+            chat_name='测试群', messages=[fixed, normal], chat_list_items=[], screenshot_path='')
+        bot.global_store.merge_tick.return_value = (state, [fixed, normal])
+        bot.global_store.chats = {'测试群': state}
+        bot.policy = Mock()
+        bot.policy.should_reply.return_value = True
+        bot.generator = Mock()
+        bot.sender = Mock(silent_mode=False)
+        bot.no_reply_chats = []
+        bot._filter_online_silence = lambda chat, unread, replies: replies
+        bot._send_text = Mock(return_value=ActionResult(success=success, error=None if success else 'failed'))
+        bot.tick()
+        bot.generator.generate.assert_not_called()
+        bot._send_text.assert_called_once_with('测试群', '收到，已进入固定处理流程（关键词：宝藏）')
+        if success:
+            bot.global_store.mark_replied.assert_called_once_with('测试群', fixed, '收到，已进入固定处理流程（关键词：宝藏）')
+            assert len(state.pending_self_messages) == 1
+        else:
+            bot.global_store.mark_replied.assert_not_called()
+            assert not state.pending_self_messages
