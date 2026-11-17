@@ -68,6 +68,13 @@
 - **职责**: 实例及 App 启停、Android 操作、内部 PNG 截图和顺序执行
 - **用法与边界**: [MuMu 模块说明](../../src/mumu/README.md)
 
+### `src/treasure_map/`
+- **定位**: 独立藏宝图布局匹配、保守拒识和去重收录；当前不注册 Bot
+- **入口**: `from src.treasure_map import TreasureMapLibrary`
+- **CLI**: `.venv/bin/python -m src.treasure_map match IMAGE [--json]`；`.venv/bin/python -m src.treasure_map add IMAGE [--json]`
+- **职责**: SIFT 特征缓存、受限平移几何校验、空间限分、图库查找及原子收录
+- **边界**: 默认图库为父仓库 `images/`，新图写 `images/added/`；缓存为 Git 忽略的 `data/treasure_map/`
+
 ### `src/models/base.py`
 - **定位**: L1 领域模型
 - **改什么**: 基础数据结构变更
