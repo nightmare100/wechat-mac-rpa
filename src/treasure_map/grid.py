@@ -14,7 +14,7 @@ ROWS = 12
 CELL_MATCHES = 4
 CELL_SHIFT = 12.0
 STRONG_MATCH_RATIO = 1.0
-DUPLICATE_RATIO = 0.60
+DUPLICATE_RATIO = 0.95
 
 # Measured from the phone screenshots and the 828×1792 library shots.
 # The board is the same 10×12 layout; these rectangles place that grid on the playfield.

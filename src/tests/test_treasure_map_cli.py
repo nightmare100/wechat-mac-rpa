@@ -35,7 +35,7 @@ def test_match_found_text_and_exit_code(capsys):
 
     output = capsys.readouterr().out
     assert exit_code == 0
-    assert "找到最相似的藏宝图" in output
+    assert "匹配成功" in output
     assert str(path) in output
     assert "70" in output
 
@@ -46,7 +46,7 @@ def test_match_not_found_text_and_exit_code(capsys):
     exit_code = main(["match", "query.png"], library=library)
 
     assert exit_code == 0
-    assert capsys.readouterr().out.strip() == "找不到足够相似的藏宝图"
+    assert capsys.readouterr().out.strip() == "未匹配成功"
 
 
 @pytest.mark.parametrize("status,prefix", [("duplicate", "已重复："), ("added", "已加入：")])
@@ -74,6 +74,16 @@ def test_match_json_contains_structured_result(capsys):
     assert payload["path"] == str(path)
     assert payload["similarity"] == asdict(SIMILARITY)
     assert payload["runner_up"] == asdict(SIMILARITY)
+    assert payload["note"] is None
+
+
+def test_not_found_with_closest_image_is_labeled(capsys):
+    path = Path("images/post/01.png")
+    result = MatchResult("not_found", path, SIMILARITY)
+
+    main(["match", "query.png"], library=FakeLibrary(result))
+
+    assert capsys.readouterr().out.strip() == f"最相似，未匹配成功：{path}"
 
 
 def test_not_found_json_uses_nulls(capsys):
@@ -82,7 +92,13 @@ def test_not_found_json_uses_nulls(capsys):
     main(["match", "query.png", "--json"], library=FakeLibrary(result))
 
     payload = json.loads(capsys.readouterr().out)
-    assert payload == {"status": "not_found", "path": None, "similarity": None, "runner_up": None}
+    assert payload == {
+        "status": "not_found",
+        "path": None,
+        "similarity": None,
+        "runner_up": None,
+        "note": "未匹配成功",
+    }
 
 
 @pytest.mark.parametrize("status", ["duplicate", "added"])

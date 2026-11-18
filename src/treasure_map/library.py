@@ -49,14 +49,14 @@ class TreasureMapLibrary:
         ranked = self._rank(query)
         eligible = [candidate for candidate in ranked if self._passes_match(candidate[1])]
         if not eligible:
-            best, second = self._top_two(ranked)
-            return MatchResult("not_found", None, best, second)
+            best_path, best, second = self._top_two(ranked)
+            return MatchResult("not_found", best_path, best, second)
         best_path, best = eligible[0]
         second = eligible[1][1] if len(eligible) > 1 else None
         if best.score < self.thresholds.strong_score and second is not None:
             relative_gap = (best.score - second.score) / best.score
             if relative_gap < self.thresholds.ambiguity_ratio:
-                return MatchResult("not_found", None, best, second)
+                return MatchResult("not_found", best_path.source, best, second)
         return MatchResult("found", best_path.source, best, second)
 
     def add(self, image_path: Path) -> AddResult:
@@ -101,14 +101,13 @@ class TreasureMapLibrary:
         ranked.sort(key=lambda item: (item[1].score, item[1].inliers), reverse=True)
         eligible = [item for item in ranked if self._cell_match_passes(item[1])]
         if not eligible:
-            best = ranked[0][1] if ranked else None
-            second = ranked[1][1] if len(ranked) > 1 else None
-            return MatchResult("not_found", None, best, second)
+            best_path, best, second = self._closest(ranked)
+            return MatchResult("not_found", best_path, best, second)
         best_path, best = eligible[0]
         second = eligible[1][1] if len(eligible) > 1 else None
         if best.inlier_ratio < STRONG_MATCH_RATIO and second is not None and best.score > 0:
             if (best.score - second.score) / best.score < self.thresholds.ambiguity_ratio:
-                return MatchResult("not_found", None, best, second)
+                return MatchResult("not_found", best_path, best, second)
         return MatchResult("found", best_path, best, second)
 
     def _add_by_cells(self, source: Path) -> AddResult:
@@ -184,12 +183,21 @@ class TreasureMapLibrary:
         )
 
     @staticmethod
+    def _closest(ranked):
+        if not ranked:
+            return None, None, None
+        best_path, best = ranked[0]
+        second = ranked[1][1] if len(ranked) > 1 else None
+        return best_path, best, second
+
+    @staticmethod
     def _top_two(ranked):
         if not ranked:
-            return None, None
+            return None, None, None
+        best_path = ranked[0][0].source
         best = ranked[0][1]
         second = ranked[1][1] if len(ranked) > 1 else None
-        return best, second
+        return best_path, best, second
 
     @staticmethod
     def _copy_atomic(source: Path, target: Path) -> None:

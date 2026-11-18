@@ -52,7 +52,16 @@ def _payload(result: MatchResult | AddResult) -> dict:
     }
     if isinstance(result, MatchResult):
         payload["runner_up"] = asdict(result.runner_up) if result.runner_up else None
+        payload["note"] = _note(result)
     return payload
+
+
+def _note(result: MatchResult) -> str | None:
+    if result.status == "found":
+        return None
+    if result.path is not None:
+        return "最相似，未匹配成功"
+    return "未匹配成功"
 
 
 def _text(result: MatchResult | AddResult) -> str:
@@ -60,8 +69,10 @@ def _text(result: MatchResult | AddResult) -> str:
         prefix = "已重复" if result.status == "duplicate" else "已加入"
         return f"{prefix}：{result.path}"
     if result.status == "not_found":
-        return "找不到足够相似的藏宝图"
-    output = f"找到最相似的藏宝图：{result.path}"
+        if result.path is not None:
+            return f"最相似，未匹配成功：{result.path}"
+        return "未匹配成功"
+    output = f"匹配成功：{result.path}"
     if result.similarity:
         output += f"\n匹配特征：{result.similarity.inliers}，覆盖区域：{result.similarity.coverage}"
     return output

@@ -100,7 +100,7 @@ def test_match_rejects_each_absolute_threshold(tmp_path, similarity):
     result = library.match(query)
 
     assert result.status == "not_found"
-    assert result.path is None
+    assert result.path.name == "a.png"
     assert result.similarity == similarity
 
 
@@ -114,7 +114,7 @@ def test_match_rejects_close_medium_candidates(tmp_path):
     result = library.match(query)
 
     assert result.status == "not_found"
-    assert result.path is None
+    assert result.path.name == "a.png"
     assert result.similarity == best
     assert result.runner_up == second
 
