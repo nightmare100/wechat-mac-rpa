@@ -45,6 +45,34 @@ class TraceMemoClient:
         except Exception:
             raise TraceMemoError(f"TraceMemo {path} 请求失败（检查本机服务及响应格式）") from None
 
+    def read_bytes(self, url: str) -> bytes:
+        target = self._loopback_url(url)
+        headers = {"Authorization": f"Bearer {self._token}"}
+        try:
+            with self._opener(Request(target, headers=headers), timeout=self.timeout) as response:
+                data = response.read()
+            if not isinstance(data, bytes) or not data:
+                raise ValueError("empty media")
+            return data
+        except TraceMemoError:
+            raise
+        except Exception:
+            raise TraceMemoError("TraceMemo 图片读取失败（检查本机服务及图片地址）") from None
+
+    def _loopback_url(self, url: str) -> str:
+        parsed = urlsplit(url)
+        base = urlsplit(self.base_url)
+        if parsed.scheme or parsed.netloc:
+            if parsed.scheme != "http" or parsed.hostname not in ("127.0.0.1", "localhost", "::1"):
+                raise TraceMemoError("TraceMemo 图片地址必须是本机")
+            return url
+        if not url.startswith("/"):
+            raise TraceMemoError("TraceMemo 图片地址无效")
+        origin = f"{base.scheme}://{base.netloc}"
+        if url.startswith("/api/"):
+            return origin + url
+        return self.base_url + url
+
 
 class TraceMemoPipeline:
     source_name = "tracememo"
@@ -146,6 +174,8 @@ class TraceMemoPipeline:
             # incorrectly granting the self-quote cooldown exemption.
             quoted_text = f"{structured.get('quotedSender') or '[未知]'}：{quoted_content}"
         message_type = {"图片": "image", "表情": "sticker", "动画表情": "sticker", "视频": "video", "语音": "voice", "文件": "file", "链接": "link_card"}.get(kind, "text")
+        media = row.get("media") if isinstance(row.get("media"), dict) else {}
+        media_url = media.get("url") if message_type == "image" and isinstance(media.get("url"), str) else ""
         if message_type in ("image", "sticker", "video"):
             text = f"[{kind}，内容未解析]"
         elif message_type == "voice":
@@ -156,5 +186,5 @@ class TraceMemoPipeline:
                            quoted_text=quoted_text,
                            replied=created < self.started_at or sender_type in (SenderType.SELF, SenderType.SYSTEM),
                            message_type=message_type, local_id=local_id, server_id=server_id,
-                           source="tracememo",
+                           source="tracememo", media_url=media_url,
                            create_time=created, sender_wxid=row.get("senderId"), raw_type=10000 if system else None)

@@ -14,6 +14,7 @@ from src.action.chat_opener import ChatOpener
 from src.action.login_recovery import LoginRecoveryStatus, WeChatLoginHandler
 from src.action.message_sender import WeChatMessageSender
 from src.bot.fixed_flow import FixedFlow
+from src.bot.treasure_flow import TreasureFlow
 from src.bot.scheduled_push import ScheduledPusher, load_mood_styles, load_rate_jitter
 from src.utils.time_window import in_sleep_window, parse_sleep_hours
 from src.capture.window_capture import WeChatNotReadyError
@@ -113,6 +114,51 @@ class WeChatBot:
                     ))
         return True
 
+    def _build_treasure_flow(self):
+        from src.treasure_map import TreasureMapLibrary
+        from src.treasure_map.cli import DEFAULT_CACHE_DIR, DEFAULT_LIBRARY_DIR
+
+        return TreasureFlow(
+            TreasureMapLibrary(DEFAULT_LIBRARY_DIR, DEFAULT_CACHE_DIR),
+            self._fetch_treasure_image,
+            self._send_text,
+            self._send_image,
+            self.global_store.mark_replied,
+        )
+
+    def _fetch_treasure_image(self, message: ChatMessage):
+        client = getattr(self.perception, "client", None)
+        if not message.media_url or client is None or not hasattr(client, "read_bytes"):
+            return None
+        try:
+            data = client.read_bytes(message.media_url)
+        except TraceMemoError:
+            return None
+        suffix = ".png"
+        if data.startswith(b"\xff\xd8"):
+            suffix = ".jpg"
+        elif data.startswith(b"RIFF") and b"WEBP" in data[:16]:
+            suffix = ".webp"
+        folder = Path(__file__).resolve().parents[2] / "data" / "treasure_map" / "inbox"
+        folder.mkdir(parents=True, exist_ok=True)
+        target = folder / f"{message.server_id or message.local_id or 'image'}{suffix}"
+        target.write_bytes(data)
+        return target
+
+    def _send_image(self, chat_name: str, image_path) -> ActionResult:
+        if not self._prepare_send_target(chat_name):
+            return ActionResult(success=False, error="无法打开或校验目标聊天")
+        return self.sender.send_file(str(image_path), chat_name=chat_name)
+
+    def _handle_treasure_flow(self, chat_name, messages, tick_id):
+        flow = getattr(self, "treasure_flow", None)
+        if flow is None:
+            return False
+        handled = flow.handle(chat_name, messages)
+        if handled:
+            self.logger.info("[Treasure] chat=%s", chat_name)
+        return handled
+
     def __init__(self, profile=None, on_message: Optional[Callable] = None, llm_client=None,
                  debug_mode: bool = False, use_openclaw: bool = True, perception=None,
                  enable_chat_switch: bool = True):
@@ -180,6 +226,7 @@ class WeChatBot:
         )
         self.generator._system_prompt()  # persona 占位符（BOT_NAME 等）未配置时启动即报错
         self.sender = WeChatMessageSender(silent_mode=os.environ.get("WECHAT_SILENT_MODE") == "1")
+        self.treasure_flow = self._build_treasure_flow()
         # 定时推送：目标群为 SILENT_WHITELIST，配置见 src/bot/scheduled_push.py
         self.scheduled_pusher = ScheduledPusher(
             groups=sorted(self.sender._silent_whitelist),
@@ -579,6 +626,10 @@ class WeChatBot:
                     latest_text=unreplied[-1].text if unreplied else "",
                 )
                 self.debug_logger.log_action("none", action_input="", success=False, error="上线静默中")
+                return
+
+            # 藏宝图指令优先于关键词；每个人在每个群里单独计接下来的 3 张图。
+            if self._handle_treasure_flow(chat_name, to_reply, tick_id):
                 return
 
             # 固定流程优先；只消费命中的消息，其余未读留待下一轮。

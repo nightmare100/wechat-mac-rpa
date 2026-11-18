@@ -110,7 +110,30 @@ def test_media_placeholder_and_cached_voice_do_not_invent_content():
     image, voice = pipeline(api).perceive().messages
     assert image.message_type == "image" and not image.image_description
     assert "未解析" in image.text
+    assert image.media_url == ""
     assert voice.text == "语音正文"
+
+
+def test_image_keeps_tracememo_media_url():
+    api = API()
+    api.messages = [{**row(), "type": "图片", "content": "[图片]",
+                     "media": {"url": "/media/abc"}}]
+    image = pipeline(api).perceive().messages[0]
+    assert image.media_url == "/media/abc"
+
+
+def test_media_download_stays_on_loopback():
+    response = Mock()
+    response.__enter__ = Mock(return_value=response)
+    response.__exit__ = Mock(return_value=False)
+    response.read.return_value = b"\x89PNG"
+    opener = Mock(return_value=response)
+    client = tm.TraceMemoClient(opener=opener, token="secret")
+    assert client.read_bytes("/media/abc") == b"\x89PNG"
+    assert client.read_bytes("http://127.0.0.1:6131/api/v1/media/abc") == b"\x89PNG"
+    with pytest.raises(tm.TraceMemoError, match="本机"):
+        client.read_bytes("http://example.com/media/abc")
+    assert "secret" not in opener.call_args.args[0].full_url
 
 
 def test_exact_ids_keep_repeated_content_and_ignore_overlap(tmp_path):
