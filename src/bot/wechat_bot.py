@@ -14,7 +14,6 @@ from src.action.chat_opener import ChatOpener
 from src.action.login_recovery import LoginRecoveryStatus, WeChatLoginHandler
 from src.action.message_sender import WeChatMessageSender
 from src.bot.fixed_flow import FixedFlow
-from src.bot.treasure_flow import TreasureFlow
 from src.bot.scheduled_push import ScheduledPusher, load_mood_styles, load_rate_jitter
 from src.utils.time_window import in_sleep_window, parse_sleep_hours
 from src.capture.window_capture import WeChatNotReadyError
@@ -115,6 +114,9 @@ class WeChatBot:
         return True
 
     def _build_treasure_flow(self):
+        if os.environ.get("ENABLE_TREASURE_MAP", "0").strip().lower() not in ("1", "true", "yes", "on"):
+            return None
+        from src.bot.treasure_flow import TreasureFlow
         from src.treasure_map import TreasureMapLibrary
         from src.treasure_map.cli import DEFAULT_CACHE_DIR, DEFAULT_LIBRARY_DIR
 
