@@ -214,3 +214,31 @@ def test_unattributed_quote_matches_only_reliable_self_history(quote, own_text, 
     msg.quoted_text = quote
     own = ChatMessage(text=own_text, sender="自己", sender_type=SenderType.SELF, chat_name=own_chat)
     assert _quotes_self(msg, [own]) is expected
+
+
+@pytest.mark.parametrize("chime,direct,expected", [
+    ("0", "1", ["甲", "乙"]),
+    ("1", "0", ["丙"]),
+    ("0", "0", []),
+    ("1", "1", ["甲", "乙", "丙"]),
+])
+def test_group_reply_switches_filter_incoming_routes(monkeypatch, chime, direct, expected):
+    monkeypatch.setenv("ENABLE_CHIME_IN", chime)
+    monkeypatch.setenv("ENABLE_DIRECT_GROUP_REPLY", direct)
+    monkeypatch.setenv("BOT_AT_KEYWORD", "囡囡")
+    monkeypatch.setenv("BOT_NAME", "囡囡")
+    gen = _gen()
+    mention = _m("甲", "@囡囡 在吗")
+    quote = _m("乙", "说得对")
+    quote.quoted_text = "囡囡：上一条"
+    ordinary = _m("丙", "今天运气不错")
+    messages = [mention, quote, ordinary]
+    assert [m.sender for m in gen.group_reply_candidates("群", messages, [])] == expected
+
+
+def test_chime_off_is_enforced_even_after_cooldown(monkeypatch):
+    monkeypatch.setenv("ENABLE_CHIME_IN", "0")
+    gen = _gen()
+    assert not gen.chime_in_allowed("群")
+    assert _run(gen, _m("得闲射击", "100 抽 5 件套")) == []
+    assert gen.followup.candidates("群") == []

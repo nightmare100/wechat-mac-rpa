@@ -1,10 +1,12 @@
 """Same-cell comparison ignores covered tiles and does not ask for a grid size."""
 import cv2
 import numpy as np
+import pytest
 from PIL import Image
 
 from src.treasure_map.grid import COLS, ROWS, board_for, covered_cells, read_rgb
 from src.treasure_map.library import TreasureMapLibrary
+from src.treasure_map.models import TreasureMapError
 
 
 def _purple() -> tuple[int, int, int]:
@@ -81,3 +83,28 @@ def test_match_uses_only_revealed_cells_at_the_same_position(tmp_path):
     assert result.status == "found"
     assert result.path.name == "same.png"
     assert result.similarity.inliers == result.similarity.good_matches == len(revealed)
+
+
+def test_add_rejects_one_covered_cell_before_duplicate_check(tmp_path):
+    patterns = {(row, col): row * COLS + col for row in range(ROWS) for col in range(COLS)}
+    library_dir = tmp_path / "library"
+    library_dir.mkdir()
+    covered = library_dir / "previously-added.png"
+    _render(covered, patterns, {(10, 8)})
+    library = TreasureMapLibrary(library_dir)
+
+    with pytest.raises(TreasureMapError, match="该藏宝图未全开，不予收录"):
+        library.add(covered)
+    assert list(library_dir.iterdir()) == [covered]
+
+
+def test_add_accepts_fully_revealed_map_and_still_checks_duplicates(tmp_path):
+    patterns = {(row, col): row * COLS + col for row in range(ROWS) for col in range(COLS)}
+    full = tmp_path / "full.png"
+    _render(full, patterns, set())
+    library = TreasureMapLibrary(tmp_path / "library")
+
+    added = library.add(full)
+    assert added.status == "added"
+    assert added.path.read_bytes() == full.read_bytes()
+    assert library.add(full).status == "duplicate"

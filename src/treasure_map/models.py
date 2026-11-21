@@ -10,6 +10,10 @@ class TreasureMapError(RuntimeError):
     """An image or treasure map library operation could not be completed."""
 
 
+class CoveredTreasureMapError(TreasureMapError):
+    """The map still contains unopened cells and cannot be added."""
+
+
 @dataclass(frozen=True)
 class FeatureSet:
     source: Path

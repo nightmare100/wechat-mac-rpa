@@ -283,6 +283,8 @@ class ReplyGenerator:
         self.last_go_online: bool = False  # 本次回复是否答应朧月上线（触发静默）
         self.last_chime_in: bool = False  # 本次回复 LLM 是否标了主动插话
         self.last_chime_in_dropped: bool = False  # 本次是否有主动插话因冷却被丢弃（bot 记录原因用）
+        self.enable_chime_in = os.getenv("ENABLE_CHIME_IN", "1").strip().lower() in ("1", "true", "yes", "on")
+        self.enable_direct_group_reply = os.getenv("ENABLE_DIRECT_GROUP_REPLY", "1").strip().lower() in ("1", "true", "yes", "on")
         self.chime_in_cooldown = _env_int("CHIME_IN_COOLDOWN_MINUTES", 60, 0, 1440) * 60  # 每个群主动插话的冷却（秒）
         self.chime_in_last: Dict[str, float] = {}  # 聊天名 → 上次主动插话的时间
         self._started_at = time.time()  # 启动即视为刚插过话：开机后屏幕上的旧消息不插话
@@ -1164,7 +1166,19 @@ class ReplyGenerator:
         return replies
 
     def chime_in_allowed(self, chat_name: str) -> bool:
-        return time.time() - self.chime_in_last.get(chat_name, self._started_at) >= self.chime_in_cooldown
+        return self.enable_chime_in and (
+            time.time() - self.chime_in_last.get(chat_name, self._started_at) >= self.chime_in_cooldown
+        )
+
+    def group_reply_candidates(self, chat_name, messages, history):
+        """按回复入口筛选群聊未读，关闭的入口不转交给另一条路径。"""
+        if self.enable_chime_in and self.enable_direct_group_reply:
+            return messages
+        return [
+            msg for msg in messages
+            if (self.enable_direct_group_reply if self._has_reply_trigger(chat_name, [msg], history)
+                else self.enable_chime_in)
+        ]
 
     def _apply_chime_in_limit(self, chat_name: str, unreplied: List[ChatMessage],
                               replies: List[str], history: Optional[List[ChatMessage]] = None) -> Tuple[List[str], set]:
@@ -1175,9 +1189,13 @@ class ReplyGenerator:
             target = _reply_target(reply, unreplied)
             # 认不出对象、或对象对不上任何未读时按整批判断（偏保守：批里有触发就不当插话）
             msgs = [m for m in unreplied if _same_person(m.sender, target)] if target else []
+            # 单独关闭入口时，不允许模型用未获准的 @ 对象绕过筛选。
+            if (not self.enable_chime_in or not self.enable_direct_group_reply) and target and not msgs:
+                continue
             msgs = msgs or unreplied
             if self._has_reply_trigger(chat_name, msgs, history):
-                kept.append(reply)
+                if self.enable_direct_group_reply:
+                    kept.append(reply)
             elif allowed:
                 kept.append(reply)
                 chimed = True
@@ -1189,7 +1207,8 @@ class ReplyGenerator:
             self.chime_in_last[chat_name] = time.time()
         if dropped:
             self.last_chime_in_dropped = True
-            _logger.info("[ChimeIn] '%s' 冷却中，丢弃主动插话: %s", chat_name, dropped)
+            reason = "冷却中" if self.enable_chime_in else "已关闭"
+            _logger.info("[ChimeIn] '%s' %s，丢弃主动插话: %s", chat_name, reason, dropped)
         return kept, fresh_targets
 
     def _has_reply_trigger(self, chat_name: str, unreplied: List[ChatMessage],

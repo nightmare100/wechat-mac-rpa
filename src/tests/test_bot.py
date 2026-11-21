@@ -28,6 +28,28 @@ class TestWeChatBot:
         bot.debug_logger = Mock(current=None)
         return bot
 
+    def test_direct_reply_off_skips_keyword_flow_and_model(self, bot, monkeypatch):
+        from src.bot.fixed_flow import FixedFlow
+
+        monkeypatch.setenv("BOT_AT_KEYWORD", "囡囡")
+        bot.generator.enable_direct_group_reply = False
+        bot.fixed_flow = FixedFlow(("符文",))
+        msg = ChatMessage(text="@囡囡 符文", sender="甲", sender_type=SenderType.OTHER, chat_name="测试群")
+        bot.perception.perceive.return_value = PerceptionResult(
+            chat_name="测试群", messages=[msg], chat_list_items=[], screenshot_path="", is_group=True,
+        )
+        bot.global_store.merge_tick.return_value = (Mock(messages=[msg]), [msg])
+        bot.sender = Mock(silent_mode=False)
+        bot._handle_fixed_flow = Mock()
+        bot.generator.generate = Mock()
+
+        bot.tick()
+
+        bot._handle_fixed_flow.assert_not_called()
+        bot.generator.generate.assert_not_called()
+        bot.sender.send.assert_not_called()
+        bot.global_store.mark_replied.assert_called_once_with("测试群", msg, "")
+
     def test_tick_no_new_messages(self, bot, tmp_path):
         """没有新消息时不发送回复"""
         mock_result = PerceptionResult(

@@ -634,8 +634,29 @@ class WeChatBot:
             if self._handle_treasure_flow(chat_name, to_reply, tick_id):
                 return
 
+            all_messages = getattr(state, "messages", [])
+            if not isinstance(all_messages, list):
+                all_messages = []
+            direct_reply_disabled = is_group and getattr(self.generator, "enable_direct_group_reply", True) is False
+            chime_in_disabled = is_group and getattr(self.generator, "enable_chime_in", True) is False
+            if direct_reply_disabled or chime_in_disabled:
+                eligible = self.generator.group_reply_candidates(chat_name, to_reply, all_messages)
+                eligible_ids = {id(msg) for msg in eligible}
+                blocked = [msg for msg in to_reply if id(msg) not in eligible_ids]
+                for msg in blocked:
+                    self.global_store.mark_replied(chat_name, msg, "")
+                blocked_ids = {id(msg) for msg in blocked}
+                unreplied = [msg for msg in unreplied if id(msg) not in blocked_ids]
+                to_reply = eligible
+                if not to_reply:
+                    self.logger.log_decision(
+                        tick_id, should_reply=False, reason="群聊回复开关已关闭对应入口",
+                        latest_text=blocked[-1].text,
+                    )
+                    return
+
             # 固定流程优先；只消费命中的消息，其余未读留待下一轮。
-            if self._handle_fixed_flow(chat_name, to_reply, tick_id):
+            if not direct_reply_disabled and self._handle_fixed_flow(chat_name, to_reply, tick_id):
                 return
 
             # 群里没 @ 我时，等对方连发的几条说完再一起回
@@ -648,9 +669,6 @@ class WeChatBot:
                 return
 
             # 传递完整消息上下文 + 所有未读消息，让 AI 生成多条回复
-            all_messages = getattr(state, "messages", [])
-            if not isinstance(all_messages, list):
-                all_messages = []
             t_gen_start = time.time()
             replies = self.generator.generate(to_reply, all_messages, is_group=is_group, tick_id=tick_id)
             t_gen_ms = (time.time() - t_gen_start) * 1000

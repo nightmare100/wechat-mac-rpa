@@ -4,11 +4,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from src.models.base import ActionResult, ChatMessage, SenderType
-from src.treasure_map.models import TreasureMapError
+from src.treasure_map.models import CoveredTreasureMapError, TreasureMapError
 from src.utils.chat_utils import _normalize_chat_name
 
 COMMANDS = {"藏宝图鉴别": "match", "藏宝图添加": "add"}
 IMAGE_SLOTS = 3
+MIN_CLOSEST_MATCH_PERCENT = 70
 _ACK = {
     "match": "收到，请发送接下来的 3 张藏宝图",
     "add": "收到，请发送接下来的 3 张要收录的藏宝图",
@@ -103,16 +104,26 @@ class TreasureFlow:
             return reply, self._deliver_text(chat_name, reply)
         if result.status == "found" and result.path is not None:
             return "匹配成功", self._deliver_image(chat_name, result.path)
-        if result.path is not None:
-            note = "最相似，未匹配成功"
-            if not self._deliver_text(chat_name, note):
-                return note, False
-            return note, self._deliver_image(chat_name, result.path)
-        return "未匹配成功", self._deliver_text(chat_name, "未匹配成功")
+        # 逐格比较中，inliers 是吻合格数，good_matches 是已翻开格数。
+        similarity = result.similarity
+        if result.path is None or similarity is None or similarity.good_matches <= 0:
+            return "未匹配成功", self._deliver_text(chat_name, "未匹配成功")
+        matched = similarity.inliers
+        opened = similarity.good_matches
+        if matched * 100 <= opened * MIN_CLOSEST_MATCH_PERCENT:
+            return "未匹配成功", self._deliver_text(chat_name, "未匹配成功")
+        percent = f"{matched / opened * 100:.1f}".removesuffix(".0")
+        note = f"最相似，未匹配成功（匹配 {matched}/{opened} 格，{percent}%）"
+        if not self._deliver_text(chat_name, note):
+            return note, False
+        return note, self._deliver_image(chat_name, result.path)
 
     def _add(self, chat_name: str, path) -> tuple[str, bool]:
         try:
             result = self.library.add(path)
+        except CoveredTreasureMapError as exc:
+            reply = str(exc)
+            return reply, self._deliver_text(chat_name, reply)
         except TreasureMapError:
             reply = "这张藏宝图处理失败"
             return reply, self._deliver_text(chat_name, reply)

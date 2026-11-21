@@ -17,7 +17,7 @@ from .grid import (
     read_rgb,
 )
 from .matcher import SiftComparator
-from .models import AddResult, FeatureSet, MatchResult, Similarity, Thresholds, TreasureMapError
+from .models import AddResult, CoveredTreasureMapError, FeatureSet, MatchResult, Similarity, Thresholds, TreasureMapError
 
 _IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
 
@@ -113,12 +113,14 @@ class TreasureMapLibrary:
     def _add_by_cells(self, source: Path) -> AddResult:
         if source.suffix.lower() not in _IMAGE_SUFFIXES:
             raise TreasureMapError(f"不支持的藏宝图图片格式：{source.suffix or '无扩展名'}")
+        image = read_rgb(source)
+        board = board_for(image)
+        if covered_cells(image, board):
+            raise CoveredTreasureMapError("该藏宝图未全开，不予收录")
         digest = file_sha256(source)
         for path in self._image_paths():
             if file_sha256(path) == digest:
                 return AddResult("duplicate", path)
-        image = read_rgb(source)
-        board = board_for(image)
         cells = [(row, col) for row in range(ROWS) for col in range(COLS)]
         query_desc = self._cells.descriptors(image, board, cells)
         best = None

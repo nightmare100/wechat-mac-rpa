@@ -1,9 +1,11 @@
 """藏宝图指令按人分开接收接下来的 3 张图片。"""
 from pathlib import Path
 
+import pytest
+
 from src.bot.treasure_flow import TreasureFlow
 from src.models.base import ActionResult, ChatMessage, SenderType
-from src.treasure_map.models import AddResult, MatchResult
+from src.treasure_map.models import AddResult, CoveredTreasureMapError, MatchResult, Similarity
 
 
 class Library:
@@ -107,13 +109,30 @@ def test_a_new_command_restarts_only_that_user(tmp_path):
     assert flow.sessions[("room@chatroom", "wx_a")].remaining == 2
 
 
-def test_unmatched_result_sends_the_note_and_closest_image(tmp_path):
-    library = Library(MatchResult("not_found", Path("images/closest.png"), None))
+@pytest.mark.parametrize("similarity", [
+    None,
+    Similarity(0, 0, 0, 0, 0),
+    Similarity(10, 6, 0.6, 6, 60),
+    Similarity(10, 7, 0.7, 7, 70),
+])
+def test_unmatched_result_at_or_below_threshold_sends_only_text(tmp_path, similarity):
+    library = Library(MatchResult("not_found", Path("images/closest.png"), similarity))
     flow, sent, marked = harness(tmp_path, library)
     flow.handle("群", [message(1, "藏宝图鉴别"), message(2, kind="image")])
-    assert sent[1] == ("text", "群", "最相似，未匹配成功")
-    assert sent[2][0] == "image" and sent[2][2].endswith("closest.png")
-    assert marked[1][1] == "最相似，未匹配成功"
+    assert sent[1:] == [("text", "群", "未匹配成功")]
+    assert marked[1] == (2, "未匹配成功")
+
+
+def test_closest_image_reply_includes_matched_and_open_cell_counts(tmp_path):
+    similarity = Similarity(good_matches=11, inliers=8, inlier_ratio=8 / 11, coverage=8, score=800 / 11)
+    library = Library(MatchResult("not_found", Path("images/closest.png"), similarity))
+    flow, sent, marked = harness(tmp_path, library)
+
+    flow.handle("群", [message(1, "藏宝图鉴别"), message(2, kind="image")])
+
+    note = "最相似，未匹配成功（匹配 8/11 格，72.7%）"
+    assert sent[1:] == [("text", "群", note), ("image", "群", "images/closest.png")]
+    assert marked[1] == (2, note)
 
 
 def test_add_reports_duplicate_without_writing_a_reply_image(tmp_path):
@@ -123,6 +142,20 @@ def test_add_reports_duplicate_without_writing_a_reply_image(tmp_path):
     assert library.calls == [("add", "2.png")]
     assert [item[0] for item in sent] == ["text", "text"]
     assert sent[1][2] == "已重复"
+
+
+def test_add_replies_with_rejection_for_a_covered_map(tmp_path, monkeypatch):
+    library = Library()
+
+    def reject(_):
+        raise CoveredTreasureMapError("该藏宝图未全开，不予收录")
+
+    monkeypatch.setattr(library, "add", reject)
+    flow, sent, marked = harness(tmp_path, library)
+    flow.handle("群", [message(1, "藏宝图添加"), message(2, kind="image")])
+
+    assert sent[1:] == [("text", "群", "该藏宝图未全开，不予收录")]
+    assert marked[1] == (2, "该藏宝图未全开，不予收录")
 
 
 def test_failed_send_keeps_the_image_for_the_next_turn(tmp_path):
