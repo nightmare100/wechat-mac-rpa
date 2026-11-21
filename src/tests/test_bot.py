@@ -50,6 +50,18 @@ class TestWeChatBot:
         bot.sender.send.assert_not_called()
         bot.global_store.mark_replied.assert_called_once_with("测试群", msg, "")
 
+    def test_guild_excel_delivers_when_group_has_no_unread(self, bot):
+        bot.guild_excel_flow = Mock()
+        bot.perception.perceive.return_value = PerceptionResult(
+            chat_name="测试群", messages=[], chat_list_items=[], screenshot_path="", is_group=True,
+        )
+        bot.global_store.merge_tick.return_value = (Mock(), [])
+        bot.sender = Mock(silent_mode=False)
+
+        bot.tick()
+
+        bot.guild_excel_flow.poll.assert_called_once_with("测试群")
+
     def test_tick_no_new_messages(self, bot, tmp_path):
         """没有新消息时不发送回复"""
         mock_result = PerceptionResult(

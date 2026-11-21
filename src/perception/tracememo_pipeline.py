@@ -45,12 +45,14 @@ class TraceMemoClient:
         except Exception:
             raise TraceMemoError(f"TraceMemo {path} 请求失败（检查本机服务及响应格式）") from None
 
-    def read_bytes(self, url: str) -> bytes:
+    def read_bytes(self, url: str, *, max_bytes: int | None = None) -> bytes:
         target = self._loopback_url(url)
         headers = {"Authorization": f"Bearer {self._token}"}
         try:
             with self._opener(Request(target, headers=headers), timeout=self.timeout) as response:
-                data = response.read()
+                data = response.read(max_bytes + 1) if max_bytes is not None else response.read()
+            if max_bytes is not None and len(data) > max_bytes:
+                raise TraceMemoError("TraceMemo 图片大小超限")
             if not isinstance(data, bytes) or not data:
                 raise ValueError("empty media")
             return data
@@ -139,7 +141,12 @@ class TraceMemoPipeline:
         # A failing group must not starve other configured groups.
         self._next = (self._next + 1) % len(self._targets)
         requested_at = self._clock()
-        data = self.client.request("/chatlog", {"talker": talker, "startTime": self._since[talker]})
+        messages = self._read_group_messages(talker, name, self._since[talker])
+        self._since[talker] = max(self._since[talker], int(requested_at) - self.OVERLAP_SECONDS)
+        return PerceptionResult(chat_name=name, messages=messages, chat_list_items=[], screenshot_path="", is_group=True)
+
+    def _read_group_messages(self, talker: str, name: str, start_time: int) -> list[ChatMessage]:
+        data = self.client.request("/chatlog", {"talker": talker, "startTime": start_time})
         rows = data.get("messages")
         if not isinstance(rows, list) or data.get("count", len(rows)) != len(rows):
             raise TraceMemoError("TraceMemo 消息响应不完整，不推进读取范围")
@@ -148,8 +155,14 @@ class TraceMemoPipeline:
         except (KeyError, ValueError, TypeError, AttributeError):
             raise TraceMemoError("TraceMemo 消息字段异常，不推进读取范围") from None
         messages.sort(key=lambda m: (m.create_time, m.local_id or 0))
-        self._since[talker] = max(self._since[talker], int(requested_at) - self.OVERLAP_SECONDS)
-        return PerceptionResult(chat_name=name, messages=messages, chat_list_items=[], screenshot_path="", is_group=True)
+        return messages
+
+    def recent_group_messages(self, talker: str, start_time: int) -> list[ChatMessage]:
+        """Read history independently of the normal polling cursor."""
+        name = next((name for group_id, name in self._targets if group_id == talker), None)
+        if name is None:
+            raise TraceMemoError("群不在 TraceMemo 监听列表中")
+        return self._read_group_messages(talker, name, start_time)
 
     def _message(self, row, talker, name):
         if row.get("sessionId") and row["sessionId"] != talker:

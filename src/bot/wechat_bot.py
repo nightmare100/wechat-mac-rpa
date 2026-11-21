@@ -148,9 +148,12 @@ class WeChatBot:
         return target
 
     def _send_image(self, chat_name: str, image_path) -> ActionResult:
+        return self._send_file_to_chat(chat_name, image_path)
+
+    def _send_file_to_chat(self, chat_name: str, file_path) -> ActionResult:
         if not self._prepare_send_target(chat_name):
             return ActionResult(success=False, error="无法打开或校验目标聊天")
-        return self.sender.send_file(str(image_path), chat_name=chat_name)
+        return self.sender.send_file(str(file_path), chat_name=chat_name)
 
     def _handle_treasure_flow(self, chat_name, messages, tick_id):
         flow = getattr(self, "treasure_flow", None)
@@ -229,6 +232,13 @@ class WeChatBot:
         self.generator._system_prompt()  # persona 占位符（BOT_NAME 等）未配置时启动即报错
         self.sender = WeChatMessageSender(silent_mode=os.environ.get("WECHAT_SILENT_MODE") == "1")
         self.treasure_flow = self._build_treasure_flow()
+        self.guild_excel_flow = None
+        if os.environ.get("ENABLE_GUILD_MONSTER_EXCEL", "0").strip() == "1":
+            if getattr(self.perception, "source_name", None) == "tracememo":
+                from src.bot.guild_excel import GuildExcelFlow
+                self.guild_excel_flow = GuildExcelFlow(self.perception, self._send_text, self._send_file_to_chat)
+            else:
+                self.logger.warning("公会 Excel 指令需要使用 TraceMemo 模式")
         # 定时推送：目标群为 SILENT_WHITELIST，配置见 src/bot/scheduled_push.py
         self.scheduled_pusher = ScheduledPusher(
             groups=sorted(self.sender._silent_whitelist),
@@ -557,6 +567,12 @@ class WeChatBot:
                 message_details=msg_dicts,
             )
 
+            guild_excel = getattr(self, "guild_excel_flow", None)
+            if (guild_excel is not None and is_group
+                    and (not self.sender.silent_mode or self.sender.in_silent_whitelist(chat_name))
+                    and chat_name not in {_normalize_chat_name(c) for c in self.no_reply_chats}):
+                guild_excel.poll(chat_name)
+
             if not unreplied:
                 self.logger.log_decision(tick_id, should_reply=False, reason="无未回复消息", latest_text="")
                 self.debug_logger.log_action("none", action_input="", success=False, error="无未回复消息")
@@ -629,6 +645,13 @@ class WeChatBot:
                 )
                 self.debug_logger.log_action("none", action_input="", success=False, error="上线静默中")
                 return
+
+            if guild_excel is not None and is_group:
+                for msg in to_reply:
+                    reply = guild_excel.handle(chat_name, msg)
+                    if reply is not None:
+                        self.global_store.mark_replied(chat_name, msg, reply)
+                        return
 
             # 藏宝图指令优先于关键词；每个人在每个群里单独计接下来的 3 张图。
             if self._handle_treasure_flow(chat_name, to_reply, tick_id):
