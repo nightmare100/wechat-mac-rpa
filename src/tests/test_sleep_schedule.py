@@ -59,6 +59,23 @@ def _fake_bot():
 
 
 class TestBotSleep:
+    def test_ignore_sleep_keeps_polling_and_scheduled_push_running(self, monkeypatch):
+        bot = _fake_bot()
+        bot.ignore_sleep_hours = True
+        bot._tick_id = 0
+        bot._check_sleep = lambda now: WeChatBot._check_sleep(bot, now)
+        bot.scheduled_pusher = Mock()
+        bot.tick = Mock(side_effect=lambda: setattr(bot, "running", False))
+        monkeypatch.setattr("src.bot.wechat_bot.datetime", Mock(now=lambda: _at("03:00")))
+        monkeypatch.setattr("src.bot.wechat_bot.time.sleep", lambda seconds: setattr(bot, "running", False))
+
+        WeChatBot.run_auto(bot)
+
+        bot.tick.assert_called_once_with()
+        bot.scheduled_pusher.run_due.assert_called_once_with()
+        assert bot._asleep is False
+        assert bot._woke_at is None
+
     def test_enter_and_wake(self):
         bot = _fake_bot()
         assert WeChatBot._check_sleep(bot, _at("23:00")) is False

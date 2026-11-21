@@ -248,12 +248,15 @@ class WeChatBot:
             last_activity=self.global_store.last_message_time,
         )
         # 休眠时段（.env 的 SLEEP_HOURS），见 src/utils/time_window.py
+        self.ignore_sleep_hours = os.environ.get("IGNORE_SLEEP_HOURS", "0").strip() == "1"
         try:
             self.sleep_window = parse_sleep_hours(os.environ.get("SLEEP_HOURS", ""))
         except ValueError as e:
             print(f"  ⚠️ {e}，不启用休眠")
             self.sleep_window = None
-        if self.sleep_window is not None:
+        if self.ignore_sleep_hours:
+            print("  • 休眠: 已忽略配置时段（继续轮询和定时推送）")
+        elif self.sleep_window is not None:
             start, end = self.sleep_window
             print(f"  • 休眠: {start:%H:%M}-{end:%H:%M}（停止轮询和定时推送，醒来不回积压消息）")
         if self.generator.bedtime_window is not None:
@@ -1057,7 +1060,9 @@ class WeChatBot:
 
     def _check_sleep(self, now: datetime) -> bool:
         """返回当前是否休眠；进入/醒来时记日志，醒来时开始「积压消息不回复」。"""
-        asleep = in_sleep_window(getattr(self, "sleep_window", None), now)
+        asleep = not getattr(self, "ignore_sleep_hours", False) and in_sleep_window(
+            getattr(self, "sleep_window", None), now,
+        )
         was_asleep = getattr(self, "_asleep", False)
         if asleep and not was_asleep:
             self.logger.info("💤 进入休眠，停止轮询和定时推送")

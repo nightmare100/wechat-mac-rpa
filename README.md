@@ -30,6 +30,7 @@ MuMu 模拟器 Python 工具见 [src/mumu/README.md](src/mumu/README.md)，提�
 - **权限**：Bot 依赖 macOS 辅助功能/屏幕录制权限，详见下文[权限说明](#权限说明)
 - **启动**：`python3 run_bot.py`（默认 TraceMemo，亦可显式指定 `--source tracememo`）
 - **原视觉方案**：`python3 run_bot.py --source vision`
+- **休眠覆盖**可在 `.env` 设置 `IGNORE_SLEEP_HOURS=1`，让 Bot 在 `SLEEP_HOURS` 时段继续轮询和定时推送。默认 `0`，按设定时段休眠。修改后重启生效。
 - **TraceMemo 准备**：启动 TraceMemo 并连接数据库，将 API Token 配置到本机环境变量 `TRACEMEMO_API_TOKEN`（兼容旧变量 `WECHATEXPLORER_API_TOKEN`）；不要把 Token 提交到仓库。默认 API 地址为 `http://127.0.0.1:6131/api/v1`，可用 `TRACEMEMO_BASE_URL` 指定本机地址。
 - **监听群**：`.env` 中配置 `TRACEMEMO_CHATS=群名或群ID,另一个群`，不配置则沿用 `SILENT_WHITELIST`。仅监听所列群，发送白名单规则保持有效；群不存在或存在同名歧义时拒绝启动。当前 TraceMemo 接收适配器仅支持群聊。
 - **藏宝图开关**：`.env` 中 `ENABLE_TREASURE_MAP=0`（默认）关闭 Bot 藏宝图处理；设为 `1` 开启“藏宝图鉴别/添加”。重启生效。关闭时不加载图库、不下载或处理藏宝图图片，消息继续走普通处理流程；独立藏宝图 CLI 不受影响。
