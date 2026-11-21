@@ -14,6 +14,10 @@ class CoveredTreasureMapError(TreasureMapError):
     """The map still contains unopened cells and cannot be added."""
 
 
+class CoverTemplateError(TreasureMapError):
+    """Cover templates are missing or unreadable."""
+
+
 @dataclass(frozen=True)
 class FeatureSet:
     source: Path

@@ -7,7 +7,7 @@ import cv2
 import numpy as np
 from PIL import Image, ImageOps
 
-from .models import TreasureMapError
+from .models import CoverTemplateError, TreasureMapError
 
 COLS = 10
 ROWS = 12
@@ -15,6 +15,15 @@ CELL_MATCHES = 4
 CELL_SHIFT = 12.0
 STRONG_MATCH_RATIO = 1.0
 DUPLICATE_RATIO = 0.95
+DUPLICATE_PIXEL_RECHECK_RATIO = 0.90
+_DUPLICATE_CELL_SIZE = 20
+_DUPLICATE_CELL_MEAN_ERROR = 10
+DEFAULT_COVER_DIR = Path(__file__).resolve().parents[3] / "cover_images"
+_COVER_CELL_SIZE = 40
+_COVER_SEARCH_MARGIN = 8
+_COVER_TEMPLATE_SIZES = range(37, 43)
+_COVER_PIXEL_TOLERANCE = 28
+_COVER_MATCH_PERCENT = 90
 
 # Measured from the phone screenshots and the 828×1792 library shots.
 # The board is the same 10×12 layout; these rectangles place that grid on the playfield.
@@ -52,6 +61,21 @@ def board_for(image: np.ndarray) -> Board:
     return Board(x0, y0, max(COLS, x1 - x0), max(ROWS, y1 - y0))
 
 
+def board_pixels(image: np.ndarray, board: Board) -> np.ndarray:
+    patch = image[board.y:board.y + board.height, board.x:board.x + board.width]
+    return cv2.resize(
+        patch, (COLS * _DUPLICATE_CELL_SIZE, ROWS * _DUPLICATE_CELL_SIZE),
+        interpolation=cv2.INTER_AREA,
+    )
+
+
+def same_board_pixels(first: np.ndarray, second: np.ndarray) -> bool:
+    # Check the error in each cell so a changed tile cannot be averaged away.
+    difference = cv2.absdiff(first, second)
+    cells = difference.reshape(ROWS, _DUPLICATE_CELL_SIZE, COLS, _DUPLICATE_CELL_SIZE, 3)
+    return bool(np.all(cells.mean(axis=(1, 3, 4)) <= _DUPLICATE_CELL_MEAN_ERROR))
+
+
 def read_rgb(path: Path) -> np.ndarray:
     try:
         with Image.open(path) as opened:
@@ -73,19 +97,49 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def covered_cells(image: np.ndarray, board: Board) -> frozenset[tuple[int, int]]:
-    """Cells still hidden by a purple or brown unopened tile."""
-    hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
-    purple = cv2.inRange(hsv, (120, 80, 150), (160, 255, 255))
-    brown = cv2.inRange(hsv, (5, 100, 140), (15, 210, 235))
-    covered = cv2.bitwise_or(purple, brown)
-    hidden = []
+def _cover_pixels_match(cell: np.ndarray, template: np.ndarray) -> bool:
+    difference = cv2.absdiff(cell, template)
+    matching = np.count_nonzero(np.all(difference <= _COVER_PIXEL_TOLERANCE, axis=2))
+    return matching * 100 > cell.shape[0] * cell.shape[1] * _COVER_MATCH_PERCENT
+
+
+def covered_cells(image: np.ndarray, board: Board, cover_dir: Path = DEFAULT_COVER_DIR) -> frozenset[tuple[int, int]]:
+    """Find cells whose pixels match any single-cell cover template."""
+    templates = []
+    try:
+        if cover_dir.is_dir():
+            for path in sorted(cover_dir.iterdir()):
+                if path.is_file() and path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}:
+                    template = read_rgb(path)
+                    for size in _COVER_TEMPLATE_SIZES:
+                        tiles = cv2.resize(template, (size, size), interpolation=cv2.INTER_AREA)
+                        templates.append(tiles)
+    except (OSError, TreasureMapError, cv2.error) as exc:
+        raise CoverTemplateError("藏宝图封面模板读取失败，请检查 cover_images") from exc
+    if not templates:
+        raise CoverTemplateError("缺少藏宝图封面模板，请先在 cover_images 放入单格封面图")
+
+    # Allow for small differences in tile size and board position between screenshots.
+    padding = max(board.width // COLS, board.height // ROWS) + 1
+    padded = cv2.copyMakeBorder(image, padding, padding, padding, padding, cv2.BORDER_CONSTANT)
+    margin = _COVER_SEARCH_MARGIN / _COVER_CELL_SIZE
+    search_size = _COVER_CELL_SIZE + 2 * _COVER_SEARCH_MARGIN
+    hidden = set()
     for row in range(ROWS):
         for col in range(COLS):
             x0, y0, x1, y1 = board.cell_bounds(row, col)
-            patch = covered[y0:y1, x0:x1]
-            if patch.size and (patch > 0).mean() >= 0.45:
-                hidden.append((row, col))
+            if x1 > image.shape[1] or y1 > image.shape[0]:
+                raise TreasureMapError("藏宝图图片尺寸过小，无法识别格子")
+            dx, dy = round((x1 - x0) * margin), round((y1 - y0) * margin)
+            patch = padded[y0 + padding - dy:y1 + padding + dy, x0 + padding - dx:x1 + padding + dx]
+            search = cv2.resize(patch, (search_size, search_size), interpolation=cv2.INTER_AREA)
+            for template in templates:
+                size = template.shape[0]
+                scores = cv2.matchTemplate(search, template, cv2.TM_SQDIFF)
+                _, _, (x, y), _ = cv2.minMaxLoc(scores)
+                if _cover_pixels_match(search[y:y + size, x:x + size], template):
+                    hidden.add((row, col))
+                    break
     return frozenset(hidden)
 
 

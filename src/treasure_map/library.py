@@ -7,14 +7,18 @@ from pathlib import Path
 from .features import FeatureExtractor
 from .grid import (
     COLS,
+    DEFAULT_COVER_DIR,
+    DUPLICATE_PIXEL_RECHECK_RATIO,
     DUPLICATE_RATIO,
     ROWS,
     STRONG_MATCH_RATIO,
     CellComparer,
     board_for,
+    board_pixels,
     covered_cells,
     file_sha256,
     read_rgb,
+    same_board_pixels,
 )
 from .matcher import SiftComparator
 from .models import AddResult, CoveredTreasureMapError, FeatureSet, MatchResult, Similarity, Thresholds, TreasureMapError
@@ -28,11 +32,13 @@ class TreasureMapLibrary:
         library_dir: Path,
         cache_dir: Path | None = None,
         *,
+        cover_dir: Path = DEFAULT_COVER_DIR,
         extractor=None,
         comparator=None,
         thresholds: Thresholds | None = None,
     ):
         self.library_dir = Path(library_dir)
+        self.cover_dir = Path(cover_dir)
         self.cache_dir = Path(cache_dir) if cache_dir else None
         self.extractor = extractor or FeatureExtractor()
         self.comparator = comparator or SiftComparator()
@@ -82,7 +88,7 @@ class TreasureMapLibrary:
     def _match_by_cells(self, image_path: Path) -> MatchResult:
         query_image = read_rgb(image_path)
         query_board = board_for(query_image)
-        hidden = covered_cells(query_image, query_board)
+        hidden = covered_cells(query_image, query_board, self.cover_dir)
         revealed = [
             (row, col)
             for row in range(ROWS)
@@ -115,7 +121,7 @@ class TreasureMapLibrary:
             raise TreasureMapError(f"不支持的藏宝图图片格式：{source.suffix or '无扩展名'}")
         image = read_rgb(source)
         board = board_for(image)
-        if covered_cells(image, board):
+        if covered_cells(image, board, self.cover_dir):
             raise CoveredTreasureMapError("该藏宝图未全开，不予收录")
         digest = file_sha256(source)
         for path in self._image_paths():
@@ -123,12 +129,17 @@ class TreasureMapLibrary:
                 return AddResult("duplicate", path)
         cells = [(row, col) for row in range(ROWS) for col in range(COLS)]
         query_desc = self._cells.descriptors(image, board, cells)
+        query_pixels = board_pixels(image, board)
         best = None
         for path in self._image_paths():
             reference = read_rgb(path)
-            hits = self._cells.agreement(query_desc, self._cells.descriptors(reference, board_for(reference), cells))
+            reference_board = board_for(reference)
+            hits = self._cells.agreement(query_desc, self._cells.descriptors(reference, reference_board, cells))
             similarity = self._cell_similarity(hits, len(cells))
-            if similarity.inlier_ratio >= DUPLICATE_RATIO and (best is None or similarity.score > best[1].score):
+            is_duplicate = similarity.inlier_ratio >= DUPLICATE_RATIO
+            if not is_duplicate and similarity.inlier_ratio >= DUPLICATE_PIXEL_RECHECK_RATIO:
+                is_duplicate = same_board_pixels(query_pixels, board_pixels(reference, reference_board))
+            if is_duplicate and (best is None or similarity.score > best[1].score):
                 best = (path, similarity)
         if best is not None:
             return AddResult("duplicate", best[0], best[1])

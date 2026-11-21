@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from src.models.base import ActionResult, ChatMessage, SenderType
-from src.treasure_map.models import CoveredTreasureMapError, TreasureMapError
+from src.treasure_map.models import CoverTemplateError, CoveredTreasureMapError, TreasureMapError
 from src.utils.chat_utils import _normalize_chat_name
 
 COMMANDS = {"藏宝图鉴别": "match", "藏宝图添加": "add"}
@@ -99,6 +99,9 @@ class TreasureFlow:
     def _match(self, chat_name: str, path) -> tuple[str, bool]:
         try:
             result = self.library.match(path)
+        except CoverTemplateError as exc:
+            reply = str(exc)
+            return reply, self._deliver_text(chat_name, reply)
         except TreasureMapError:
             reply = "这张藏宝图处理失败"
             return reply, self._deliver_text(chat_name, reply)
@@ -121,7 +124,7 @@ class TreasureFlow:
     def _add(self, chat_name: str, path) -> tuple[str, bool]:
         try:
             result = self.library.add(path)
-        except CoveredTreasureMapError as exc:
+        except (CoveredTreasureMapError, CoverTemplateError) as exc:
             reply = str(exc)
             return reply, self._deliver_text(chat_name, reply)
         except TreasureMapError:
