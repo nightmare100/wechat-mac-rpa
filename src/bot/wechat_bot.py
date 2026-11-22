@@ -113,8 +113,23 @@ class WeChatBot:
                     ))
         return True
 
+    def _treasure_map_global_enabled(self) -> bool:
+        return os.environ.get("ENABLE_TREASURE_MAP", "0").strip().lower() in ("1", "true", "yes", "on")
+
+    def _guild_excel_global_enabled(self) -> bool:
+        return os.environ.get("ENABLE_GUILD_MONSTER_EXCEL", "0").strip() == "1"
+
+    def _group_feature_enabled(self, chat_name: str, key: str, default: bool) -> bool:
+        cfg = getattr(self, "group_config", None)
+        if cfg is None or not chat_name:
+            return default
+        return cfg.is_enabled(chat_name, key, default=default)
+
     def _build_treasure_flow(self):
-        if os.environ.get("ENABLE_TREASURE_MAP", "0").strip().lower() not in ("1", "true", "yes", "on"):
+        global_enabled = self._treasure_map_global_enabled()
+        cfg = getattr(self, "group_config", None)
+        enabled = cfg.any_group_enabled("treasure_map", global_enabled) if cfg is not None else global_enabled
+        if not enabled:
             return None
         from src.bot.treasure_flow import TreasureFlow
         from src.treasure_map import TreasureMapLibrary
@@ -158,6 +173,8 @@ class WeChatBot:
     def _handle_treasure_flow(self, chat_name, messages, tick_id):
         flow = getattr(self, "treasure_flow", None)
         if flow is None:
+            return False
+        if not self._group_feature_enabled(chat_name, "treasure_map", self._treasure_map_global_enabled()):
             return False
         handled = flow.handle(chat_name, messages)
         if handled:
@@ -221,6 +238,8 @@ class WeChatBot:
         if self.voice_reply_config is not None:
             mode = "dry_run（只记日志）" if self.voice_reply_config.dry_run else "正式发送"
             print(f"  • 回复语音: 已启用，{mode}")
+        from src.bot.group_config import GroupConfig
+        self.group_config = GroupConfig()
         self.generator = ReplyGenerator(
             llm_client=actual_llm,
             memory_engine=self.memory_engine,
@@ -228,20 +247,25 @@ class WeChatBot:
             judge_worker=judge_worker,
             enable_timestamps=True,
             voice_prompt=voice_prompt,
+            group_config=self.group_config,
         )
         self.generator._system_prompt()  # persona 占位符（BOT_NAME 等）未配置时启动即报错
         self.sender = WeChatMessageSender(silent_mode=os.environ.get("WECHAT_SILENT_MODE") == "1")
         self.treasure_flow = self._build_treasure_flow()
         self.guild_excel_flow = None
-        if os.environ.get("ENABLE_GUILD_MONSTER_EXCEL", "0").strip() == "1":
+        if self.group_config.any_group_enabled("guild_excel", self._guild_excel_global_enabled()):
             if getattr(self.perception, "source_name", None) == "tracememo":
                 from src.bot.guild_excel import GuildExcelFlow
                 self.guild_excel_flow = GuildExcelFlow(self.perception, self._send_text, self._send_file_to_chat)
             else:
                 self.logger.warning("公会 Excel 指令需要使用 TraceMemo 模式")
-        # 定时推送：目标群为 SILENT_WHITELIST，配置见 src/bot/scheduled_push.py
+        # 定时推送：目标群为 SILENT_WHITELIST 中开启 scheduled_push 的群（默认全开），配置见 src/bot/scheduled_push.py
+        push_groups = [
+            g for g in sorted(self.sender._silent_whitelist)
+            if self.group_config.is_enabled(g, "scheduled_push", default=True)
+        ]
         self.scheduled_pusher = ScheduledPusher(
-            groups=sorted(self.sender._silent_whitelist),
+            groups=push_groups,
             open_chat=ChatOpener(self.perception).open,
             send=self.send_to_chat,
             send_voice=self._send_voice_line,
@@ -571,7 +595,12 @@ class WeChatBot:
             )
 
             guild_excel = getattr(self, "guild_excel_flow", None)
-            if (guild_excel is not None and is_group
+            guild_excel_allowed = (
+                guild_excel is not None
+                and is_group
+                and self._group_feature_enabled(chat_name, "guild_excel", self._guild_excel_global_enabled())
+            )
+            if (guild_excel_allowed
                     and (not self.sender.silent_mode or self.sender.in_silent_whitelist(chat_name))
                     and chat_name not in {_normalize_chat_name(c) for c in self.no_reply_chats}):
                 guild_excel.poll(chat_name)
@@ -649,7 +678,7 @@ class WeChatBot:
                 self.debug_logger.log_action("none", action_input="", success=False, error="上线静默中")
                 return
 
-            if guild_excel is not None and is_group:
+            if guild_excel_allowed:
                 for msg in to_reply:
                     reply = guild_excel.handle(chat_name, msg)
                     if reply is not None:
@@ -663,8 +692,16 @@ class WeChatBot:
             all_messages = getattr(state, "messages", [])
             if not isinstance(all_messages, list):
                 all_messages = []
-            direct_reply_disabled = is_group and getattr(self.generator, "enable_direct_group_reply", True) is False
-            chime_in_disabled = is_group and getattr(self.generator, "enable_chime_in", True) is False
+            direct_checker = getattr(self.generator, "is_direct_group_reply_enabled", None)
+            chime_checker = getattr(self.generator, "is_chime_in_enabled", None)
+            direct_reply_disabled = is_group and (
+                (not direct_checker(chat_name)) if callable(direct_checker)
+                else getattr(self.generator, "enable_direct_group_reply", True) is False
+            )
+            chime_in_disabled = is_group and (
+                (not chime_checker(chat_name)) if callable(chime_checker)
+                else getattr(self.generator, "enable_chime_in", True) is False
+            )
             if direct_reply_disabled or chime_in_disabled:
                 eligible = self.generator.group_reply_candidates(chat_name, to_reply, all_messages)
                 eligible_ids = {id(msg) for msg in eligible}
@@ -859,7 +896,12 @@ class WeChatBot:
             send_skipped = False  # 静默模式跳过（非真实失败），应视为已处理避免卡循环
             sent_replies = []
             voiced = False
-            if self.voice_policy is not None and is_group:
+            voice_allowed = (
+                self.voice_policy is not None
+                and is_group
+                and self._group_feature_enabled(chat_name, "voice_reply", True)
+            )
+            if voice_allowed:
                 decision = self.voice_policy.decide(
                     chat_name, to_reply[-1].sender if to_reply else "", replies,
                     getattr(self.generator, "last_voice_meta", None), datetime.now(),

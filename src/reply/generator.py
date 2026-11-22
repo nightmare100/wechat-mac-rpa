@@ -276,9 +276,11 @@ class ReplyGenerator:
                  enable_reply_restraint: bool = True,
                  enable_unread_dedup: bool = True,
                  enable_timestamps: bool = True,
-                 voice_prompt: str = ""):
+                 voice_prompt: str = "",
+                 group_config=None):
         self.llm_client = llm_client
         self.voice_prompt = voice_prompt  # 回复语音：启用时追加到群聊 system prompt（见 src/reply/voice_policy.py）
+        self.group_config = group_config  # 可选按群开关覆写（见 src/bot/group_config.py）
         self.last_voice_meta: Optional[Dict] = None
         self.last_go_online: bool = False  # 本次回复是否答应朧月上线（触发静默）
         self.last_chime_in: bool = False  # 本次回复 LLM 是否标了主动插话
@@ -1060,8 +1062,9 @@ class ReplyGenerator:
             unreplied=unreplied,
             all_messages=all_messages,
             is_group=is_group,
+            chat_name=chat_name,
         )
-        if is_group and self.voice_prompt:
+        if is_group and self.voice_prompt and self.is_voice_reply_enabled(chat_name):
             system_prompt += "\n\n" + self.voice_prompt
 
         tools_context = self._build_tools_context(chat_name)
@@ -1228,24 +1231,43 @@ class ReplyGenerator:
         self._submit_to_judge(tick_id, replies, unreplied, all_messages, is_group)
         return replies
 
+    def is_chime_in_enabled(self, chat_name: str = "") -> bool:
+        if self.group_config is not None and chat_name:
+            return self.group_config.is_enabled(chat_name, "chime_in", default=self.enable_chime_in)
+        return self.enable_chime_in
+
+    def is_direct_group_reply_enabled(self, chat_name: str = "") -> bool:
+        if self.group_config is not None and chat_name:
+            return self.group_config.is_enabled(chat_name, "direct_group_reply", default=self.enable_direct_group_reply)
+        return self.enable_direct_group_reply
+
+    def is_voice_reply_enabled(self, chat_name: str = "") -> bool:
+        if self.group_config is not None and chat_name:
+            return self.group_config.is_enabled(chat_name, "voice_reply", default=bool(self.voice_prompt))
+        return bool(self.voice_prompt)
+
     def chime_in_allowed(self, chat_name: str) -> bool:
-        return self.enable_chime_in and (
+        return self.is_chime_in_enabled(chat_name) and (
             time.time() - self.chime_in_last.get(chat_name, self._started_at) >= self.chime_in_cooldown
         )
 
     def group_reply_candidates(self, chat_name, messages, history):
         """按回复入口筛选群聊未读，关闭的入口不转交给另一条路径。"""
-        if self.enable_chime_in and self.enable_direct_group_reply:
+        chime_on = self.is_chime_in_enabled(chat_name)
+        direct_on = self.is_direct_group_reply_enabled(chat_name)
+        if chime_on and direct_on:
             return messages
         return [
             msg for msg in messages
-            if (self.enable_direct_group_reply if self._has_reply_trigger(chat_name, [msg], history)
-                else self.enable_chime_in)
+            if (direct_on if self._has_reply_trigger(chat_name, [msg], history)
+                else chime_on)
         ]
 
     def _apply_chime_in_limit(self, chat_name: str, unreplied: List[ChatMessage],
                               replies: List[str], history: Optional[List[ChatMessage]] = None) -> Tuple[List[str], set]:
         """群聊回复逐条判断（不管 LLM 标没标 chime_in）：对象有现有触发的照常发；其余算主动插话，冷却中丢弃，放行则开始冷却。"""
+        chime_on = self.is_chime_in_enabled(chat_name)
+        direct_on = self.is_direct_group_reply_enabled(chat_name)
         allowed = self.chime_in_allowed(chat_name)
         kept, fresh_targets, dropped, chimed = [], set(), [], False
         for reply in replies:
@@ -1253,11 +1275,11 @@ class ReplyGenerator:
             # 认不出对象、或对象对不上任何未读时按整批判断（偏保守：批里有触发就不当插话）
             msgs = [m for m in unreplied if _same_person(m.sender, target)] if target else []
             # 单独关闭入口时，不允许模型用未获准的 @ 对象绕过筛选。
-            if (not self.enable_chime_in or not self.enable_direct_group_reply) and target and not msgs:
+            if (not chime_on or not direct_on) and target and not msgs:
                 continue
             msgs = msgs or unreplied
             if self._has_reply_trigger(chat_name, msgs, history):
-                if self.enable_direct_group_reply:
+                if direct_on:
                     kept.append(reply)
             elif allowed:
                 kept.append(reply)
@@ -1270,7 +1292,7 @@ class ReplyGenerator:
             self.chime_in_last[chat_name] = time.time()
         if dropped:
             self.last_chime_in_dropped = True
-            reason = "冷却中" if self.enable_chime_in else "已关闭"
+            reason = "冷却中" if chime_on else "已关闭"
             _logger.info("[ChimeIn] '%s' %s，丢弃主动插话: %s", chat_name, reason, dropped)
         return kept, fresh_targets
 
@@ -1483,13 +1505,18 @@ class ReplyGenerator:
     def _system_prompt(self, enable_reply_restraint: Optional[bool] = None,
                        unreplied: Optional[List[ChatMessage]] = None,
                        all_messages: Optional[List[ChatMessage]] = None,
-                       is_group: bool = False) -> str:
+                       is_group: bool = False,
+                       chat_name: str = "") -> str:
         """核心 system prompt：读取稳定的人设、策略和输出 schema。"""
         if enable_reply_restraint is None:
             enable_reply_restraint = self.enable_reply_restraint
 
         project_root = Path(__file__).parent.parent.parent
         configured_path = os.environ.get("PERSONA_PATH", "data/persona.md")
+        if is_group and self.group_config is not None and chat_name:
+            override_persona = self.group_config.get(chat_name, "persona_path")
+            if isinstance(override_persona, str) and override_persona.strip():
+                configured_path = override_persona.strip()
         prompt_path = Path(configured_path)
         if not prompt_path.is_absolute():
             prompt_path = project_root / prompt_path
