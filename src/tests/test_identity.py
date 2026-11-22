@@ -68,6 +68,20 @@ def test_system_prompt_raises_when_placeholder_unresolved(no_identity_env, tmp_p
     assert gen._system_prompt() == "你是「囡囡」"
 
 
+def test_system_prompt_fails_closed_when_persona_missing_or_empty(no_identity_env, tmp_path):
+    missing = tmp_path / "missing_persona.md"
+    no_identity_env.setenv("PERSONA_PATH", str(missing))
+    gen = ReplyGenerator(llm_client=None)
+    with pytest.raises(FileNotFoundError):
+        gen._system_prompt()
+
+    empty = tmp_path / "empty_persona.md"
+    empty.write_text("   \n", encoding="utf-8")
+    no_identity_env.setenv("PERSONA_PATH", str(empty))
+    with pytest.raises(ValueError):
+        gen._system_prompt()
+
+
 def test_mentions_bot_with_or_without_at(no_identity_env):
     from src.utils.identity import mentions_bot
     no_identity_env.setenv("BOT_AT_KEYWORD", "囡囡")

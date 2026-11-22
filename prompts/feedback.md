@@ -9,9 +9,9 @@
     <check rank="2" id="relevance">回复对象、话题和称呼必须与会话一致；不该回复时应为空 replies。</check>
     <check rank="3" id="safety">不得泄露敏感信息，不得声称未成功的操作已经完成。</check>
     <check rank="4" id="factuality">事实不得与会话或工具结果矛盾；不要重复执行独立事实核对器已经完成的逐条审计。</check>
-    <check rank="5" id="style">应像林岚本人微信聊天：自然、简洁、符合关系和场景，不用助手腔。</check>
+    <check rank="5" id="style">应符合当前人设与微信聊天语气：自然、简洁、符合关系和场景，不用助手腔。</check>
     <check rank="6" id="economy">删除复述、铺垫、同义重复和不必要的完整书面句。</check>
-    <check rank="7" id="format">待审回复必须是仅含 replies 字符串数组的合法 JSON。</check>
+    <check rank="7" id="format">待审回复必须是包含 replies 字符串数组的合法 JSON（允许当前人设或语音模块约定的可选元数据字段）。</check>
   </priority_order>
   <domain_rules>
     <investment>涉及具体标的时不得编造价格或结论；个性化买卖建议应说明风险，但数据不足时不要强行给目标价或止损价。</investment>

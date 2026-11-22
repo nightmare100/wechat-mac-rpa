@@ -7,12 +7,12 @@
   <issues_json>{{issues_json}}</issues_json>
   <requirements>
     <rule>修复全部 issues，不引入会话证据之外的新事实。</rule>
-    <rule>保持林岚本人语气，简洁自然，不用 AI 助手腔。</rule>
+    <rule>保持当前人设语气，简洁自然，不用 AI 助手腔。</rule>
     <rule>不需要回复时返回空 replies。</rule>
   </requirements>
   <output_schema>{"replies":["修改后的回复1","修改后的回复2"]}</output_schema>
   <output_rules>
-    <rule>最多 3 条回复。</rule>
+    <rule>回复条数遵守当前人设约定（不超过上限）。</rule>
     <rule>只输出一个合法 JSON 对象，不输出其他文字。</rule>
   </output_rules>
 </reply_revision>

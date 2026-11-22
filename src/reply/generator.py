@@ -378,12 +378,10 @@ class ReplyGenerator:
                 name="search_memory",
                 description=(
                     "搜索本地记忆。同时返回两路结果："
-                    "(1) 人物/群聊摘要（wiki）：用于查身边的人是谁、什么关系、近况/在哪/做什么/在什么公司；"
+                    "(1) 人物/群聊摘要（wiki）：用于核实某人是谁、什么关系、近况/在哪/做什么；"
                     "(2) 历史聊天原文：用于回忆过去某段对话具体说了什么。"
-                    "只要消息涉及示例用户甲现实生活中认识的人、所在的群、去过的地方、做过的事、工作/投资/家庭相关的人或公司，"
-                    "都应该先调用 search_memory 查本地记忆，确认身份和背景后再回答或决定是否需要其他工具。"
-                    "也用于：对话中提到'上次''之前说过''你记得吗''叫什么来着'等需要回忆旧事的语境。"
-                    "不要用于：天气、股票、时间、新闻、网页搜索、纯闲聊、陈述句、陌生人的八卦。"
+                    "仅在回答确实缺少具体事实或需要回忆旧事时调用（例如对方明确问起某人的背景，或提到'上次''之前说过''你记得吗''叫什么来着'）。"
+                    "不要仅因随口提到人名或熟人就调用；不要用于天气、股票、时间、新闻、网页搜索、纯闲聊、陈述句或陌生人的八卦。"
                 ),
                 parameters={
                     "type": "object",
@@ -393,8 +391,6 @@ class ReplyGenerator:
                             "description": (
                                 "搜索关键词。用简短关键词组合，优先人名/昵称/群名/地点/事件标签，"
                                 "不要用完整问句。底层是关键字匹配，关键词越具体结果越准。"
-                                "示例：'示例用户丁'、'示例别名丁'、'示例用户丙'、'示例交流群'、'示例社区'、"
-                                "'3D打印材料'、'示例用户丁 上海'。"
                             ),
                         },
                         "top_k": {
@@ -493,6 +489,28 @@ class ReplyGenerator:
         except Exception as e:
             _logger.debug("JudgeWorker submit failed: %s", e)
 
+    @staticmethod
+    def _extract_persona_contract(system_prompt: str) -> str:
+        """抽取当前人设的最小声明事实与边界，供 Self-Refine / FactCheck 参考。"""
+        if not system_prompt:
+            return ""
+        parts = []
+        for tag in ("identity", "gender", "profile", "fact", "boundary", "persona"):
+            for match in re.finditer(rf"<{tag}>.*?</{tag}>", system_prompt, re.DOTALL):
+                parts.append(match.group(0).strip())
+        if not parts:
+            return ""
+        joined = "\n".join(parts)
+        if len(joined) > 1500:
+            joined = joined[:1500]
+        return f"<persona_contract>\n{joined}\n</persona_contract>"
+
+    @staticmethod
+    def _has_blocking_refine_issue(issues: List[str]) -> bool:
+        """判断 Self-Refine 失败原因是否属于必须阻断发送的严重问题（事实/身份/隐私安全）。"""
+        keywords = ("事实矛盾", "事实无依据", "身份", "AI", "机器人", "语言模型", "隐私", "敏感", "安全")
+        return any(any(kw in issue for kw in keywords) for issue in issues)
+
     def _self_refine(
         self,
         messages: List[Dict],
@@ -508,6 +526,13 @@ class ReplyGenerator:
             "",
         )
         evidence_parts = []
+        system_text = next(
+            (str(m.get("content", "")) for m in messages if m.get("role") == "system"),
+            "",
+        )
+        persona_contract = self._extract_persona_contract(system_text)
+        if persona_contract:
+            evidence_parts.append(persona_contract)
         for tag in ("session", "context", "history", "unread"):
             match = re.search(rf"<{tag}>.*?</{tag}>", source_text, re.DOTALL)
             if match:
@@ -1140,13 +1165,30 @@ class ReplyGenerator:
             if decision == "fail" and issues:
                 current_replies = replies
                 current_messages = feedback_messages
+                revised_ok = False
 
                 # 单次 Iterate（无循环：issues 不刷新时循环无意义）
                 if deadline - time.time() >= 1.0:
-                    new_replies, new_messages, _ = self._iterate(current_messages, issues, deadline)
+                    new_replies, new_messages, iterate_raw = self._iterate(current_messages, issues, deadline)
+                    parsed_iterate = self._extract_json(iterate_raw) if iterate_raw else None
+                    valid_empty_iterate = (
+                        isinstance(parsed_iterate, dict) and parsed_iterate.get("replies") == []
+                    )
                     if new_replies:
                         current_replies = new_replies
                         current_messages = new_messages
+                        revised_ok = True
+                        if self.voice_prompt:
+                            from src.reply.voice_policy import parse_voice_meta
+                            self.last_voice_meta = parse_voice_meta((parsed_iterate or {}).get("voice"))
+                    elif valid_empty_iterate:
+                        current_replies = []
+                        current_messages = new_messages
+                        revised_ok = True
+                        self.last_voice_meta = None
+                        self.last_go_online = False
+                        self.last_chime_in = False
+                        _logger.info("[SelfRefine] Iterate 决策不回复（空 replies）")
                     else:
                         _logger.warning("[SelfRefine] Iterate 未生成有效回复，保留原回复")
                     self.last_iterate_count = 1
@@ -1154,6 +1196,13 @@ class ReplyGenerator:
                     self.last_iterate_skipped_no_budget = True
                     _logger.warning("[SelfRefine] Iterate 因预算不足跳过 (deadline=%.1fs)",
                                     deadline - time.time())
+
+                if not revised_ok and self._has_blocking_refine_issue(issues):
+                    _logger.warning("[SelfRefine] 存在阻断性问题且未完成修订，拦截原回复: %s", issues)
+                    current_replies = []
+                    self.last_voice_meta = None
+                    self.last_go_online = False
+                    self.last_chime_in = False
 
                 replies = current_replies
                 final_messages = current_messages
@@ -1444,11 +1493,11 @@ class ReplyGenerator:
         prompt_path = Path(configured_path)
         if not prompt_path.is_absolute():
             prompt_path = project_root / prompt_path
-        if prompt_path.exists():
-            prompt = prompt_path.read_text(encoding="utf-8")
-        else:
-            # fallback 到默认 prompt
-            prompt = "<instructions><persona>你是示例用户甲本人。用户不是在跟AI聊天，是在微信上给示例用户甲发消息。</persona></instructions>"
+        if not prompt_path.exists():
+            raise FileNotFoundError(f"人设文件不存在: {prompt_path}（请检查 PERSONA_PATH 配置）")
+        prompt = prompt_path.read_text(encoding="utf-8")
+        if not prompt.strip():
+            raise ValueError(f"人设文件为空: {prompt_path}")
 
         prompt = render_persona(prompt)
         prompt = self._select_persona_examples(prompt, unreplied or [])

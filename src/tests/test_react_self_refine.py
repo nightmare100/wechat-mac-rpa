@@ -276,6 +276,51 @@ class TestSelfRefine:
         assert root.findtext("issues_json") == '["称呼错误", "包含 <tag>"]'
         assert "反馈问题：" not in revision
 
+    def test_self_refine_injects_persona_contract_into_evidence(self, mock_llm, sample_message):
+        mock_llm.responses = [
+            '{"skills": []}',
+            '{"replies": ["在上海呀"]}',
+            '{"decision": "pass", "issues": []}',
+        ]
+        gen = _make_generator(mock_llm, enable_self_refine=True)
+        assert gen.generate([sample_message], [sample_message]) == ["在上海呀"]
+        evidence_msg = mock_llm.calls[2]["messages"][1]["content"]
+        assert "<persona_contract>" in evidence_msg
+        assert "<identity>" in evidence_msg
+
+    def test_iterate_valid_empty_replies_adopts_silence(self, mock_llm, sample_message):
+        mock_llm.responses = [
+            '{"skills": []}',
+            '{"replies": ["不该回的话"], "voice": {"scene": "被夸感谢", "mood": "调皮"}}',
+            '{"decision": "fail", "issues": ["不该回复"]}',
+            '{"replies": []}',
+        ]
+        gen = _make_generator(mock_llm, enable_self_refine=True)
+        gen.voice_prompt = "VOICE"
+        assert gen.generate([sample_message], [sample_message], is_group=True) == []
+        assert gen.last_voice_meta is None
+
+    def test_iterate_broken_json_keeps_draft_for_style_issue(self, mock_llm, sample_message):
+        mock_llm.responses = [
+            '{"skills": []}',
+            '{"replies": ["原回复"]}',
+            '{"decision": "fail", "issues": ["太正式"]}',
+            '{"replies": ["截断了',
+        ]
+        gen = _make_generator(mock_llm, enable_self_refine=True)
+        assert gen.generate([sample_message], [sample_message]) == ["原回复"]
+
+    def test_blocking_issue_without_valid_revision_blocks_reply(self, mock_llm, sample_message):
+        mock_llm.responses = [
+            '{"skills": []}',
+            '{"replies": ["我是AI助手"]}',
+            '{"decision": "fail", "issues": ["身份：承认自己是AI"]}',
+            '{"replies": ["坏JSON',
+        ]
+        gen = _make_generator(mock_llm, enable_self_refine=True)
+        assert gen.generate([sample_message], [sample_message]) == []
+        assert gen.last_voice_meta is None
+
 
 class TestForceSkill:
     """FORCE_SKILL 环境变量的测试。"""
@@ -505,13 +550,13 @@ class TestVoiceMeta:
         gen.generate([msg], [msg], is_group=True)
         assert "VOICE" not in gen.last_system_prompt
 
-    def test_last_voice_meta_from_first_generation(self):
+    def test_last_voice_meta_updates_or_clears_after_self_refine(self):
         msg = self._group_msg()
         llm = MockLLM(responses=[
             '{"skills": []}',
             '{"replies": ["哼"], "voice": {"scene": "被夸感谢", "mood": "调皮"}}',
             '{"decision": "fail", "issues": ["太短"]}',
-            '{"replies": ["哼，算你有眼光"], "voice": {"scene": "安慰", "mood": "安慰"}}',
+            '{"replies": ["谢谢呀"], "voice": {"scene": "安慰", "mood": "安慰"}}',
         ])
         gen = _make_generator(llm, enable_self_refine=True)
         gen.generate([msg], [msg], is_group=True)
@@ -519,7 +564,17 @@ class TestVoiceMeta:
         llm.responses, llm.index = llm.responses, 0
         gen.voice_prompt = "VOICE"
         gen.generate([msg], [msg], is_group=True)
-        assert gen.last_voice_meta == {"scene": "被夸感谢", "mood": "调皮"}
+        assert gen.last_voice_meta == {"scene": "安慰", "mood": "安慰"}
+
+        # 修订稿未返回 voice 时，清空初稿遗留的 voice 元数据，避免旧 accept 覆盖修订稿
+        llm.responses, llm.index = [
+            '{"skills": []}',
+            '{"replies": ["哼"], "voice": {"scene": "被夸感谢", "mood": "调皮"}}',
+            '{"decision": "fail", "issues": ["太短"]}',
+            '{"replies": ["不发语音哦"]}',
+        ], 0
+        gen.generate([msg], [msg], is_group=True)
+        assert gen.last_voice_meta is None
 
         llm.responses, llm.index = ['{"skills": []}', '{"replies": ["好"]}'], 0
         gen.enable_self_refine = False
