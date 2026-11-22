@@ -23,7 +23,7 @@ _LOGGER = logging.getLogger(__name__)
 _COMMAND = re.compile(r"请读取(.+?)的图片\s*[,，]\s*工作表\s*[:：](.*?)\s*[,，]\s*最终输出\s*[:：](.*)")
 _SKILL = Path.home() / ".agents/skills/guild-monster-excel"
 _OUTBOX = Path(__file__).resolve().parents[2] / "data" / "guild_excel" / "outbox"
-_WINDOW_MINUTES = 10
+_WINDOW_MINUTES = 20
 _WINDOW_SECONDS = _WINDOW_MINUTES * 60
 _MAX_IMAGES = 20
 _MAX_PENDING_JOBS = 8
@@ -146,6 +146,13 @@ def _run_codex(request, images, directory, skill):
         )
         for key, field in (("members", "power"), ("scores", "score"))
     ):
+        members_n = len(data.get("members") or []) if isinstance(data, dict) and isinstance(data.get("members"), list) else 0
+        scores_n = len(data.get("scores") or []) if isinstance(data, dict) and isinstance(data.get("scores"), list) else 0
+        err_val = data.get("error") if isinstance(data, dict) else None
+        _LOGGER.warning(
+            "[GuildExcel] 识别校验未通过: sheet=%s images=%d members=%d scores=%d error=%r",
+            request.sheet, len(images), members_n, scores_n, err_val,
+        )
         raise GuildExcelError("没有同时识别出公会成员战力和今日魔物得分，请检查两类截图是否齐全、清晰。")
     return response
 
@@ -178,6 +185,10 @@ def create_workbook(request, command, perception, directory, *, skill=_SKILL):
     except TraceMemoError as exc:
         raise GuildExcelError("TraceMemo 读取群图片失败，请确认原图可打开后重试。") from exc
 
+    _LOGGER.info(
+        "[GuildExcel] 已拉取图片 %d 张 (sender=%s, sheet=%s, file=%s)",
+        len(paths), request.nickname, request.sheet, request.filename,
+    )
     records = _run_codex(request, paths, directory, skill)
     output = directory / request.filename
     try:
@@ -193,18 +204,70 @@ def create_workbook(request, command, perception, directory, *, skill=_SKILL):
     return output
 
 
+def _inspect_workbook_sheet(path: Path, sheet_name: str) -> tuple[int, int, int]:
+    """返回 (总工作表数, 该表成员数, 该表匹配到魔物得分的人数)。"""
+    from openpyxl import load_workbook
+
+    book = load_workbook(path, read_only=True)
+    try:
+        sheet_count = len(book.sheetnames)
+        target = next((n for n in book.sheetnames if n.casefold() == sheet_name.casefold()), None)
+        if target is None:
+            return sheet_count, 0, 0
+        rows = list(book[target].iter_rows(values_only=True))
+        data_rows = rows[1:] if len(rows) > 1 else []
+        members_count = len(data_rows)
+        matched_count = sum(1 for row in data_rows if len(row) >= 3 and row[2] not in (None, ""))
+        return sheet_count, members_count, matched_count
+    finally:
+        book.close()
+
+
+def _drop_existing_sheet(path: Path, sheet_name: str) -> None:
+    """若工作簿中已存在同名工作表（忽略大小写），先移除以便本次重写覆盖而非生成 _2。"""
+    from openpyxl import load_workbook
+
+    book = load_workbook(path)
+    try:
+        matches = [n for n in book.sheetnames if n.casefold() == sheet_name.casefold()]
+        if not matches:
+            return
+        if len(matches) >= len(book.sheetnames):
+            book.close()
+            path.unlink(missing_ok=True)
+            return
+        for name in matches:
+            del book[name]
+        book.save(path)
+    finally:
+        book.close()
+
+
 class GuildExcelFlow:
     """Append workbooks serially and deliver snapshots on the Bot's UI thread."""
 
-    def __init__(self, perception, send_text, send_file, *, worker=create_workbook, outbox=_OUTBOX):
+    def __init__(self, perception, send_text, send_file, *, worker=create_workbook, outbox=_OUTBOX, group_config=None):
         self.perception = perception
         self.send_text = send_text
         self.send_file = send_file
         self.worker = worker
         self.outbox = Path(outbox)
         self.workbooks = self.outbox.parent / "workbooks"
+        self.group_config = group_config
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="guild-excel")
         self.jobs: list[tuple[str, Future[Path]]] = []
+        self._job_meta: dict[Future[Path], tuple[str, int, str, str]] = {}
+
+    def _delivery_policy(self, origin_chat: str) -> tuple[int, str, str]:
+        if self.group_config is None or not origin_chat:
+            return 1, origin_chat, ""
+        raw_min = self.group_config.get(origin_chat, "guild_excel_min_sheets", 1)
+        min_sheets = raw_min if isinstance(raw_min, int) and not isinstance(raw_min, bool) and raw_min >= 1 else 1
+        raw_target = self.group_config.get(origin_chat, "guild_excel_target_chat", "")
+        target_chat = raw_target.strip() if isinstance(raw_target, str) and raw_target.strip() else origin_chat
+        raw_msg = self.group_config.get(origin_chat, "guild_excel_target_message", "")
+        target_message = raw_msg.strip() if isinstance(raw_msg, str) and raw_msg.strip() else ""
+        return min_sheets, target_chat, target_message
 
     def handle(self, chat_name, message):
         if message.sender_type != SenderType.OTHER or message.message_type != "text":
@@ -222,7 +285,10 @@ class GuildExcelFlow:
                 reply = "公会统计队列已满，请稍后再发指令。"
             else:
                 waiting = bool(self.jobs)
-                self.jobs.append((chat_name, self.executor.submit(self._append_workbook, request, message)))
+                future = self.executor.submit(self._append_workbook, request, message)
+                min_sheets, target_chat, target_message = self._delivery_policy(chat_name)
+                self._job_meta[future] = (request.sheet, min_sheets, target_chat, target_message)
+                self.jobs.append((chat_name, future))
                 reply = "收到，已排队，处理完成后会回发 Excel。" if waiting else "收到，正在识别图片并生成 Excel。"
         self.send_text(chat_name, reply)
         return reply
@@ -234,7 +300,9 @@ class GuildExcelFlow:
         with TemporaryDirectory(prefix="guild-excel-") as directory:
             directory = Path(directory)
             if workbook.is_file():
-                shutil.copyfile(workbook, directory / request.filename)
+                staged_input = directory / request.filename
+                shutil.copyfile(workbook, staged_input)
+                _drop_existing_sheet(staged_input, request.sheet)
             output = self.worker(request, command, self.perception, directory)
 
             # 先保存发送时的版本。后续任务只替换主工作簿，不修改已交给微信的文件。
@@ -255,18 +323,42 @@ class GuildExcelFlow:
         return delivery_file
 
     def poll(self, chat_name):
-        for index, (target, future) in enumerate(self.jobs):
-            if target != chat_name or not future.done():
+        for index, (origin_chat, future) in enumerate(self.jobs):
+            if origin_chat != chat_name or not future.done():
                 continue
             self.jobs.pop(index)
+            sheet_name, min_sheets, delivery_chat, target_message = self._job_meta.pop(future, ("", 1, origin_chat, ""))
+            delivery_chat = delivery_chat or origin_chat
             try:
                 delivery_file = future.result()
             except GuildExcelError as exc:
-                self.send_text(target, str(exc))
+                self.send_text(origin_chat, str(exc))
             except Exception:
                 _LOGGER.exception("公会统计任务失败")
-                self.send_text(target, "公会统计处理失败，请检查 Bot 日志。")
+                self.send_text(origin_chat, "公会统计处理失败，请检查 Bot 日志。")
             else:
-                if not self.send_file(target, delivery_file).success:
-                    self.send_text(target, "Excel 已生成并保存在本机，但未能发到群里。")
+                stats_suffix = ""
+                if min_sheets > 1 or delivery_chat != origin_chat:
+                    sheet_count, members_count, matched_count = _inspect_workbook_sheet(delivery_file, sheet_name)
+                    if members_count > 0:
+                        stats_suffix = f"，共{members_count}人/匹配{matched_count}人"
+                    if min_sheets > 1 and sheet_count < min_sheets:
+                        self.send_text(
+                            origin_chat,
+                            f"已写入（{sheet_name}{stats_suffix}），当前进度 {sheet_count}/{min_sheets}。",
+                        )
+                        return
+                if not self.send_file(delivery_chat, delivery_file).success:
+                    if delivery_chat != origin_chat:
+                        self.send_text(origin_chat, f"Excel 已生成并保存在本机，但未能发到「{delivery_chat}」。")
+                    else:
+                        self.send_text(origin_chat, "Excel 已生成并保存在本机，但未能发到群里。")
+                else:
+                    if target_message:
+                        self.send_text(delivery_chat, target_message)
+                    if delivery_chat != origin_chat:
+                        self.send_text(
+                            origin_chat,
+                            f"已写入（{sheet_name}{stats_suffix}），Excel 已发送到「{delivery_chat}」。",
+                        )
             return

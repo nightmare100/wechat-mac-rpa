@@ -22,13 +22,13 @@ def test_command_is_exact_and_disallows_paths():
 
 
 def test_selects_recent_images_from_one_sender_in_current_group():
-    command = message(create_time=1600, local_id=10)
-    first, last = message(), message(create_time=1600, local_id=9)
-    nine_minutes_before = message(create_time=1060, local_id=2)
-    other = [message(create_time=999), message(create_time=1601), message(chatroom_id="other"),
-             message(sender="小红"), message(create_time=1600, local_id=11)]
-    assert select_images([last, *other, nine_minutes_before, first], command, "小明") == [
-        first, nine_minutes_before, last,
+    command = message(create_time=2200, local_id=10)
+    first, last = message(create_time=1000), message(create_time=2200, local_id=9)
+    nineteen_minutes_before = message(create_time=1060, local_id=2)
+    other = [message(create_time=999), message(create_time=2201), message(chatroom_id="other"),
+             message(sender="小红"), message(create_time=2200, local_id=11)]
+    assert select_images([last, *other, nineteen_minutes_before, first], command, "小明") == [
+        first, nineteen_minutes_before, last,
     ]
     with pytest.raises(GuildExcelError, match="重名"):
         select_images([first, message(sender_wxid="wx_b", local_id=2)], command, "小明")
@@ -68,7 +68,7 @@ def test_workbook_uses_scoped_images_and_skill_exporter(tmp_path, monkeypatch):
     monkeypatch.setattr(guild_excel, "_run_codex", recognize)
     output = guild_excel.create_workbook(request, command, perception, tmp_path)
     assert output.name == "战报.xlsx"
-    perception.recent_group_messages.assert_called_once_with("abc@chatroom", 500)
+    perception.recent_group_messages.assert_called_once_with("abc@chatroom", -100)
     assert [call.args[0] for call in perception.client.read_bytes.call_args_list] == ["/media/one", "/media/two"]
     workbook = load_workbook(output, read_only=True)
     try:
@@ -168,3 +168,79 @@ def test_same_file_accumulates_queued_sheets_and_survives_restart(tmp_path):
         assert sheets(first) == ["1队"]
     finally:
         restarted.executor.shutdown()
+
+
+def test_waits_for_min_sheets_and_delivers_to_target_group(tmp_path):
+    import json
+    from openpyxl import Workbook, load_workbook
+    from src.bot.group_config import GroupConfig
+    from src.bot.guild_excel import GuildExcelFlow
+    from src.models.base import ActionResult
+
+    def export(request, command, perception, directory):
+        path = directory / request.filename
+        if path.exists():
+            book = load_workbook(path)
+        else:
+            book = Workbook()
+            book.remove(book.active)
+        sheet = book.create_sheet(request.sheet)
+        sheet.append(("名称", "战力", "魔物得分"))
+        sheet.append(("甲", "10.00m", "1.00t"))
+        sheet.append(("乙", "8.00m", None))
+        book.save(path)
+        book.close()
+        return path
+
+    cfg_path = tmp_path / "group_config.json"
+    cfg_path.write_text(
+        json.dumps(
+            {
+                "groups": {
+                    "戰神管理群": {
+                        "guild_excel": True,
+                        "guild_excel_min_sheets": 3,
+                        "guild_excel_target_chat": "弓箭2战神公会",
+                        "guild_excel_target_message": "大家辛苦啦，这是今日的魔物成绩单，请查收。大家要加油哦，我们都是战神！",
+                    }
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    send_text = Mock()
+    send_file = Mock(return_value=ActionResult(success=True))
+    flow = GuildExcelFlow(
+        Mock(), send_text, send_file, worker=export, outbox=tmp_path / "outbox", group_config=GroupConfig(cfg_path)
+    )
+    try:
+        # 写入 1队 → 2队 → 重跑覆盖 2队（不应生成 2队_2 凑满 3 张）→ 写入 3队
+        for sheet_name in ("1队", "2队", "2队", "3队"):
+            cmd = message(
+                text=f"请读取小明的图片，工作表:{sheet_name}，最终输出:战报.xlsx",
+                message_type="text",
+                chat_name="戰神管理群",
+            )
+            flow.handle("戰神管理群", cmd)
+            flow.jobs[-1][1].result(timeout=5)
+            flow.poll("戰神管理群")
+
+        # 重跑 2队 覆盖原表，只有写入 3队 真正凑齐 3 张 sheet 后才发往 弓箭2战神公会
+        send_file.assert_called_once()
+        target_chat, sent_path = send_file.call_args.args
+        assert target_chat == "弓箭2战神公会"
+        assert sent_path.name == "战报.xlsx"
+        wb = load_workbook(sent_path, read_only=True)
+        try:
+            assert wb.sheetnames == ["1队", "2队", "3队"]
+        finally:
+            wb.close()
+
+        texts = [call.args for call in send_text.call_args_list]
+        assert ("戰神管理群", "已写入（1队，共2人/匹配1人），当前进度 1/3。") in texts
+        assert ("戰神管理群", "已写入（2队，共2人/匹配1人），当前进度 2/3。") in texts
+        assert ("弓箭2战神公会", "大家辛苦啦，这是今日的魔物成绩单，请查收。大家要加油哦，我们都是战神！") in texts
+        assert ("戰神管理群", "已写入（3队，共2人/匹配1人），Excel 已发送到「弓箭2战神公会」。") in texts
+    finally:
+        flow.executor.shutdown()

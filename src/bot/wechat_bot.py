@@ -276,7 +276,9 @@ class WeChatBot:
         if self.group_config.any_group_enabled("guild_excel", self._guild_excel_global_enabled()):
             if getattr(self.perception, "source_name", None) == "tracememo":
                 from src.bot.guild_excel import GuildExcelFlow
-                self.guild_excel_flow = GuildExcelFlow(self.perception, self._send_text, self._send_file_to_chat)
+                self.guild_excel_flow = GuildExcelFlow(
+                    self.perception, self._send_text, self._send_file_to_chat, group_config=self.group_config
+                )
             else:
                 self.logger.warning("公会 Excel 指令需要使用 TraceMemo 模式")
         # 定时推送：目标群为 SILENT_WHITELIST 中开启 scheduled_push 的群（默认全开），配置见 src/bot/scheduled_push.py
