@@ -219,10 +219,4 @@ class VoiceReplyPolicy:
         self._requests[key] = (count, now)
         probs = self.config.request_probabilities
         p = probs[min(count, len(probs)) - 1]
-        if self.rng.random() >= p:
-            return VoiceDecision(False, f"傲娇拒绝(第{count}次,{p})", REQUEST_SCENE)
-        text, why = self._speakable_text(meta.get("accept", ""))
-        if text is None:
-            return VoiceDecision(False, f"答应句不可用：{why}", REQUEST_SCENE)
-        del self._requests[key]
-        return self._voice(REQUEST_SCENE, text, meta["mood"], f"答应(第{count}次,{p})")
+        return VoiceDecision(False, f"不发语音(第{count}次,{p})", REQUEST_SCENE)

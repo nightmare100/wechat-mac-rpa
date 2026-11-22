@@ -124,7 +124,8 @@ class TestReplyGenerator:
         assert guard.attrib == {"priority": "final", "enforcement": "hard"}
         assert "不得照抄其中的句子" in "".join(guard.itertext())
         assert "不得在已用的梗上继续加戏" in "".join(guard.itertext())
-        assert "明确 @ 你时必须回复，不得输出空 replies" in "".join(guard.itertext())
+        assert "明确 @ 你时可以回复，但不是必须有正文" in "".join(guard.itertext())
+        assert "名字、数字、玩法和已经说过的事实可以再用" in "".join(guard.itertext())
         assert [child.tag for child in root][-3:] == ["unread", "consumed_self_replies", "reply_guard"]
 
     def test_history_excludes_unread_by_identity_when_system_message_is_last(self):
@@ -165,7 +166,8 @@ class TestReplyGenerator:
 
         assert [child.tag for child in root][-1] == "reply_guard"
         guard_text = "".join(root.find("./reply_guard").itertext())
-        assert "要求停止交流" in guard_text
+        assert "别再回" in guard_text
+        assert "普通告别可以回一句很短的" in guard_text
         # OCR 常把昵称识别错，不再强制"纠正错误称呼"，避免把识别错误放大成回复
         assert "identity_provocation" not in guard_text
 
@@ -177,6 +179,24 @@ class TestReplyGenerator:
         assert ET.fromstring(prompt).tag == "instructions"
         assert "<available_skills>" not in prompt
         assert "<active_skill" not in prompt
+
+    def test_short_acknowledgement_is_kept(self):
+        gen = ReplyGenerator(llm_client=None, tool_registry=_TEST_TOOL_REGISTRY)
+
+        assert gen._parse_replies('{"replies":["好的"]}') == ["好的"]
+
+    def test_persona_examples_follow_the_current_message(self):
+        gen = ReplyGenerator(llm_client=None, tool_registry=_TEST_TOOL_REGISTRY)
+        unread = ChatMessage(
+            text="@囡囡 今天好累啊", sender="李桑", sender_type=SenderType.OTHER, chat_name="群",
+        )
+
+        prompt = gen._system_prompt(unreplied=[unread])
+        examples = ET.fromstring(prompt).find("examples")
+        incoming = [node.findtext("in") or "" for node in examples.findall("example")]
+
+        assert 4 <= len(incoming) <= 8
+        assert any("累" in text for text in incoming)
 
     def test_appended_sections_stay_before_final_reply_guard(self):
         gen = ReplyGenerator(llm_client=None, tool_registry=_TEST_TOOL_REGISTRY)
@@ -260,13 +280,21 @@ class TestBedtimeContext:
         from datetime import datetime, timedelta
         now = datetime.now()
         window = ((now - timedelta(minutes=5)).time(), (now + timedelta(minutes=5)).time())
-        bedtime = self._prompt(window).find("./session/bedtime")
-        assert bedtime is not None
+        root = self._prompt(window)
+        bedtime = root.find("./session/bedtime")
+        state = root.find("./session/current_state")
+        assert bedtime is not None and state is not None
         assert f"你 {window[1]:%H:%M} 睡觉" in bedtime.text
+        assert "催大家" not in bedtime.text
+        assert state.attrib == {"mood": "犯困", "energy": "低"}
 
     def test_no_bedtime_outside_window(self):
         from datetime import datetime, timedelta
         now = datetime.now()
         window = ((now + timedelta(hours=1)).time(), (now + timedelta(hours=2)).time())
-        assert self._prompt(window).find("./session/bedtime") is None
-        assert self._prompt(None).find("./session/bedtime") is None
+        outside = self._prompt(window)
+        assert outside.find("./session/bedtime") is None
+        assert outside.find("./session/current_state").attrib == {"mood": "平静", "energy": "平常"}
+        unset = self._prompt(None)
+        assert unset.find("./session/bedtime") is None
+        assert unset.find("./session/current_state").attrib["energy"] == "平常"

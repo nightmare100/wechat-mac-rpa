@@ -1,4 +1,4 @@
-"""回复语音策略：时间窗口、场合与心情、字数与可念、不连发、傲娇计数、语速与 style、配置。"""
+"""回复语音策略：时间窗口、场合与心情、字数与可念、不连发、索要语音不改口、语速与 style、配置。"""
 
 import json
 from datetime import datetime, timedelta
@@ -98,7 +98,7 @@ def test_no_consecutive_voice():
     p = _policy(0.0, 0.0, 0.0, 0.0)
     p.record_sent("群", True)
     assert not p.decide("群", "A", ["哼"], PRAISE, NOON).send_voice
-    assert p.decide("群", "B", ["好啦"], {"scene": "要听语音", "mood": "不情愿", "accept": "好啦就一句"}, NOON).send_voice
+    assert not p.decide("群", "B", ["不发语音啦"], {"scene": "要听语音", "mood": "平静"}, NOON).send_voice
     p.record_sent("群", False)
     assert p.decide("群", "A", ["哼"], PRAISE, NOON).send_voice
 
@@ -107,34 +107,12 @@ def _ask(p, sender, now, accept="好啦好啦，就一句哦"):
     return p.decide("群", sender, ["哼，才不给你听"], {"scene": "要听语音", "mood": "不情愿", "accept": accept}, now)
 
 
-def test_request_escalation():
-    p = _policy(0.35, 0.55)
+def test_request_never_sends_voice():
+    p = _policy(0.0, 0.0, 0.0)
     assert not _ask(p, "A", NOON).send_voice
-    assert _ask(p, "A", NOON + timedelta(minutes=5)).send_voice
-
-    p = _policy(0.85, 0.85, 0.85)
-    assert not _ask(p, "B", NOON).send_voice
-    assert not _ask(p, "B", NOON + timedelta(minutes=1)).send_voice
-    assert _ask(p, "B", NOON + timedelta(minutes=2)).send_voice
-
-    p = _policy(0.35, 0.35)
-    assert not _ask(p, "C", NOON).send_voice
-    assert not _ask(p, "C", NOON + timedelta(minutes=11)).send_voice  # 超窗，仍按第 1 次 0.3
-
-    p = _policy(0.0, 0.35)
-    assert _ask(p, "D", NOON).send_voice
-    assert not _ask(p, "D", NOON + timedelta(minutes=1)).send_voice  # 答应后从第 1 次算
-
-
-def test_request_accept_text_rules():
-    p = _policy(0.0, 0.55)
-    assert not _ask(p, "A", NOON, accept="一" * 21).send_voice  # 掷中但太长 → 拒绝，计数不清零
-    d = _ask(p, "A", NOON + timedelta(minutes=1))  # 第 2 次 0.6
-    assert d.send_voice and d.text == "好啦好啦，就一句哦"
-
-    p = _policy(0.35)
-    assert not _ask(p, "B", NOON.replace(hour=23)).send_voice  # 窗口外不计次
-    assert not _ask(p, "B", NOON).send_voice  # 仍是第 1 次（0.35 ≥ 0.3）
+    assert not _ask(p, "A", NOON + timedelta(minutes=5)).send_voice
+    assert not _ask(p, "A", NOON + timedelta(minutes=6), accept="一" * 21).send_voice
+    assert not _ask(p, "B", NOON.replace(hour=23)).send_voice
 
 
 def test_rate_for_length():
@@ -144,7 +122,7 @@ def test_rate_for_length():
     import random
     p = VoiceReplyPolicy(CFG, {}, 0.1, rng=random.Random(3))
     for _ in range(100):
-        d = p.decide("群", "A", ["哼"], {"scene": "要听语音", "mood": "不情愿", "accept": "好吧"}, NOON)
+        d = p.decide("群", "A", ["哼"], PRAISE, NOON)
         if d.send_voice:
             assert 0.9 <= d.rate <= 1.2
 

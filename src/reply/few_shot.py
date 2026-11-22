@@ -21,6 +21,22 @@ def _is_trusted_human_example(row: dict[str, Any]) -> bool:
     return row.get("source_provenance") in _TRUSTED_PROVENANCE
 
 
+def _fits_persona(row: dict[str, Any], *, persona: str | None, relation_level: str | None) -> bool:
+    """未传关系时保持旧行为。buddy 和 refused 必须显式声明适用；其他关系不混入只属于这两档的样本。"""
+    sample_persona = row.get("persona")
+    if sample_persona and persona and sample_persona != persona:
+        return False
+    applies = row.get("applies_to")
+    if not relation_level:
+        return True
+    marked = isinstance(applies, list) and bool(applies)
+    if relation_level in ("buddy", "refused"):
+        return marked and relation_level in applies
+    if marked and relation_level not in applies:
+        return False
+    return True
+
+
 def _chat_id(chat_name: str) -> str:
     return f"chat_{hashlib.sha256(chat_name.encode('utf-8')).hexdigest()[:10]}"
 
@@ -108,6 +124,26 @@ class PersonaFewShotRetriever:
         rows = self._load()
         return bool(rows) and all(_is_trusted_human_example(row) for row in rows)
 
+    def approval_status(self) -> str:
+        if not self.path.exists():
+            return "missing"
+        report_path = self.path.with_name("report.json")
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return "unapproved"
+        if report.get("review_status") != "approved":
+            return "unapproved"
+        try:
+            digest = hashlib.sha256(self.path.read_bytes()).hexdigest()
+        except OSError:
+            return "missing"
+        if report.get("examples_sha256") != digest:
+            return "hash_mismatch"
+        if not self._load():
+            return "empty"
+        return "approved"
+
     def _load(self) -> list[dict[str, Any]]:
         try:
             mtime_ns = self.path.stat().st_mtime_ns
@@ -142,6 +178,8 @@ class PersonaFewShotRetriever:
         relationship: str | None = None,
         chat_id: str | None = None,
         interaction_context: str = "",
+        relation_level: str | None = None,
+        persona: str | None = None,
     ) -> list[dict[str, Any]]:
         query_terms = Counter(_terms(query))
         current_chat_id = chat_id or (_chat_id(chat_name) if chat_name else "")
@@ -153,6 +191,8 @@ class PersonaFewShotRetriever:
         scored = []
         for row in self._load():
             if is_group != (row.get("relationship") == "group"):
+                continue
+            if not _fits_persona(row, persona=persona, relation_level=relation_level):
                 continue
             sample_text = " ".join(row["context"])
             sample_terms = Counter(_terms(sample_text))

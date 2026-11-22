@@ -183,6 +183,31 @@ def test_render_has_fact_isolation_and_budget(tmp_path):
     assert "<response>\n<message>咋啦</message>\n</response>" in content
 
 
+def test_relation_and_persona_keep_samples_apart(tmp_path):
+    path = tmp_path / "examples.jsonl"
+    _write_rows(path, [
+        {"id": "shared", "relationship": "group", "context": ["在吗"], "reply": ["在呀"]},
+        {"id": "buddy", "relationship": "group", "persona": "group-bot-4", "applies_to": ["buddy"], "context": ["在吗"], "reply": ["来啦"]},
+        {"id": "other_persona", "relationship": "group", "persona": "old", "applies_to": ["known"], "context": ["在吗"], "reply": ["旧口吻"]},
+    ])
+    retriever = PersonaFewShotRetriever(path)
+
+    known = retriever.retrieve("在吗", "群", is_group=True, relation_level="known", persona="group-bot-4")
+    buddy = retriever.retrieve("在吗", "群", is_group=True, relation_level="buddy", persona="group-bot-4")
+    refused = retriever.retrieve("在吗", "群", is_group=True, relation_level="refused", persona="group-bot-4")
+
+    assert [row["id"] for row in known] == ["shared"]
+    assert [row["id"] for row in buddy] == ["buddy"]
+    assert refused == []
+
+
+def test_approval_status_names_the_blocker(tmp_path):
+    path = tmp_path / "examples.jsonl"
+    assert PersonaFewShotRetriever(path).approval_status() == "missing"
+    _write_rows(path, [{"id": "one", "relationship": "friend", "context": ["在吗"], "reply": ["在"]}])
+    assert PersonaFewShotRetriever(path).approval_status() == "unapproved"
+
+
 def test_missing_file_degrades_to_empty(tmp_path):
     retriever = PersonaFewShotRetriever(tmp_path / "missing.jsonl")
 
