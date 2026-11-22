@@ -1701,12 +1701,16 @@ class ReplyGenerator:
 
         t_mem_ms = {}
         if self.memory_engine is not None and unreplied:
+            from src.reply.memory_selector import select_relevant_memory
+
+            batch_query = "\n".join(m.text or "" for m in unreplied if m.text)
             if not is_group:
                 last_sender = unreplied[-1].sender
                 clean_sender = last_sender.split(" @")[0] if last_sender and " @" in last_sender else last_sender
                 if clean_sender and clean_sender != "我":
                     t_m2 = time.time()
                     memory_text = self.memory_engine.get_user_memory(clean_sender, max_chars=6000)
+                    memory_text = select_relevant_memory(memory_text, batch_query, max_chars=2400)
                     t_mem_ms["other"] = (time.time() - t_m2) * 1000
                     if memory_text:
                         context_fields.append(
@@ -1716,16 +1720,22 @@ class ReplyGenerator:
             if is_group and chat_name:
                 t_m3 = time.time()
                 group_text = self.memory_engine.get_group_memory(chat_name, max_chars=6000)
+                group_text = select_relevant_memory(group_text, batch_query, max_chars=2000)
                 if group_text:
                     context_fields.append(f"<group_memory>{xml_escape(group_text)}</group_memory>")
-                # 本批发言人的精简个人记忆：去重，最近发言的在前，最多 3 人
+                # 本批发言人的精简个人记忆：去重，最近发言的在前，最多 3 人，各自按本人消息话题过滤
                 senders: List[str] = []
+                sender_texts: Dict[str, List[str]] = {}
                 for m in reversed(unreplied):
                     name = (m.sender or "").split(" @")[0]
-                    if name and name != "我" and name not in senders:
-                        senders.append(name)
+                    if name and name != "我":
+                        if name not in senders:
+                            senders.append(name)
+                        if m.text:
+                            sender_texts.setdefault(name, []).append(m.text)
                 for name in senders[:3]:
                     brief = self.memory_engine.get_user_brief(name, max_chars=400)
+                    brief = select_relevant_memory(brief, "\n".join(sender_texts.get(name, [])), max_chars=400)
                     if brief:
                         context_fields.append(
                             f'<participant_memory subject="{xml_escape(name, quote=True)}">'
