@@ -239,7 +239,25 @@ class WeChatBot:
             mode = "dry_run（只记日志）" if self.voice_reply_config.dry_run else "正式发送"
             print(f"  • 回复语音: 已启用，{mode}")
         from src.bot.group_config import GroupConfig
+        from src.reply.sticker_policy import StickerPolicy, load_sticker_reply_config
         self.group_config = GroupConfig()
+        # 群聊表情包回复（配置见 data/sticker_reply.json，素材目录见 data/stickers/<标签>/）
+        self.sticker_reply_config = load_sticker_reply_config()
+        sticker_prompt = ""
+        if self.sticker_reply_config is not None:
+            sticker_prompt_path = Path(__file__).parent.parent.parent / "prompts" / "sticker_reply.md"
+            if sticker_prompt_path.exists():
+                sticker_prompt = sticker_prompt_path.read_text(encoding="utf-8")
+            else:
+                self.logger.error("[StickerReply] 缺少 prompts/sticker_reply.md，表情包回复不启用")
+                self.sticker_reply_config = None
+        self.sticker_policy: Optional[StickerPolicy] = (
+            StickerPolicy(self.sticker_reply_config) if self.sticker_reply_config is not None else None
+        )
+        if self.sticker_reply_config is not None:
+            mode = "dry_run（只记日志）" if self.sticker_reply_config.dry_run else "正式发送"
+            tags = self.sticker_policy.available_tags() if self.sticker_policy else []
+            print(f"  • 表情包回复: 已启用，{mode}（可用标签: {', '.join(tags) if tags else '无'}）")
         self.generator = ReplyGenerator(
             llm_client=actual_llm,
             memory_engine=self.memory_engine,
@@ -248,6 +266,8 @@ class WeChatBot:
             enable_timestamps=True,
             voice_prompt=voice_prompt,
             group_config=self.group_config,
+            sticker_prompt=sticker_prompt,
+            sticker_tags_provider=self.sticker_policy.available_tags if self.sticker_policy is not None else None,
         )
         self.generator._system_prompt()  # persona 占位符（BOT_NAME 等）未配置时启动即报错
         self.sender = WeChatMessageSender(silent_mode=os.environ.get("WECHAT_SILENT_MODE") == "1")
@@ -938,7 +958,60 @@ class WeChatBot:
                         # 主动场合发原回复（保留 @）；要听语音时原回复是拒绝，改发答应的那句
                         if decision.scene == "要听语音":
                             replies = [decision.text]
-            for i, reply in enumerate([] if voiced else replies):
+            sticker_policy = getattr(self, "sticker_policy", None)
+            sticker_config = getattr(self, "sticker_reply_config", None)
+            sticker_allowed = (
+                sticker_policy is not None
+                and sticker_config is not None
+                and is_group
+                and self._group_feature_enabled(chat_name, "sticker_reply", True)
+            )
+            sticker_decision = None
+            sticker_replaced = False
+            sticker_sent = False
+            if sticker_allowed:
+                sticker_decision = sticker_policy.decide(
+                    chat_name,
+                    replies,
+                    getattr(self.generator, "last_sticker_meta", None),
+                    voiced=voiced,
+                    now=datetime.now(),
+                )
+                self.logger.info(
+                    "[StickerReply] chat=%s tag=%s mode=%s decision=%s reason=%s",
+                    chat_name,
+                    sticker_decision.tag or "-",
+                    sticker_decision.mode or "-",
+                    "发" if sticker_decision.send_sticker else "不发",
+                    sticker_decision.reason,
+                )
+                if sticker_decision.send_sticker and sticker_config.dry_run:
+                    self.logger.info(
+                        "[StickerReply] 本会发表情: mode=%s tag=%s file=%s",
+                        sticker_decision.mode,
+                        sticker_decision.tag,
+                        sticker_decision.image_path,
+                    )
+                elif sticker_decision.send_sticker and sticker_decision.mode == "replace" and sticker_decision.image_path:
+                    img_result = self._send_image(chat_name, sticker_decision.image_path)
+                    if img_result.success:
+                        sticker_replaced = True
+                        sticker_sent = True
+                        tagged = f"[表情包: {sticker_decision.tag}]"
+                        sent_replies.append(tagged)
+                        self.logger.log_send(tick_id, success=True, text=tagged)
+                        self.debug_logger.log_action("send", action_input=tagged, success=True)
+                        chat_state = self.global_store.chats.get(chat_name)
+                        if chat_state is not None:
+                            chat_state.pending_self_messages.append(ChatMessage(
+                                text=tagged, sender="自己", sender_type=SenderType.SELF,
+                                chat_name=chat_name, replied=True, reply_text=tagged,
+                                reply_time=time.time(), message_type="text",
+                            ))
+                    else:
+                        self.logger.warning("[StickerReply] 替代模式发图失败，回退发文字: %s", img_result.error)
+
+            for i, reply in enumerate([] if (voiced or sticker_replaced) else replies):
                 action_result = self._send_text(chat_name, reply)
                 if action_result.success:
                     sent_replies.append(reply)
@@ -970,8 +1043,46 @@ class WeChatBot:
                 if i < len(replies) - 1:
                     time.sleep(1.5)
 
+            if (
+                sticker_allowed
+                and not voiced
+                and not sticker_replaced
+                and sent_replies
+                and not send_failed
+                and not send_skipped
+                and sticker_decision is not None
+                and sticker_decision.send_sticker
+                and sticker_decision.mode == "append"
+                and not sticker_config.dry_run
+                and sticker_decision.image_path is not None
+            ):
+                time.sleep(0.8)
+                img_result = self._send_image(chat_name, sticker_decision.image_path)
+                if img_result.success:
+                    sticker_sent = True
+                    tagged = f"[表情包: {sticker_decision.tag}]"
+                    sent_replies.append(tagged)
+                    self.logger.log_send(tick_id, success=True, text=tagged)
+                    self.debug_logger.log_action("send", action_input=tagged, success=True)
+                    chat_state = self.global_store.chats.get(chat_name)
+                    if chat_state is not None:
+                        chat_state.pending_self_messages.append(ChatMessage(
+                            text=tagged, sender="自己", sender_type=SenderType.SELF,
+                            chat_name=chat_name, replied=True, reply_text=tagged,
+                            reply_time=time.time(), message_type="text",
+                        ))
+                else:
+                    self.logger.warning("[StickerReply] 追加表情包发送失败: %s", img_result.error)
+
             if self.voice_policy is not None and is_group and sent_replies:
                 self.voice_policy.record_sent(chat_name, voiced)
+            if sticker_allowed and sent_replies:
+                sticker_policy.record_sent(
+                    chat_name,
+                    image_path=sticker_decision.image_path if (sticker_sent and sticker_decision) else None,
+                    sent=sticker_sent,
+                    now=datetime.now(),
+                )
             if sent_replies and getattr(self.generator, "last_go_online", False):
                 self._start_online_silence(chat_name, to_reply)
 

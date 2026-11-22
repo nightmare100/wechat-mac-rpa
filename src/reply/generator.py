@@ -277,11 +277,16 @@ class ReplyGenerator:
                  enable_unread_dedup: bool = True,
                  enable_timestamps: bool = True,
                  voice_prompt: str = "",
-                 group_config=None):
+                 group_config=None,
+                 sticker_prompt: str = "",
+                 sticker_tags_provider=None):
         self.llm_client = llm_client
         self.voice_prompt = voice_prompt  # 回复语音：启用时追加到群聊 system prompt（见 src/reply/voice_policy.py）
+        self.sticker_prompt = sticker_prompt  # 表情包提示词模板（见 src/reply/sticker_policy.py）
+        self.sticker_tags_provider = sticker_tags_provider  # 可调用对象，动态返回可用表情标签列表
         self.group_config = group_config  # 可选按群开关覆写（见 src/bot/group_config.py）
         self.last_voice_meta: Optional[Dict] = None
+        self.last_sticker_meta: Optional[Dict] = None
         self.last_go_online: bool = False  # 本次回复是否答应朧月上线（触发静默）
         self.last_chime_in: bool = False  # 本次回复 LLM 是否标了主动插话
         self.last_chime_in_dropped: bool = False  # 本次是否有主动插话因冷却被丢弃（bot 记录原因用）
@@ -926,6 +931,9 @@ class ReplyGenerator:
                     if replies and self.voice_prompt and self.last_voice_meta is None:
                         from src.reply.voice_policy import parse_voice_meta
                         self.last_voice_meta = parse_voice_meta((self._extract_json(text) or {}).get("voice"))
+                    if replies and self.sticker_prompt and self.last_sticker_meta is None:
+                        from src.reply.sticker_policy import parse_sticker_meta
+                        self.last_sticker_meta = parse_sticker_meta((self._extract_json(text) or {}).get("sticker"))
                     if replies:
                         _logger.info("[Generate] deepseek 直接生成 replies=%d 条", len(replies))
                         self.last_llm_calls = llm_calls
@@ -988,6 +996,7 @@ class ReplyGenerator:
         t_generate_start = time.time()
         self.last_generation_failed = False
         self.last_voice_meta = None
+        self.last_sticker_meta = None
         self.last_go_online = False
         self.last_chime_in = False
         self.last_chime_in_dropped = False
@@ -1066,6 +1075,12 @@ class ReplyGenerator:
         )
         if is_group and self.voice_prompt and self.is_voice_reply_enabled(chat_name):
             system_prompt += "\n\n" + self.voice_prompt
+        if is_group and self.sticker_prompt and self.is_sticker_reply_enabled(chat_name):
+            from src.reply.sticker_policy import render_sticker_prompt
+            tags = self.sticker_tags_provider() if callable(self.sticker_tags_provider) else []
+            rendered_sticker = render_sticker_prompt(self.sticker_prompt, tags)
+            if rendered_sticker:
+                system_prompt += "\n\n" + rendered_sticker
 
         tools_context = self._build_tools_context(chat_name)
 
@@ -1184,11 +1199,15 @@ class ReplyGenerator:
                         if self.voice_prompt:
                             from src.reply.voice_policy import parse_voice_meta
                             self.last_voice_meta = parse_voice_meta((parsed_iterate or {}).get("voice"))
+                        if self.sticker_prompt:
+                            from src.reply.sticker_policy import parse_sticker_meta
+                            self.last_sticker_meta = parse_sticker_meta((parsed_iterate or {}).get("sticker"))
                     elif valid_empty_iterate:
                         current_replies = []
                         current_messages = new_messages
                         revised_ok = True
                         self.last_voice_meta = None
+                        self.last_sticker_meta = None
                         self.last_go_online = False
                         self.last_chime_in = False
                         _logger.info("[SelfRefine] Iterate 决策不回复（空 replies）")
@@ -1204,6 +1223,7 @@ class ReplyGenerator:
                     _logger.warning("[SelfRefine] 存在阻断性问题且未完成修订，拦截原回复: %s", issues)
                     current_replies = []
                     self.last_voice_meta = None
+                    self.last_sticker_meta = None
                     self.last_go_online = False
                     self.last_chime_in = False
 
@@ -1245,6 +1265,11 @@ class ReplyGenerator:
         if self.group_config is not None and chat_name:
             return self.group_config.is_enabled(chat_name, "voice_reply", default=bool(self.voice_prompt))
         return bool(self.voice_prompt)
+
+    def is_sticker_reply_enabled(self, chat_name: str = "") -> bool:
+        if self.group_config is not None and chat_name:
+            return self.group_config.is_enabled(chat_name, "sticker_reply", default=bool(self.sticker_prompt))
+        return bool(self.sticker_prompt)
 
     def chime_in_allowed(self, chat_name: str) -> bool:
         return self.is_chime_in_enabled(chat_name) and (
