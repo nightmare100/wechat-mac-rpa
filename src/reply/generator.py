@@ -85,10 +85,13 @@ def _apply_at_policy(replies: List[str], keep_rate: Optional[float] = AT_KEEP_RA
     return result
 
 
-# 接话轮数：被 @ 或引用后随机给 2～4 轮不带 @ 的接话额度（主动插话的对象也是 2～4 轮），每接一次减 1，30 分钟没动静作废
-FOLLOWUP_ROUNDS = (2, 4)
-CHIME_FOLLOWUP_ROUNDS = (2, 4)
-FOLLOWUP_TTL_SECONDS = 1800
+# 接话轮数：被 @ 或引用后随机给 2～4 轮（30 分钟有效）；主动插话对象单独缩为 1～3 轮 + 5 分钟短窗口；
+# 每接一次减 1（不刷新 TTL）；从上次回复算起中间他人消息超过 3 条即失效。
+FOLLOWUP_ROUNDS = (2, 4)            # 被 @ / 引用：随机 2～4 轮
+CHIME_FOLLOWUP_ROUNDS = (1, 3)      # 主动插话：随机 1～3 轮
+FOLLOWUP_TTL_SECONDS = 600         # 被 @ / 引用：30 分钟有效（秒）
+CHIME_FOLLOWUP_TTL_SECONDS = 300    # 主动插话：5 分钟有效（秒）
+FOLLOWUP_MAX_OTHER_MESSAGES = 5     # 从上次回复算起，中间他人消息超过 3 条即失效
 
 
 def _same_person(a: str, b: str) -> bool:
@@ -139,26 +142,55 @@ def _quotes_self(msg: ChatMessage, history: List[ChatMessage]) -> bool:
 class FollowupTracker:
     def __init__(self, rounds: Tuple[int, int] = FOLLOWUP_ROUNDS, ttl: float = FOLLOWUP_TTL_SECONDS,
                  randint: Callable[[int, int], int] = random.randint, now: Callable[[], float] = time.time,
-                 chime_rounds: Tuple[int, int] = CHIME_FOLLOWUP_ROUNDS):
+                 chime_rounds: Tuple[int, int] = CHIME_FOLLOWUP_ROUNDS,
+                 chime_ttl: float = CHIME_FOLLOWUP_TTL_SECONDS,
+                 max_other_messages: int = FOLLOWUP_MAX_OTHER_MESSAGES):
         self.rounds, self.ttl, self.randint, self.now = rounds, ttl, randint, now
         self.chime_rounds = chime_rounds
+        self.chime_ttl = chime_ttl
+        self.max_other_messages = max_other_messages
         self.keyword_targets: Dict[str, set] = {}  # 仅明确 @Bot/引用 Bot 建立的检索资格
-        self.threads: Dict[str, Dict[str, list]] = {}  # chat -> sender -> [remaining, updated_at]
+        self.threads: Dict[str, Dict[str, list]] = {}  # chat -> sender -> [remaining, opened_at, ttl]
 
     def _find(self, chat: str, sender: str) -> Optional[str]:
         return next((k for k in self.threads.get(chat, {}) if _same_person(k, sender)), None)
 
-    def candidates(self, chat: str) -> List[Tuple[str, int]]:
-        now = self.now()
-        return [(s, r) for s, (r, t) in self.threads.get(chat, {}).items() if r > 0 and now - t <= self.ttl]
+    def _other_messages_since_last_self(self, sender: str, history: Optional[List[ChatMessage]]) -> int:
+        if not history:
+            return 0
+        last_self_idx = -1
+        for i in range(len(history) - 1, -1, -1):
+            if history[i].sender_type == SenderType.SELF:
+                last_self_idx = i
+                break
+        if last_self_idx < 0:
+            return 0
+        return sum(
+            1 for m in history[last_self_idx + 1:]
+            if m.sender_type == SenderType.OTHER and not _same_person(m.sender, sender)
+        )
 
-    def keyword_candidates(self, chat: str) -> List[Tuple[str, int]]:
+    def candidates(self, chat: str, history: Optional[List[ChatMessage]] = None) -> List[Tuple[str, int]]:
+        now = self.now()
+        result: List[Tuple[str, int]] = []
+        for s, entry in self.threads.get(chat, {}).items():
+            r = entry[0]
+            opened_at = entry[1]
+            entry_ttl = entry[2] if len(entry) >= 3 else self.ttl
+            if r <= 0 or now - opened_at > entry_ttl:
+                continue
+            if history and self._other_messages_since_last_self(s, history) > self.max_other_messages:
+                continue
+            result.append((s, r))
+        return result
+
+    def keyword_candidates(self, chat: str, history: Optional[List[ChatMessage]] = None) -> List[Tuple[str, int]]:
         eligible = self.keyword_targets.get(chat, set())
-        return [(sender, rounds) for sender, rounds in self.candidates(chat) if sender in eligible]
+        return [(sender, rounds) for sender, rounds in self.candidates(chat, history=history) if sender in eligible]
 
     def record(self, chat: str, unreplied: List[ChatMessage], replies: List[str], fresh_targets=(),
                history: Optional[List[ChatMessage]] = None) -> None:
-        """fresh_targets：放行的主动插话对象，和被 @ 一样给新的接话额度。"""
+        """fresh_targets：放行的主动插话对象，给独立短窗口和较少轮数；消费轮数时不刷新 TTL。"""
         for reply in replies:
             target = _reply_target(reply, unreplied)
             if not target:
@@ -174,7 +206,7 @@ class FollowupTracker:
                 eligible = self.keyword_targets.setdefault(chat, set())
                 # 主动插话不能建立关键词检索资格；资格只来自明确 @ 或引用我。
                 direct = any(is_at_bot(u.text) or _quotes_self(u, history or []) for u in msgs)
-                inherited = any(s == key for s, _ in self.keyword_candidates(chat))
+                inherited = any(s == key for s, _ in self.keyword_candidates(chat, history=history))
                 if key:
                     eligible.discard(key)
                 if direct or (inherited and not fresh):
@@ -184,9 +216,19 @@ class FollowupTracker:
                 if key:
                     del chat_threads[key]
                 rounds = self.rounds if triggered else self.chime_rounds
-                chat_threads[target] = [self.randint(*rounds), self.now()]
+                entry_ttl = self.ttl if triggered else self.chime_ttl
+                assigned = self.randint(*rounds)
+                if assigned > 0:
+                    chat_threads[target] = [assigned, self.now(), entry_ttl]
             elif key and chat_threads[key][0] > 0:
-                chat_threads[key] = [chat_threads[key][0] - 1, self.now()]
+                entry = chat_threads[key]
+                entry_ttl = entry[2] if len(entry) >= 3 else self.ttl
+                remaining = entry[0] - 1
+                if remaining > 0:
+                    chat_threads[key] = [remaining, entry[1], entry_ttl]
+                else:
+                    del chat_threads[key]
+                    self.keyword_targets.get(chat, set()).discard(key)
 
 
 # 开头「哈哈」「嘿嘿」冷却：最近 N 条自己发的消息里有以它开头的，本次回复去掉开头的笑声
@@ -1324,7 +1366,7 @@ class ReplyGenerator:
     def _has_reply_trigger(self, chat_name: str, unreplied: List[ChatMessage],
                            history: Optional[List[ChatMessage]] = None) -> bool:
         """这些消息里有现有触发（@ 我、提到我、引用、接话名单里的人），对应回复不算主动插话。"""
-        candidates = [s for s, _ in self.followup.candidates(chat_name)]
+        candidates = [s for s, _ in self.followup.candidates(chat_name, history=history)]
         return any(
             mentions_bot(m.text) or _quotes_self(m, history or [])
             or any(_same_person(m.sender, s) for s in candidates)
@@ -1858,7 +1900,7 @@ class ReplyGenerator:
         if is_group:
             followup_items = [
                 f'<candidate sender="{xml_escape(s, quote=True)}" remaining_rounds="{r}"/>'
-                for s, r in self.followup.candidates(chat_name)
+                for s, r in self.followup.candidates(chat_name, history=all_messages)
             ]
             if followup_items:
                 sections.append("<followup_candidates>\n" + "\n".join(followup_items) + "\n</followup_candidates>")

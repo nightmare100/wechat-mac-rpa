@@ -109,3 +109,41 @@ def test_chime_in_target_gets_fewer_rounds_than_at():
     t.record("g", [_m("得闲射击", "100 抽 5 件套")], ["@得闲射击 欧皇"], fresh_targets={"得闲射击"})
     t.record("g", [_m("相缺", "@『宵桜』囡囡 在吗")], ["@相缺 在哒"])
     assert dict(t.candidates("g")) == {"得闲射击": 2, "相缺": 3}
+
+
+def test_chime_in_defaults_to_short_rounds_and_independent_ttl():
+    clock = [1000.0]
+    t = FollowupTracker(now=lambda: clock[0])
+    t.record("g", [_m("得闲射击", "100 抽 5 件套")], ["@得闲射击 欧皇"], fresh_targets={"得闲射击"})
+    t.record("g", [_m("相缺", "@『宵桜』囡囡 在吗")], ["@相缺 在哒"])
+    cands = dict(t.candidates("g"))
+    assert 1 <= cands["得闲射击"] <= 3
+    assert 2 <= cands["相缺"] <= 4
+    # 5 分钟内仍可接话，超过 5 分钟（300s）主动插话窗口失效，@ 窗口（1800s）仍有效
+    clock[0] += 301.0
+    cands_after = dict(t.candidates("g"))
+    assert "得闲射击" not in cands_after
+    assert "相缺" in cands_after
+
+
+def test_consuming_round_does_not_refresh_ttl_and_clears_at_zero():
+    clock = [1000.0]
+    t = FollowupTracker(randint=lambda a, b: 2, now=lambda: clock[0], ttl=600.0)
+    t.record("g", [_m("相缺", "@『宵桜』囡囡 在吗")], ["@相缺 在哒"])
+    clock[0] += 500.0
+    t.record("g", [_m("相缺", "继续聊")], ["@相缺 嗯嗯"])
+    assert t.candidates("g") == [("相缺", 1)]
+    # 若错误刷新了 TTL，再过 200s 仍会有效；不刷新 TTL 时总耗时 700s > 600s 应已过期
+    clock[0] += 200.0
+    assert t.candidates("g") == []
+
+
+def test_other_messages_over_limit_invalidates_followup_candidate():
+    clock = [1000.0]
+    t = FollowupTracker(randint=lambda a, b: a, now=lambda: clock[0])
+    t.record("g", [_m("得闲射击", "100 抽 5 件套")], ["@得闲射击 欧皇"], fresh_targets={"得闲射击"})
+    self_msg = ChatMessage(text="@得闲射击 欧皇", sender="自己", sender_type=SenderType.SELF, chat_name="g")
+    three_others = [self_msg, _m("乙", "1"), _m("丙", "2"), _m("丁", "3"), _m("得闲射击", "哈哈")]
+    assert t.candidates("g", history=three_others) == [("得闲射击", 1)]
+    four_others = [self_msg, _m("乙", "1"), _m("丙", "2"), _m("丁", "3"), _m("戊", "4"), _m("得闲射击", "哈哈")]
+    assert t.candidates("g", history=four_others) == []
