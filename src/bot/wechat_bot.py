@@ -258,6 +258,8 @@ class WeChatBot:
             mode = "dry_run（只记日志）" if self.sticker_reply_config.dry_run else "正式发送"
             tags = self.sticker_policy.available_tags() if self.sticker_policy else []
             print(f"  • 表情包回复: 已启用，{mode}（可用标签: {', '.join(tags) if tags else '无'}）")
+        from src.reply.relationship_store import RelationshipEngine
+        self.relationship_engine = RelationshipEngine()
         self.generator = ReplyGenerator(
             llm_client=actual_llm,
             memory_engine=self.memory_engine,
@@ -268,6 +270,7 @@ class WeChatBot:
             group_config=self.group_config,
             sticker_prompt=sticker_prompt,
             sticker_tags_provider=self.sticker_policy.available_tags if self.sticker_policy is not None else None,
+            relationship_engine=self.relationship_engine,
         )
         self.generator._system_prompt()  # persona 占位符（BOT_NAME 等）未配置时启动即报错
         self.sender = WeChatMessageSender(silent_mode=os.environ.get("WECHAT_SILENT_MODE") == "1")
@@ -1087,6 +1090,17 @@ class WeChatBot:
                 )
             if sent_replies and getattr(self.generator, "last_go_online", False):
                 self._start_online_silence(chat_name, to_reply)
+            if sent_replies and getattr(self, "relationship_engine", None) is not None:
+                try:
+                    chatroom_id = next(
+                        (getattr(m, "chatroom_id", None) for m in to_reply if getattr(m, "chatroom_id", None)),
+                        None,
+                    )
+                    self.relationship_engine.record_replies(
+                        chat_name, to_reply, sent_replies, chatroom_id=chatroom_id
+                    )
+                except Exception as e:
+                    self.logger.warning("[Relationship] 记录互动失败: %s", e)
 
             self._update_tick_send_result(
                 tick_id,

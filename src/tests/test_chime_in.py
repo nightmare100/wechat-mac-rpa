@@ -256,11 +256,13 @@ def test_chime_followup_rounds_and_blocked_after_other_messages():
     assert _run(gen, _m("得闲射击", "再来一把")) == []
     assert gen.last_chime_in_dropped is True
 
-    # 重新放行一次插话后，若中间插了 4 条其他人的消息，冷却期内也不允许免 CD 接话
+    # 重新放行一次插话后，若中间插了超过上限的其他人消息，冷却期内也不允许免 CD 接话
+    from src.reply.generator import FOLLOWUP_MAX_OTHER_MESSAGES
+
     gen.chime_in_last["群"] -= gen.chime_in_cooldown + 1
     assert _run(gen, _m("得闲射击", "又出货了"))
     self_msg = ChatMessage(text="@得闲射击 欧皇", sender="自己", sender_type=SenderType.SELF, chat_name="群")
     next_msg = _m("得闲射击", "顺便问下")
-    history = [self_msg, _m("乙", "1"), _m("丙", "2"), _m("丁", "3"), _m("戊", "4"), next_msg]
+    history = [self_msg] + [_m(f"路人{i}", str(i)) for i in range(FOLLOWUP_MAX_OTHER_MESSAGES + 1)] + [next_msg]
     assert gen.generate([next_msg], history, is_group=True) == []
     assert gen.last_chime_in_dropped is True

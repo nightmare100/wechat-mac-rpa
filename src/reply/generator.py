@@ -321,12 +321,14 @@ class ReplyGenerator:
                  voice_prompt: str = "",
                  group_config=None,
                  sticker_prompt: str = "",
-                 sticker_tags_provider=None):
+                 sticker_tags_provider=None,
+                 relationship_engine=None):
         self.llm_client = llm_client
         self.voice_prompt = voice_prompt  # 回复语音：启用时追加到群聊 system prompt（见 src/reply/voice_policy.py）
         self.sticker_prompt = sticker_prompt  # 表情包提示词模板（见 src/reply/sticker_policy.py）
         self.sticker_tags_provider = sticker_tags_provider  # 可调用对象，动态返回可用表情标签列表
         self.group_config = group_config  # 可选按群开关覆写（见 src/bot/group_config.py）
+        self.relationship_engine = relationship_engine  # 可选持久化关系引擎（见 src/reply/relationship_store.py）
         self.last_voice_meta: Optional[Dict] = None
         self.last_sticker_meta: Optional[Dict] = None
         self.last_go_online: bool = False  # 本次回复是否答应朧月上线（触发静默）
@@ -1165,7 +1167,10 @@ class ReplyGenerator:
             from src.reply.relationship import describe_relationship
             unread_ids = {id(message) for message in unreplied}
             relation = describe_relationship(
-                unreplied, [message for message in all_messages if id(message) not in unread_ids]
+                unreplied,
+                [message for message in all_messages if id(message) not in unread_ids],
+                engine=self.relationship_engine,
+                chat_name=chat_name,
             )
             persona_id = ""
             version = re.search(r'<instructions version="([^"]+)"', system_prompt)
@@ -1764,11 +1769,16 @@ class ReplyGenerator:
             f"<chat_type>{'group' if is_group else 'private'}</chat_type>",
             f"<mentioned>{str(is_at).lower()}</mentioned>",
         ]
-        from src.reply.relationship import describe_relationship
+        from src.reply.relationship import describe_relationships
         unread_ids = {id(message) for message in unreplied}
-        relation = describe_relationship(unreplied, [message for message in all_messages if id(message) not in unread_ids])
-        if relation is not None:
-            person, level, rules = relation
+        relations = describe_relationships(
+            unreplied,
+            [message for message in all_messages if id(message) not in unread_ids],
+            engine=self.relationship_engine,
+            chat_name=chat_name,
+            max_people=3,
+        )
+        for person, level, rules in relations:
             session_fields.append(
                 f'<relationship person="{xml_escape(person, quote=True)}" level="{level}">'
                 f"{xml_escape(rules)}</relationship>"

@@ -139,11 +139,13 @@ def test_consuming_round_does_not_refresh_ttl_and_clears_at_zero():
 
 
 def test_other_messages_over_limit_invalidates_followup_candidate():
+    from src.reply.generator import FOLLOWUP_MAX_OTHER_MESSAGES
+
     clock = [1000.0]
     t = FollowupTracker(randint=lambda a, b: a, now=lambda: clock[0])
     t.record("g", [_m("得闲射击", "100 抽 5 件套")], ["@得闲射击 欧皇"], fresh_targets={"得闲射击"})
     self_msg = ChatMessage(text="@得闲射击 欧皇", sender="自己", sender_type=SenderType.SELF, chat_name="g")
-    three_others = [self_msg, _m("乙", "1"), _m("丙", "2"), _m("丁", "3"), _m("得闲射击", "哈哈")]
-    assert t.candidates("g", history=three_others) == [("得闲射击", 1)]
-    four_others = [self_msg, _m("乙", "1"), _m("丙", "2"), _m("丁", "3"), _m("戊", "4"), _m("得闲射击", "哈哈")]
-    assert t.candidates("g", history=four_others) == []
+    at_limit = [self_msg] + [_m(f"路人{i}", str(i)) for i in range(FOLLOWUP_MAX_OTHER_MESSAGES)] + [_m("得闲射击", "哈哈")]
+    assert t.candidates("g", history=at_limit) == [("得闲射击", 1)]
+    over_limit = [self_msg] + [_m(f"路人{i}", str(i)) for i in range(FOLLOWUP_MAX_OTHER_MESSAGES + 1)] + [_m("得闲射击", "哈哈")]
+    assert t.candidates("g", history=over_limit) == []
