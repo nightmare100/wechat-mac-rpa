@@ -259,7 +259,15 @@ class WeChatBot:
             tags = self.sticker_policy.available_tags() if self.sticker_policy else []
             print(f"  • 表情包回复: 已启用，{mode}（可用标签: {', '.join(tags) if tags else '无'}）")
         from src.reply.relationship_store import RelationshipEngine
+        from src.reply.relationship_evaluator import RelationshipEvaluator
         self.relationship_engine = RelationshipEngine()
+        enable_rel_eval = os.environ.get("ENABLE_RELATIONSHIP_EVALUATOR", "1").strip().lower() in ("1", "true", "yes", "on")
+        self.relationship_evaluator: Optional[RelationshipEvaluator] = (
+            RelationshipEvaluator(self.relationship_engine, llm_client=actual_llm)
+            if (enable_rel_eval and actual_llm is not None) else None
+        )
+        if self.relationship_evaluator is not None:
+            self.relationship_evaluator.start()
         self.generator = ReplyGenerator(
             llm_client=actual_llm,
             memory_engine=self.memory_engine,
@@ -1099,6 +1107,11 @@ class WeChatBot:
                     self.relationship_engine.record_replies(
                         chat_name, to_reply, sent_replies, chatroom_id=chatroom_id
                     )
+                    rel_eval = getattr(self, "relationship_evaluator", None)
+                    if rel_eval is not None:
+                        rel_eval.enqueue_replies(
+                            chat_name, to_reply, sent_replies, chatroom_id=chatroom_id
+                        )
                 except Exception as e:
                     self.logger.warning("[Relationship] 记录互动失败: %s", e)
 
