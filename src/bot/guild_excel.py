@@ -1,8 +1,10 @@
 """Scoped group command for compiling guild screenshots into an Excel file."""
 
+import difflib
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -21,6 +23,25 @@ from src.perception.tracememo_pipeline import TraceMemoError
 
 _LOGGER = logging.getLogger(__name__)
 _COMMAND = re.compile(r"请读取(.+?)的图片\s*[,，]\s*工作表\s*[:：](.*?)\s*[,，]\s*最终输出\s*[:：](.*)")
+_EDIT_COMMAND = re.compile(
+    r"请修改\s*(.+?)\s*(?:[,，]\s*|\s+)工作表\s*[:：]\s*(.*?)\s*[,，]\s*把\s*(.+)\s*的\s*(战力|魔物分数|魔物得分)\s*改为\s*(.+)"
+)
+_NUMBER_RE = re.compile(r"^([+-]?\d+(?:\.\d+)?)\s*(k|m|b|t|w|千|万|百万|亿|十亿|万亿)?$", re.IGNORECASE)
+_UNIT_MULTIPLIERS = {
+    "": 1.0,
+    "k": 1e3,
+    "千": 1e3,
+    "w": 1e4,
+    "万": 1e4,
+    "m": 1e6,
+    "百万": 1e6,
+    "亿": 1e8,
+    "b": 1e9,
+    "十亿": 1e9,
+    "t": 1e12,
+    "万亿": 1e12,
+}
+_CLEAR_TOKENS = {"空", "清空", "无", "null", "none"}
 _SKILL = Path.home() / ".agents/skills/guild-monster-excel"
 _OUTBOX = Path(__file__).resolve().parents[2] / "data" / "guild_excel" / "outbox"
 _WINDOW_MINUTES = 20
@@ -44,6 +65,74 @@ class GuildExcelRequest:
     filename: str
 
 
+@dataclass(frozen=True)
+class GuildExcelEditRequest:
+    filename: str
+    sheet: str
+    nickname: str
+    field: str  # "power" or "score"
+    value: float | None
+
+
+def _validate_sheet(sheet: str) -> str:
+    if not sheet or len(sheet) > 31 or re.search(r"[\\/*?:\[\]\x00-\x1f]", sheet) or sheet.startswith("'") or sheet.endswith("'"):
+        raise GuildExcelError("工作表名须为 1–31 个字符，且符合 Excel 命名规则。")
+    return sheet
+
+
+def _validate_filename(filename: str) -> str:
+    if not filename or len(filename.encode("utf-8")) > 180 or re.search(r'[<>:"/\\|?*\x00-\x1f]', filename) or filename.startswith(".") or filename.endswith("."):
+        raise GuildExcelError("请填写 Excel 文件名，不能包含路径。")
+    if not filename.lower().endswith(".xlsx"):
+        filename += ".xlsx"
+    return filename
+
+
+def _format_power(value: float | None) -> str | None:
+    return None if value is None else f"{value / 10**6:.2f}m"
+
+
+def _format_score(value: float | None) -> str | None:
+    if value is not None and value >= 10**12:
+        return f"{value / 10**12:.2f}t"
+    if value is not None and value >= 10**9:
+        return f"{value / 10**9:.2f}b"
+    return _format_power(value)
+
+
+def parse_numeric_value(raw: str) -> float | None:
+    text = (raw or "").strip().replace(",", "").replace("，", "")
+    if not text:
+        raise GuildExcelError("数值不能为空，请输入有效的非负数字（可带 k/m/b/t/万/亿 等单位）。")
+    if text.casefold() in _CLEAR_TOKENS:
+        return None
+    match = _NUMBER_RE.fullmatch(text)
+    if match is None:
+        raise GuildExcelError("数值格式不正确，请输入有效的非负数字（可带 k/m/b/t/万/亿 等单位）。")
+    base = float(match.group(1))
+    unit = (match.group(2) or "").lower()
+    value = base * _UNIT_MULTIPLIERS[unit]
+    if not math.isfinite(value) or value < 0:
+        raise GuildExcelError("数值必须为非负有限数字。")
+    return value
+
+
+def _parse_cell_number(val) -> float | None:
+    if val is None:
+        return None
+    if isinstance(val, bool):
+        return None
+    if isinstance(val, (int, float)):
+        return float(val) if math.isfinite(val) else None
+    text = str(val).strip()
+    if not text:
+        return None
+    try:
+        return parse_numeric_value(text)
+    except GuildExcelError:
+        return None
+
+
 def parse_command(text: str) -> GuildExcelRequest | None:
     match = _COMMAND.fullmatch((text or "").strip())
     if match is None:
@@ -51,13 +140,23 @@ def parse_command(text: str) -> GuildExcelRequest | None:
     nickname, sheet, filename = (field.strip() for field in match.groups())
     if not nickname or len(nickname) > 80 or any(ord(c) < 32 for c in nickname):
         raise GuildExcelError("请填写群友的完整昵称。")
-    if not sheet or len(sheet) > 31 or re.search(r"[\\/*?:\[\]\x00-\x1f]", sheet) or sheet.startswith("'") or sheet.endswith("'"):
-        raise GuildExcelError("工作表名须为 1–31 个字符，且符合 Excel 命名规则。")
-    if not filename or len(filename.encode("utf-8")) > 180 or re.search(r'[<>:"/\\|?*\x00-\x1f]', filename) or filename.startswith(".") or filename.endswith("."):
-        raise GuildExcelError("请填写 Excel 文件名，不能包含路径。")
-    if not filename.lower().endswith(".xlsx"):
-        filename += ".xlsx"
+    sheet = _validate_sheet(sheet)
+    filename = _validate_filename(filename)
     return GuildExcelRequest(nickname, sheet, filename)
+
+
+def parse_edit_command(text: str) -> GuildExcelEditRequest | None:
+    match = _EDIT_COMMAND.fullmatch((text or "").strip())
+    if match is None:
+        return None
+    filename, sheet, nickname, field_label, raw_value = (part.strip() for part in match.groups())
+    filename = _validate_filename(filename)
+    sheet = _validate_sheet(sheet)
+    if not nickname or len(nickname) > 80 or any(ord(c) < 32 for c in nickname):
+        raise GuildExcelError("请填写要修改的成员昵称关键词。")
+    field = "power" if field_label == "战力" else "score"
+    value = parse_numeric_value(raw_value)
+    return GuildExcelEditRequest(filename, sheet, nickname, field, value)
 
 
 def select_images(messages, command: ChatMessage, nickname: str) -> list[ChatMessage]:
@@ -243,6 +342,115 @@ def _drop_existing_sheet(path: Path, sheet_name: str) -> None:
         book.close()
 
 
+def _normalize_fuzzy(text: str) -> str:
+    return re.sub(r"\s+", "", text.strip().casefold())
+
+
+def _is_subsequence(needle: str, haystack: str) -> bool:
+    it = iter(haystack)
+    return all(ch in it for ch in needle)
+
+
+def _fuzzy_match_member(query: str, members: list[tuple[int, str]], sheet_name: str) -> tuple[int, str]:
+    q_fold = query.strip().casefold()
+    q_compact = _normalize_fuzzy(query)
+    if not q_compact:
+        raise GuildExcelError("请填写要修改的成员昵称关键词。")
+
+    exact = [(idx, name) for idx, name in members if name.strip().casefold() == q_fold]
+    if len(exact) == 1:
+        return exact[0]
+    if len(exact) > 1:
+        candidates = exact
+    else:
+        substring = [(idx, name) for idx, name in members if q_compact in _normalize_fuzzy(name)]
+        if len(substring) == 1:
+            return substring[0]
+        if len(substring) > 1:
+            candidates = substring
+        else:
+            subseq = (
+                [(idx, name) for idx, name in members if _is_subsequence(q_compact, _normalize_fuzzy(name))]
+                if len(q_compact) >= 2
+                else []
+            )
+            if len(subseq) == 1:
+                return subseq[0]
+            if len(subseq) > 1:
+                candidates = subseq
+            else:
+                scored = [
+                    (difflib.SequenceMatcher(None, q_compact, _normalize_fuzzy(name)).ratio(), idx, name)
+                    for idx, name in members
+                ]
+                similar = [(idx, name) for ratio, idx, name in sorted(scored, key=lambda x: -x[0]) if ratio >= 0.6]
+                if len(similar) == 1:
+                    return similar[0]
+                if len(similar) > 1:
+                    candidates = similar
+                else:
+                    raise GuildExcelError(f"在工作表「{sheet_name}」中未找到与「{query}」匹配的成员。")
+
+    preview = "、".join(name for _, name in candidates[:8])
+    suffix = f" 等共 {len(candidates)} 人" if len(candidates) > 8 else ""
+    raise GuildExcelError(f"「{query}」匹配到多个成员：{preview}{suffix}，请提供更具体的昵称。")
+
+
+def edit_workbook_file(path: Path, request: GuildExcelEditRequest) -> tuple[str, str, str, str]:
+    """修改指定工作表中模糊匹配到的成员战力或魔物得分，返回 (表名, 匹配成员名, 旧值文本, 新值文本)。"""
+    from openpyxl import load_workbook
+
+    book = load_workbook(path)
+    try:
+        target = next((n for n in book.sheetnames if n.casefold() == request.sheet.casefold()), None)
+        if target is None:
+            raise GuildExcelError(f"文件「{request.filename}」中未找到工作表「{request.sheet}」。")
+        sheet = book[target]
+        rows = [list(row) for row in sheet.iter_rows(values_only=True)]
+        if len(rows) <= 1:
+            raise GuildExcelError(f"工作表「{target}」中没有成员数据。")
+        data_rows = rows[1:]
+        members = [
+            (idx, str(row[0]).strip())
+            for idx, row in enumerate(data_rows)
+            if row and row[0] not in (None, "") and str(row[0]).strip()
+        ]
+        if not members:
+            raise GuildExcelError(f"工作表「{target}」中没有成员数据。")
+
+        matched_idx, matched_name = _fuzzy_match_member(request.nickname, members, target)
+        while len(data_rows[matched_idx]) < 3:
+            data_rows[matched_idx].append(None)
+
+        col_idx = 1 if request.field == "power" else 2
+        old_raw = data_rows[matched_idx][col_idx]
+        old_display = str(old_raw) if old_raw not in (None, "") else "空"
+        new_formatted = _format_power(request.value) if request.field == "power" else _format_score(request.value)
+        new_display = new_formatted if new_formatted is not None else "空"
+        data_rows[matched_idx][col_idx] = new_formatted
+
+        if request.field == "score":
+            keyed = []
+            for idx, row in enumerate(data_rows):
+                if idx == matched_idx:
+                    score_num = request.value
+                else:
+                    score_num = _parse_cell_number(row[2] if len(row) >= 3 else None)
+                keyed.append((score_num is None, -(score_num or 0.0), idx, row))
+            keyed.sort(key=lambda item: (item[0], item[1], item[2]))
+            for row_number, (_, _, _, row) in enumerate(keyed, start=2):
+                for col_number, cell_val in enumerate(row, start=1):
+                    sheet.cell(row_number, col_number, cell_val)
+                sheet.cell(row_number, 1).data_type = "s"
+        else:
+            sheet.cell(matched_idx + 2, 2, new_formatted)
+
+        book.save(path)
+        return target, matched_name, old_display, new_display
+    finally:
+        book.close()
+
+
 class GuildExcelFlow:
     """Append workbooks serially and deliver snapshots on the Bot's UI thread."""
 
@@ -256,7 +464,7 @@ class GuildExcelFlow:
         self.group_config = group_config
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="guild-excel")
         self.jobs: list[tuple[str, Future[Path]]] = []
-        self._job_meta: dict[Future[Path], tuple[str, int, str, str]] = {}
+        self._job_meta: dict[Future[Path], tuple[str, int, str, str, list[tuple[str, str]] | None]] = {}
 
     def _delivery_policy(self, origin_chat: str) -> tuple[int, str, str]:
         if self.group_config is None or not origin_chat:
@@ -274,24 +482,57 @@ class GuildExcelFlow:
             return None
         try:
             request = parse_command(message.text)
+            edit_request = None if request is not None else parse_edit_command(message.text)
         except GuildExcelError as exc:
             reply = str(exc)
         else:
-            if request is None:
+            if request is None and edit_request is None:
                 return None
-            if not message.chatroom_id or message.create_time is None:
-                reply = "无法确认当前群及指令时间，请使用 TraceMemo 模式。"
-            elif len(self.jobs) >= _MAX_PENDING_JOBS:
-                reply = "公会统计队列已满，请稍后再发指令。"
+            if request is not None:
+                if not message.chatroom_id or message.create_time is None:
+                    reply = "无法确认当前群及指令时间，请使用 TraceMemo 模式。"
+                elif len(self.jobs) >= _MAX_PENDING_JOBS:
+                    reply = "公会统计队列已满，请稍后再发指令。"
+                else:
+                    waiting = bool(self.jobs)
+                    future = self.executor.submit(self._append_workbook, request, message)
+                    min_sheets, target_chat, target_message = self._delivery_policy(chat_name)
+                    self._job_meta[future] = (request.sheet, min_sheets, target_chat, target_message, None)
+                    self.jobs.append((chat_name, future))
+                    reply = "收到，已排队，处理完成后会回发 Excel。" if waiting else "收到，正在识别图片并生成 Excel。"
             else:
-                waiting = bool(self.jobs)
-                future = self.executor.submit(self._append_workbook, request, message)
-                min_sheets, target_chat, target_message = self._delivery_policy(chat_name)
-                self._job_meta[future] = (request.sheet, min_sheets, target_chat, target_message)
-                self.jobs.append((chat_name, future))
-                reply = "收到，已排队，处理完成后会回发 Excel。" if waiting else "收到，正在识别图片并生成 Excel。"
+                if not message.chatroom_id:
+                    reply = "无法确认当前群，请使用 TraceMemo 模式。"
+                elif len(self.jobs) >= _MAX_PENDING_JOBS:
+                    reply = "公会统计队列已满，请稍后再发指令。"
+                else:
+                    waiting = bool(self.jobs)
+                    edit_box: list[tuple[str, str]] = []
+                    future = self.executor.submit(self._edit_workbook, edit_request, message, edit_box)
+                    min_sheets, target_chat, target_message = self._delivery_policy(chat_name)
+                    self._job_meta[future] = (edit_request.sheet, min_sheets, target_chat, target_message, edit_box)
+                    self.jobs.append((chat_name, future))
+                    reply = "收到，已排队，修改完成后会按群策略处理。" if waiting else "收到，正在修改 Excel。"
         self.send_text(chat_name, reply)
         return reply
+
+    def _publish_workbook(self, output: Path, workbook: Path, filename: str) -> Path:
+        # 先保存发送时的版本。后续任务只替换主工作簿，不修改已交给微信的文件。
+        self.outbox.mkdir(parents=True, exist_ok=True)
+        delivery_dir = Path(mkdtemp(prefix="job-", dir=self.outbox))
+        delivery_file = delivery_dir / filename
+        try:
+            shutil.copyfile(output, delivery_file)
+            workbook.parent.mkdir(parents=True, exist_ok=True)
+            with TemporaryDirectory(dir=workbook.parent, prefix=".update-") as stage:
+                staged_workbook = Path(stage) / filename
+                shutil.copyfile(output, staged_workbook)
+                os.replace(staged_workbook, workbook)
+        except OSError:
+            delivery_file.unlink(missing_ok=True)
+            delivery_dir.rmdir()
+            raise
+        return delivery_file
 
     def _append_workbook(self, request, command):
         # 群 ID 用作隔离范围，避免同名群互相读取统计数据。
@@ -304,22 +545,26 @@ class GuildExcelFlow:
                 shutil.copyfile(workbook, staged_input)
                 _drop_existing_sheet(staged_input, request.sheet)
             output = self.worker(request, command, self.perception, directory)
+            return self._publish_workbook(output, workbook, request.filename)
 
-            # 先保存发送时的版本。后续任务只替换主工作簿，不修改已交给微信的文件。
-            self.outbox.mkdir(parents=True, exist_ok=True)
-            delivery_dir = Path(mkdtemp(prefix="job-", dir=self.outbox))
-            delivery_file = delivery_dir / request.filename
-            try:
-                shutil.copyfile(output, delivery_file)
-                workbook.parent.mkdir(parents=True, exist_ok=True)
-                with TemporaryDirectory(dir=workbook.parent, prefix=".update-") as stage:
-                    staged_workbook = Path(stage) / request.filename
-                    shutil.copyfile(output, staged_workbook)
-                    os.replace(staged_workbook, workbook)
-            except OSError:
-                delivery_file.unlink(missing_ok=True)
-                delivery_dir.rmdir()
-                raise
+    def _edit_workbook(
+        self,
+        request: GuildExcelEditRequest,
+        command: ChatMessage,
+        edit_box: list[tuple[str, str]],
+    ) -> Path:
+        group_key = hashlib.sha256(command.chatroom_id.encode("utf-8")).hexdigest()
+        workbook = self.workbooks / group_key / request.filename
+        if not workbook.is_file():
+            raise GuildExcelError(f"未找到文件「{request.filename}」，请先生成 Excel 或检查文件名。")
+        with TemporaryDirectory(prefix="guild-excel-edit-") as directory:
+            staged = Path(directory) / request.filename
+            shutil.copyfile(workbook, staged)
+            actual_sheet, matched_name, old_display, new_display = edit_workbook_file(staged, request)
+            delivery_file = self._publish_workbook(staged, workbook, request.filename)
+        field_label = "战力" if request.field == "power" else "魔物得分"
+        detail = f"已将「{matched_name}」的{field_label}从 {old_display} 改为 {new_display}"
+        edit_box.append((actual_sheet, detail))
         return delivery_file
 
     def poll(self, chat_name):
@@ -327,7 +572,9 @@ class GuildExcelFlow:
             if origin_chat != chat_name or not future.done():
                 continue
             self.jobs.pop(index)
-            sheet_name, min_sheets, delivery_chat, target_message = self._job_meta.pop(future, ("", 1, origin_chat, ""))
+            sheet_name, min_sheets, delivery_chat, target_message, edit_box = self._job_meta.pop(
+                future, ("", 1, origin_chat, "", None)
+            )
             delivery_chat = delivery_chat or origin_chat
             try:
                 delivery_file = future.result()
@@ -337,6 +584,33 @@ class GuildExcelFlow:
                 _LOGGER.exception("公会统计任务失败")
                 self.send_text(origin_chat, "公会统计处理失败，请检查 Bot 日志。")
             else:
+                if edit_box is not None and edit_box:
+                    actual_sheet, edit_detail = edit_box[0]
+                    if min_sheets > 1:
+                        sheet_count, _, _ = _inspect_workbook_sheet(delivery_file, actual_sheet)
+                        if sheet_count < min_sheets:
+                            self.send_text(
+                                origin_chat,
+                                f"已修改（{actual_sheet}，{edit_detail}），当前进度 {sheet_count}/{min_sheets}。",
+                            )
+                            return
+                    if not self.send_file(delivery_chat, delivery_file).success:
+                        if delivery_chat != origin_chat:
+                            self.send_text(origin_chat, f"Excel 已修改（{edit_detail}）并保存在本机，但未能发到「{delivery_chat}」。")
+                        else:
+                            self.send_text(origin_chat, f"Excel 已修改（{edit_detail}）并保存在本机，但未能发到群里。")
+                    else:
+                        if target_message:
+                            self.send_text(delivery_chat, target_message)
+                        if delivery_chat != origin_chat:
+                            self.send_text(
+                                origin_chat,
+                                f"已修改（{actual_sheet}，{edit_detail}），Excel 已发送到「{delivery_chat}」。",
+                            )
+                        else:
+                            self.send_text(origin_chat, f"已修改（{actual_sheet}，{edit_detail}）。")
+                    return
+
                 stats_suffix = ""
                 if min_sheets > 1 or delivery_chat != origin_chat:
                     sheet_count, members_count, matched_count = _inspect_workbook_sheet(delivery_file, sheet_name)
