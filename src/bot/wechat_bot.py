@@ -119,6 +119,9 @@ class WeChatBot:
     def _guild_excel_global_enabled(self) -> bool:
         return os.environ.get("ENABLE_GUILD_MONSTER_EXCEL", "0").strip() == "1"
 
+    def _relationship_evaluator_global_enabled(self) -> bool:
+        return os.environ.get("ENABLE_RELATIONSHIP_EVALUATOR", "1").strip().lower() in ("1", "true", "yes", "on")
+
     def _group_feature_enabled(self, chat_name: str, key: str, default: bool) -> bool:
         cfg = getattr(self, "group_config", None)
         if cfg is None or not chat_name:
@@ -263,7 +266,9 @@ class WeChatBot:
         from src.reply.mood_engine import MoodEngine
         self.relationship_engine = RelationshipEngine()
         self.mood_engine = MoodEngine()
-        enable_rel_eval = os.environ.get("ENABLE_RELATIONSHIP_EVALUATOR", "1").strip().lower() in ("1", "true", "yes", "on")
+        enable_rel_eval = self.group_config.any_group_enabled(
+            "relationship_evaluator", self._relationship_evaluator_global_enabled()
+        )
         self.relationship_evaluator: Optional[RelationshipEvaluator] = (
             RelationshipEvaluator(
                 self.relationship_engine, llm_client=actual_llm, mood_engine=self.mood_engine
@@ -1138,7 +1143,13 @@ class WeChatBot:
                         reply_targets=reply_targets,
                     )
                     rel_eval = getattr(self, "relationship_evaluator", None)
-                    if rel_eval is not None:
+                    rel_eval_allowed = rel_eval is not None and (
+                        not is_group
+                        or self._group_feature_enabled(
+                            chat_name, "relationship_evaluator", self._relationship_evaluator_global_enabled()
+                        )
+                    )
+                    if rel_eval_allowed:
                         rel_eval.enqueue_replies(
                             chat_name,
                             to_reply,

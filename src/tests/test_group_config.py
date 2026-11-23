@@ -98,3 +98,24 @@ def test_generator_per_group_persona_path_override(tmp_path, monkeypatch):
     gen = ReplyGenerator(llm_client=None, group_config=GroupConfig(cfg_path))
     prompt = gen._system_prompt(is_group=True, chat_name="群B")
     assert "测试群专属人设" in prompt
+
+
+def test_relationship_evaluator_per_group_override(tmp_path):
+    cfg_path = tmp_path / "group_config.json"
+    cfg_path.write_text(
+        json.dumps(
+            {
+                "groups": {
+                    "弓箭2战神公会": {"relationship_evaluator": True},
+                    "戰神管理群": {"relationship_evaluator": False},
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    cfg = GroupConfig(cfg_path)
+    assert cfg.any_group_enabled("relationship_evaluator", default=False) is True
+    assert cfg.is_enabled("弓箭2战神公会", "relationship_evaluator", default=False) is True
+    assert cfg.is_enabled("戰神管理群", "relationship_evaluator", default=True) is False
+    assert cfg.is_enabled("未配置群", "relationship_evaluator", default=True) is True
