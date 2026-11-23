@@ -32,6 +32,8 @@ def test_selects_recent_images_from_one_sender_in_current_group():
     ]
     with pytest.raises(GuildExcelError, match="重名"):
         select_images([first, message(sender_wxid="wx_b", local_id=2)], command, "小明")
+    with pytest.raises(GuildExcelError, match="不要折叠发送图片.*等待 30 秒"):
+        select_images([], command, "小明")
 
 
 def test_workbook_uses_scoped_images_and_skill_exporter(tmp_path, monkeypatch):

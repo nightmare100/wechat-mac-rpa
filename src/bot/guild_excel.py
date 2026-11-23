@@ -52,6 +52,7 @@ _MAX_IMAGE_BYTES = 12 * 1024 * 1024
 _MAX_BATCH_BYTES = 40 * 1024 * 1024
 _CODEX_TIMEOUT_SECONDS = 300
 _IMAGE_EXTENSIONS = {"PNG": ".png", "JPEG": ".jpg", "WEBP": ".webp"}
+_IMAGE_SEND_HINT = "提示：请不要折叠发送图片，并且发送图片后等待 30 秒左右再发送指令。"
 
 
 class GuildExcelError(RuntimeError):
@@ -181,7 +182,7 @@ def select_images(messages, command: ChatMessage, nickname: str) -> list[ChatMes
             key = ("server", msg.server_id) if msg.server_id not in ("", "0", None) else ("local", msg.local_id)
             images.setdefault(key, msg)
     if not images:
-        raise GuildExcelError(f"没找到该群友在指令前 {_WINDOW_MINUTES} 分钟内发送的图片，请先发图再发指令。")
+        raise GuildExcelError(f"没找到该群友在指令前 {_WINDOW_MINUTES} 分钟内发送的图片，请先发图再发指令。{_IMAGE_SEND_HINT}")
     if len(images) > _MAX_IMAGES:
         raise GuildExcelError(f"近 {_WINDOW_MINUTES} 分钟图片超过 {_MAX_IMAGES} 张，请分批处理。")
     return sorted(images.values(), key=lambda msg: (msg.create_time, msg.local_id or 0))
@@ -252,7 +253,7 @@ def _run_codex(request, images, directory, skill):
             "[GuildExcel] 识别校验未通过: sheet=%s images=%d members=%d scores=%d error=%r",
             request.sheet, len(images), members_n, scores_n, err_val,
         )
-        raise GuildExcelError("没有同时识别出公会成员战力和今日魔物得分，请检查两类截图是否齐全、清晰。")
+        raise GuildExcelError(f"没有同时识别出公会成员战力和今日魔物得分，请检查两类截图是否齐全、清晰。{_IMAGE_SEND_HINT}")
     return response
 
 
@@ -265,7 +266,7 @@ def create_workbook(request, command, perception, directory, *, skill=_SKILL):
         paths, total_bytes = [], 0
         for index, msg in enumerate(images, start=1):
             if not msg.media_url:
-                raise GuildExcelError("有图片尚未能从 TraceMemo 读取，请在微信打开原图后重试。")
+                raise GuildExcelError(f"有图片尚未能从 TraceMemo 读取，请在微信打开原图后重试。{_IMAGE_SEND_HINT}")
             data = perception.client.read_bytes(msg.media_url, max_bytes=_MAX_IMAGE_BYTES)
             total_bytes += len(data)
             if total_bytes > _MAX_BATCH_BYTES:
@@ -282,7 +283,7 @@ def create_workbook(request, command, perception, directory, *, skill=_SKILL):
             path.write_bytes(data)
             paths.append(path)
     except TraceMemoError as exc:
-        raise GuildExcelError("TraceMemo 读取群图片失败，请确认原图可打开后重试。") from exc
+        raise GuildExcelError(f"TraceMemo 读取群图片失败，请确认原图可打开后重试。{_IMAGE_SEND_HINT}") from exc
 
     _LOGGER.info(
         "[GuildExcel] 已拉取图片 %d 张 (sender=%s, sheet=%s, file=%s)",
