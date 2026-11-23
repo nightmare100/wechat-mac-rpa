@@ -126,6 +126,7 @@ th,td{padding:8px 12px;text-align:left;border-bottom:1px solid var(--border)}th{
 <a href="/benchmark/reply">🤖 回复质量</a>
 <a href="/experiments">🧪 实验</a>
 <a href="/code-audit">🐛 代码审计</a>
+<a href="/relationship">❤️ 好感心情</a>
 </nav><main>"""
 
 FOOTER = """</main>
@@ -142,7 +143,7 @@ document.addEventListener('dblclick',function(e){
 
 def _page(title: str, content: str, active: str = "") -> str:
     nav = HEADER
-    for href, label in [("/", "📊 Dashboard"), ("/ticks", "🔍 Tick"), ("/gt", "🏷️ GT"), ("/review", "🧑‍⚖️ 审核"), ("/screenshots", "📸 截图OCR"), ("/benchmark/judge", "📊 Judge"), ("/benchmark/reply", "🤖 回复"), ("/experiments", "🧪 实验"), ("/code-audit", "🐛 审计"), ("/wiki-review", "🧠 Wiki审核")]:
+    for href, label in [("/", "📊 Dashboard"), ("/ticks", "🔍 Tick"), ("/gt", "🏷️ GT"), ("/review", "🧑‍⚖️ 审核"), ("/screenshots", "📸 截图OCR"), ("/benchmark/judge", "📊 Judge"), ("/benchmark/reply", "🤖 回复"), ("/experiments", "🧪 实验"), ("/code-audit", "🐛 审计"), ("/wiki-review", "🧠 Wiki审核"), ("/relationship", "❤️ 好感心情")]:
         cls = ' class="active"' if href == active else ""
         nav += f'<a href="{href}"{cls}>{label}</a>'
     nav += "</nav><main>"
@@ -1952,7 +1953,466 @@ async def wiki_review_save(item_id: str, request: Request):
     return JSONResponse({"success": True})
 
 
+# ============================================================
+# 好感度 & 心情可视化面板（读取 data/db/relationship.db & mood.db）
+# ============================================================
+
+def _relationship_db_path() -> Path:
+    return Path(WORK_DIR) / "data" / "db" / "relationship.db"
+
+
+def _mood_db_path() -> Path:
+    return Path(WORK_DIR) / "data" / "db" / "mood.db"
+
+
+def _fmt_ts(ts: Optional[float]) -> str:
+    if not ts:
+        return "-"
+    try:
+        return __import__("datetime").datetime.fromtimestamp(float(ts)).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return "-"
+
+
+def _load_relationship_and_mood_snapshot(chat_filter: str = "", query: str = "") -> Dict[str, Any]:
+    import sqlite3
+    import time as _time
+    from urllib.parse import urlencode
+
+    from src.reply.mood_engine import DECAY_FLOOR, MoodEngine, _decay_intensity
+    from src.utils.identity import is_buddy
+
+    now_ts = _time.time()
+    rel_db = _relationship_db_path()
+    mood_db = _mood_db_path()
+
+    group_moods: Dict[str, Dict[str, Any]] = {}
+    user_moods: Dict[tuple, Dict[str, Any]] = {}
+    if mood_db.exists():
+        conn = sqlite3.connect(str(mood_db))
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute("SELECT * FROM mood_states ORDER BY updated_at DESC").fetchall()
+            for r in rows:
+                raw_mood = r["mood"] or "平静"
+                raw_int = float(r["intensity"] or 0.0)
+                updated_at = float(r["updated_at"] or 0.0)
+                decayed = _decay_intensity(raw_mood, raw_int, now_ts - updated_at)
+                eff_mood = raw_mood if decayed >= DECAY_FLOOR else "平静"
+                eff_int = round(decayed, 1) if eff_mood != "平静" else 0.0
+                item = {
+                    "chat_key": r["chat_key"],
+                    "scope_key": r["scope_key"],
+                    "mood": eff_mood,
+                    "intensity": eff_int,
+                    "reason": (r["reason"] or "") if eff_mood != "平静" else "",
+                    "updated_at": updated_at,
+                }
+                if r["scope_key"] == MoodEngine.GROUP_SCOPE:
+                    group_moods[r["chat_key"]] = item
+                else:
+                    user_moods[(r["chat_key"], r["scope_key"])] = item
+        except sqlite3.OperationalError:
+            pass
+        finally:
+            conn.close()
+
+    users: List[Dict[str, Any]] = []
+    chats: set = set(group_moods.keys())
+    total_events = 0
+    guarded_count = 0
+    if rel_db.exists():
+        conn = sqlite3.connect(str(rel_db))
+        conn.row_factory = sqlite3.Row
+        try:
+            ev_row = conn.execute("SELECT COUNT(*) AS cnt FROM relationship_events").fetchone()
+            total_events = int(ev_row["cnt"]) if ev_row else 0
+            unresolved_rows = conn.execute(
+                "SELECT DISTINCT chat_key, user_key FROM relationship_events WHERE resolved = 0"
+            ).fetchall()
+            unresolved_set = {(r["chat_key"], r["user_key"]) for r in unresolved_rows}
+
+            rows = conn.execute(
+                "SELECT * FROM user_relationships ORDER BY updated_at DESC"
+            ).fetchall()
+            for r in rows:
+                ckey = r["chat_key"]
+                ukey = r["user_key"]
+                chats.add(ckey)
+                dname = r["display_name"] or ukey
+                try:
+                    aliases = _json.loads(r["aliases_json"] or "[]")
+                    if not isinstance(aliases, list):
+                        aliases = []
+                except Exception:
+                    aliases = []
+                trust = float(r["trust"] or 0.0)
+                guarded_until = float(r["guarded_until"]) if r["guarded_until"] is not None else None
+                is_guarded = bool(
+                    (guarded_until is not None and guarded_until > now_ts)
+                    or (trust < 10.0 and (ckey, ukey) in unresolved_set)
+                )
+                if is_guarded:
+                    guarded_count += 1
+                buddy = is_buddy(dname)
+                eff_level = "buddy" if buddy else ("guarded" if is_guarded else (r["stage"] or "stranger"))
+                um = user_moods.get((ckey, ukey))
+                gm = group_moods.get(ckey)
+                if um and um["mood"] != "平静":
+                    cur_mood, cur_mood_int, cur_mood_src = um["mood"], um["intensity"], "个人"
+                elif gm and gm["mood"] != "平静":
+                    cur_mood, cur_mood_int, cur_mood_src = gm["mood"], gm["intensity"], "群氛围"
+                else:
+                    cur_mood, cur_mood_int, cur_mood_src = "平静", 0.0, "基线"
+
+                if chat_filter and ckey != chat_filter:
+                    continue
+                if query:
+                    q_low = query.lower()
+                    hay = " ".join([dname, ukey, ckey, *[str(a) for a in aliases]]).lower()
+                    if q_low not in hay:
+                        continue
+
+                users.append({
+                    "chat_key": ckey,
+                    "user_key": ukey,
+                    "display_name": dname,
+                    "aliases": [str(a) for a in aliases if a and str(a) != dname],
+                    "familiarity": round(float(r["familiarity"] or 0.0), 1),
+                    "affection": round(float(r["affection"] or 0.0), 1),
+                    "trust": round(trust, 1),
+                    "stage": r["stage"] or "stranger",
+                    "effective_level": eff_level,
+                    "is_guarded": is_guarded,
+                    "guarded_until": guarded_until,
+                    "guarded_reason": r["guarded_reason"] or "",
+                    "interaction_days": int(r["interaction_days"] or 0),
+                    "mood": cur_mood,
+                    "mood_intensity": cur_mood_int,
+                    "mood_source": cur_mood_src,
+                    "updated_at": float(r["updated_at"] or 0.0),
+                    "detail_url": "/relationship/user?" + urlencode({"chat_key": ckey, "user_key": ukey}),
+                })
+        except sqlite3.OperationalError:
+            pass
+        finally:
+            conn.close()
+
+    return {
+        "rel_db_exists": rel_db.exists(),
+        "mood_db_exists": mood_db.exists(),
+        "chats": sorted(chats),
+        "group_moods": list(group_moods.values()),
+        "users": users,
+        "summary": {
+            "user_count": len(users),
+            "chat_count": len(chats),
+            "guarded_count": guarded_count,
+            "total_events": total_events,
+        },
+    }
+
+
+def _stage_badge(level: str) -> str:
+    colors = {
+        "buddy": ("#a371f7", "rgba(163,113,247,.18)"),
+        "friend": ("#3fb950", "rgba(63,185,80,.18)"),
+        "familiar": ("#58a6ff", "rgba(88,166,255,.18)"),
+        "acquaintance": ("#d29922", "rgba(210,153,34,.18)"),
+        "stranger": ("#8b949e", "rgba(139,148,158,.15)"),
+        "guarded": ("#f85149", "rgba(248,81,73,.2)"),
+    }
+    fg, bg = colors.get(level, ("#8b949e", "rgba(139,148,158,.15)"))
+    return (
+        f'<span style="display:inline-block;padding:2px 8px;border-radius:10px;'
+        f'font-size:12px;font-weight:600;color:{fg};background:{bg}">'
+        f'{html.escape(level)}</span>'
+    )
+
+
+def _mood_badge(mood: str, intensity: float = 0.0) -> str:
+    colors = {
+        "开心": ("#3fb950", "rgba(63,185,80,.18)"),
+        "调皮": ("#58a6ff", "rgba(88,166,255,.18)"),
+        "平静": ("#8b949e", "rgba(139,148,158,.15)"),
+        "犯困": ("#d29922", "rgba(210,153,34,.18)"),
+        "小郁闷": ("#d29922", "rgba(210,153,34,.22)"),
+        "不耐烦": ("#f85149", "rgba(248,81,73,.2)"),
+    }
+    fg, bg = colors.get(mood, ("#8b949e", "rgba(139,148,158,.15)"))
+    extra = f" {intensity:.0f}" if intensity > 0 else ""
+    return (
+        f'<span style="display:inline-block;padding:2px 8px;border-radius:10px;'
+        f'font-size:12px;font-weight:600;color:{fg};background:{bg}">'
+        f'{html.escape(mood)}{extra}</span>'
+    )
+
+
+def _bar_cell(val: float, color: str) -> str:
+    pct = max(0.0, min(100.0, float(val)))
+    return (
+        f'<div style="min-width:92px">'
+        f'<div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:2px">'
+        f'<span>{val:.1f}</span><span style="color:var(--muted)">/100</span></div>'
+        f'<div style="height:6px;background:#21262d;border-radius:3px;overflow:hidden">'
+        f'<div style="width:{pct:.1f}%;height:100%;background:{color}"></div></div></div>'
+    )
+
+
+@app.get("/api/relationship/overview")
+def api_relationship_overview(chat: str = Query(""), q: str = Query("")):
+    return JSONResponse(_load_relationship_and_mood_snapshot(chat_filter=chat.strip(), query=q.strip()))
+
+
+@app.get("/relationship", response_class=HTMLResponse)
+def relationship_dashboard(chat: str = Query(""), q: str = Query("")):
+    chat_f = chat.strip()
+    q_f = q.strip()
+    snap = _load_relationship_and_mood_snapshot(chat_filter=chat_f, query=q_f)
+    summary = snap["summary"]
+
+    notice = ""
+    if not snap["rel_db_exists"] and not snap["mood_db_exists"]:
+        notice = (
+            '<div style="padding:14px 16px;margin-bottom:16px;background:var(--card);'
+            'border:1px solid var(--border);border-radius:8px;color:var(--yellow);font-size:13px">'
+            '尚未检测到 <code>data/db/relationship.db</code> 或 <code>data/db/mood.db</code>。'
+            '重启 Bot 并在群里产生回复后会自动建库并在此实时展示。</div>'
+        )
+
+    # 群级氛围心情卡片
+    mood_cards = ""
+    if snap["group_moods"]:
+        cards = []
+        for gm in snap["group_moods"]:
+            reason_html = f'<div style="color:var(--muted);font-size:12px;margin-top:6px">原因：{html.escape(gm["reason"])}</div>' if gm["reason"] else ""
+            cards.append(
+                f'<div style="background:var(--card);border:1px solid var(--border);border-radius:8px;padding:12px 14px;min-width:220px">'
+                f'<div style="font-weight:600;font-size:13px;margin-bottom:6px">{html.escape(gm["chat_key"])}</div>'
+                f'<div>{_mood_badge(gm["mood"], gm["intensity"])}</div>'
+                f'{reason_html}'
+                f'<div style="color:var(--muted);font-size:11px;margin-top:6px">更新：{_fmt_ts(gm["updated_at"])}</div>'
+                f'</div>'
+            )
+        mood_cards = '<div style="display:flex;flex-wrap:wrap;gap:12px;margin-bottom:18px">' + "".join(cards) + '</div>'
+    else:
+        mood_cards = '<p style="color:var(--muted);font-size:13px;margin-bottom:18px">当前各群氛围均处于「平静」基线（无未衰减群级心情记录）。</p>'
+
+    # 群筛选下拉与搜索框
+    chat_options = '<option value="">全部群聊</option>' + "".join(
+        f'<option value="{html.escape(c, quote=True)}" {"selected" if c == chat_f else ""}>{html.escape(c)}</option>'
+        for c in snap["chats"]
+    )
+    filter_bar = f"""
+    <form method="get" action="/relationship" style="display:flex;gap:8px;align-items:center;margin-bottom:14px;flex-wrap:wrap">
+      <select name="chat" style="background:var(--card);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px">{chat_options}</select>
+      <input type="text" name="q" value="{html.escape(q_f, quote=True)}" placeholder="搜索昵称 / 别名 / wxid..." style="background:var(--card);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 10px;min-width:220px" />
+      <button type="submit" style="background:var(--blue);color:#fff;border:none;border-radius:6px;padding:6px 14px;cursor:pointer">筛选</button>
+      <a href="/relationship" style="color:var(--muted);font-size:12px;margin-left:4px">重置</a>
+    </form>"""
+
+    rows_html = ""
+    for u in snap["users"]:
+        alias_str = (
+            f'<div style="color:var(--muted);font-size:11px">别名：{html.escape(", ".join(u["aliases"][:3]))}</div>'
+            if u["aliases"] else ""
+        )
+        guard_tip = (
+            f'<div style="color:var(--red);font-size:11px">警戒至 {_fmt_ts(u["guarded_until"])}</div>'
+            if u["is_guarded"] and u["guarded_until"] else ""
+        )
+        rows_html += (
+            f'<tr>'
+            f'<td style="font-size:12px;color:var(--muted)">{html.escape(u["chat_key"])}</td>'
+            f'<td><a href="{u["detail_url"]}" style="color:var(--blue);font-weight:600">{html.escape(u["display_name"])}</a>{alias_str}</td>'
+            f'<td>{_stage_badge(u["effective_level"])}{guard_tip}</td>'
+            f'<td>{_bar_cell(u["familiarity"], "#58a6ff")}</td>'
+            f'<td>{_bar_cell(u["affection"], "#f778ba")}</td>'
+            f'<td>{_bar_cell(u["trust"], "#3fb950")}</td>'
+            f'<td>{u["interaction_days"]} 天</td>'
+            f'<td>{_mood_badge(u["mood"], u["mood_intensity"])}<div style="color:var(--muted);font-size:11px">{html.escape(u["mood_source"])}</div></td>'
+            f'<td style="font-size:12px;color:var(--muted)">{_fmt_ts(u["updated_at"])}</td>'
+            f'<td><a href="{u["detail_url"]}" style="color:var(--blue);font-size:12px">详情 →</a></td>'
+            f'</tr>'
+        )
+    if not rows_html:
+        rows_html = '<tr><td colspan="10" style="text-align:center;color:var(--muted);padding:20px">暂无匹配的关系记录</td></tr>'
+
+    content = f"""
+    {notice}
+    <div class="metrics">
+      <div class="metric"><div class="value" style="color:var(--blue)">{summary['user_count']}</div><div class="label">已建档群友</div></div>
+      <div class="metric"><div class="value" style="color:var(--green)">{summary['chat_count']}</div><div class="label">涉及群聊</div></div>
+      <div class="metric"><div class="value" style="color:var(--red)">{summary['guarded_count']}</div><div class="label">警戒中 (guarded)</div></div>
+      <div class="metric"><div class="value" style="color:var(--yellow)">{summary['total_events']}</div><div class="label">累计事件数</div></div>
+    </div>
+    <h2 style="font-size:15px;margin:16px 0 10px">群级实时氛围心情</h2>
+    {mood_cards}
+    <h2 style="font-size:15px;margin:16px 0 10px">群友关系与个人情绪</h2>
+    {filter_bar}
+    <table>
+      <thead><tr>
+        <th>群聊</th><th>群友</th><th>阶段</th><th>熟悉度</th><th>好感度</th><th>信任度</th>
+        <th>互动天数</th><th>当前心情</th><th>最近更新</th><th>操作</th>
+      </tr></thead>
+      <tbody>{rows_html}</tbody>
+    </table>
+    <p style="color:var(--muted);font-size:12px;margin-top:12px">数据实时读取自 <code>data/db/relationship.db</code> 与 <code>data/db/mood.db</code>（WAL 模式，可与 Bot 并行运行）。</p>"""
+    return HTMLResponse(_page("好感度 & 心情", content, "/relationship"))
+
+
+@app.get("/relationship/user", response_class=HTMLResponse)
+def relationship_user_detail(chat_key: str = Query(...), user_key: str = Query(...)):
+    import time as _time
+
+    from src.reply.mood_engine import MoodEngine, MoodStore
+    from src.reply.relationship_store import RelationshipStore
+
+    rel_db = _relationship_db_path()
+    if not rel_db.exists():
+        return HTMLResponse(_page("群友详情", '<p style="color:var(--muted)">尚未生成 relationship.db。</p><p><a href="/relationship" style="color:var(--blue)">← 返回列表</a></p>', "/relationship"))
+
+    store = RelationshipStore(db_path=rel_db)
+    try:
+        rec = store.get(chat_key, user_key)
+        events = store.list_events(chat_key, user_key, limit=50) if rec else []
+        has_unresolved = store.has_unresolved_negative_event(chat_key, user_key) if rec else False
+    finally:
+        store.close()
+
+    if rec is None:
+        return HTMLResponse(_page("群友详情", '<p style="color:var(--muted)">未找到该群友记录。</p><p><a href="/relationship" style="color:var(--blue)">← 返回列表</a></p>', "/relationship"))
+
+    mood_db = _mood_db_path()
+    cur_mood, cur_energy = "平静", "平常"
+    if mood_db.exists():
+        m_store = MoodStore(db_path=mood_db)
+        try:
+            m_engine = MoodEngine(store=m_store)
+            cur_mood, cur_energy, _ = m_engine.get_state(chat_key, user_key=user_key, in_bedtime=False)
+        finally:
+            m_store.close()
+
+    now_ts = _time.time()
+    is_guarded = bool((rec.guarded_until and rec.guarded_until > now_ts) or (rec.trust < 10.0 and has_unresolved))
+    eff_level = "guarded" if is_guarded else rec.stage
+
+    ev_rows = ""
+    for ev in events:
+        ev_rows += (
+            f'<tr>'
+            f'<td style="font-size:12px;color:var(--muted)">{_fmt_ts(ev["created_at"])}</td>'
+            f'<td><code>{html.escape(str(ev["event_type"]))}</code></td>'
+            f'<td>{float(ev["delta_familiarity"]):+.2f}</td>'
+            f'<td>{float(ev["delta_affection"]):+.2f}</td>'
+            f'<td>{float(ev["delta_trust"]):+.2f}</td>'
+            f'<td>{float(ev["intensity"]):.2f} / {float(ev["confidence"]):.2f}</td>'
+            f'<td>{"✅" if ev["resolved"] else "⚠️ 未解决"}</td>'
+            f'<td style="font-size:12px">{html.escape(str(ev["summary"] or ""))}</td>'
+            f'</tr>'
+        )
+    if not ev_rows:
+        ev_rows = '<tr><td colspan="8" style="text-align:center;color:var(--muted);padding:16px">暂无事件记录</td></tr>'
+
+    ck_js = _json.dumps(chat_key)
+    uk_js = _json.dumps(user_key)
+    content = f"""
+    <p style="margin-bottom:14px"><a href="/relationship" style="color:var(--blue)">← 返回好感度列表</a></p>
+    <div style="background:var(--card);border:1px solid var(--border);border-radius:8px;padding:16px;margin-bottom:16px">
+      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
+        <div>
+          <div style="font-size:18px;font-weight:700">{html.escape(rec.display_name or user_key)} {_stage_badge(eff_level)} {_mood_badge(cur_mood)}</div>
+          <div style="color:var(--muted);font-size:12px;margin-top:4px">群：{html.escape(chat_key)} · 主键：<code>{html.escape(user_key)}</code> · 别名：{html.escape(", ".join(rec.aliases) or "-")}</div>
+          <div style="color:var(--muted);font-size:12px;margin-top:4px">互动天数：{rec.interaction_days} 天 · 今日正向累积：熟 {rec.daily_familiarity_gain:.1f} / 好 {rec.daily_affection_gain:.1f} / 信 {rec.daily_trust_gain:.1f} · 精力：{html.escape(cur_energy)}</div>
+          {f'<div style="color:var(--red);font-size:12px;margin-top:4px">警戒状态：{html.escape(rec.guarded_reason or "边界警戒")}（至 {_fmt_ts(rec.guarded_until)}）</div>' if is_guarded else ''}
+        </div>
+        <div style="display:flex;gap:8px">
+          <button onclick="clearGuard()" style="background:#21262d;color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 12px;cursor:pointer">解除警戒</button>
+          <button onclick="resetMood()" style="background:#21262d;color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 12px;cursor:pointer">重置心情为平静</button>
+        </div>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:16px;margin-top:16px">
+        <div><div style="font-size:12px;color:var(--muted);margin-bottom:4px">熟悉度</div>{_bar_cell(rec.familiarity, "#58a6ff")}</div>
+        <div><div style="font-size:12px;color:var(--muted);margin-bottom:4px">好感度</div>{_bar_cell(rec.affection, "#f778ba")}</div>
+        <div><div style="font-size:12px;color:var(--muted);margin-bottom:4px">信任度</div>{_bar_cell(rec.trust, "#3fb950")}</div>
+      </div>
+    </div>
+    <h2 style="font-size:15px;margin:16px 0 10px">事件时间线（最近 50 条）</h2>
+    <table>
+      <thead><tr>
+        <th>时间</th><th>事件类型</th><th>熟悉度</th><th>好感度</th><th>信任度</th><th>强度/置信度</th><th>状态</th><th>依据摘要</th>
+      </tr></thead>
+      <tbody>{ev_rows}</tbody>
+    </table>
+    <script>
+    async function clearGuard(){{
+      const r=await fetch('/api/relationship/clear-guard',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{chat_key:{ck_js},user_key:{uk_js}}})}});
+      if(r.ok) location.reload();
+    }}
+    async function resetMood(){{
+      const r=await fetch('/api/relationship/reset-mood',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{chat_key:{ck_js},user_key:{uk_js}}})}});
+      if(r.ok) location.reload();
+    }}
+    </script>"""
+    return HTMLResponse(_page(f"群友详情：{html.escape(rec.display_name or user_key)}", content, "/relationship"))
+
+
+@app.post("/api/relationship/clear-guard")
+async def api_relationship_clear_guard(request: Request):
+    from src.reply.relationship_store import RelationshipStore
+
+    body = await request.json()
+    chat_key = str(body.get("chat_key") or "").strip()
+    user_key = str(body.get("user_key") or "").strip()
+    if not chat_key or not user_key:
+        return JSONResponse({"error": "missing chat_key or user_key"}, status_code=400)
+    rel_db = _relationship_db_path()
+    if not rel_db.exists():
+        return JSONResponse({"error": "relationship.db not found"}, status_code=404)
+    store = RelationshipStore(db_path=rel_db)
+    try:
+        rec = store.get(chat_key, user_key)
+        if rec is None:
+            return JSONResponse({"error": "user not found"}, status_code=404)
+        rec.guarded_until = None
+        rec.guarded_reason = ""
+        store.upsert(rec)
+        store.resolve_negative_events(chat_key, user_key)
+    finally:
+        store.close()
+    return JSONResponse({"success": True})
+
+
+@app.post("/api/relationship/reset-mood")
+async def api_relationship_reset_mood(request: Request):
+    import time as _time
+
+    from src.reply.mood_engine import MoodRecord, MoodStore
+
+    body = await request.json()
+    chat_key = str(body.get("chat_key") or "").strip()
+    user_key = str(body.get("user_key") or "").strip()
+    if not chat_key or not user_key:
+        return JSONResponse({"error": "missing chat_key or user_key"}, status_code=400)
+    mood_db = _mood_db_path()
+    store = MoodStore(db_path=mood_db)
+    try:
+        store.upsert(
+            MoodRecord(
+                chat_key=chat_key,
+                scope_key=user_key,
+                mood="平静",
+                intensity=0.0,
+                reason="",
+                updated_at=_time.time(),
+            )
+        )
+    finally:
+        store.close()
+    return JSONResponse({"success": True})
+
+
 if __name__ == "__main__":
     import uvicorn
-    print("wechat-twin Admin → http://localhost:8765")
+    print("wechat-twin Admin → http://127.0.0.1:8766")
     uvicorn.run(app, host="127.0.0.1", port=8766)
