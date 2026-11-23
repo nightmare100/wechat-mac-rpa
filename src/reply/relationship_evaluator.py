@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import inspect
 import logging
 import threading
 import time
@@ -140,6 +141,8 @@ class RelationshipEvaluator:
         replies: List[str],
         *,
         chatroom_id: Optional[str] = None,
+        reply_targets: Optional[List[Optional[str]]] = None,
+        skip_user_keys: Optional[set] = None,
     ) -> int:
         """将本次成功发出的回复按目标分桶入队，纯内存操作不阻塞主线程。返回入队轮数。"""
         if self.llm_client is None or not unreplied or not replies:
@@ -150,8 +153,9 @@ class RelationshipEvaluator:
 
         # 先按目标归组本批回复
         grouped: Dict[Tuple[str, str], Tuple[ChatMessage, List[str], List[str]]] = {}
-        for reply in replies:
-            target_msg = self.engine._reply_target_msg(reply, unreplied)
+        for idx, reply in enumerate(replies):
+            hint = reply_targets[idx] if (reply_targets and idx < len(reply_targets)) else None
+            target_msg = self.engine._reply_target_msg(reply, unreplied, target_hint=hint)
             if target_msg is None:
                 continue
             ckey = make_chat_key(
@@ -163,6 +167,8 @@ class RelationshipEvaluator:
             if not ukey:
                 continue
             key = (ckey, ukey)
+            if skip_user_keys and key in skip_user_keys:
+                continue
             if key not in grouped:
                 user_texts = [
                     (m.text or "").strip()[:200]
@@ -299,6 +305,25 @@ class RelationshipEvaluator:
         )
         return ranked[:2]
 
+    def _call_llm(self, messages: List[Dict[str, str]]) -> Any:
+        """兼容 OpenClawClient / QwenClient（支持 timeout）与 KimiClient（不含 timeout）。"""
+        kwargs: Dict[str, Any] = {
+            "messages": messages,
+            "temperature": 0.1,
+            "max_tokens": 300,
+        }
+        try:
+            sig = inspect.signature(self.llm_client.chat)
+            params = sig.parameters
+            accepts_timeout = "timeout" in params or any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+            )
+            if accepts_timeout:
+                kwargs["timeout"] = self.llm_timeout
+        except (TypeError, ValueError):
+            pass
+        return self.llm_client.chat(**kwargs)
+
     def _evaluate_bucket(self, bucket: _PendingBucket) -> int:
         if not bucket.turns:
             return 0
@@ -310,12 +335,7 @@ class RelationshipEvaluator:
             {"role": "user", "content": self._build_user_prompt(bucket, current_level)},
         ]
         try:
-            response = self.llm_client.chat(
-                messages=messages,
-                temperature=0.1,
-                max_tokens=300,
-                timeout=self.llm_timeout,
-            )
+            response = self._call_llm(messages)
             raw_text = _extract_llm_text(response)
         except Exception as e:
             _logger.warning("[RelationshipEvaluator] LLM 评估失败 (%s): %s", bucket.sender, e)

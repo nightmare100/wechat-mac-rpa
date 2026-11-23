@@ -208,3 +208,77 @@ def test_stateless_fallback_refused_does_not_bleed_to_other_person():
     ]
     rels = describe_relationships([_msg("在吗", sender="甲")], history)
     assert rels[0][1] == "known"
+
+
+def test_reply_targets_after_at_strip_space_nickname_and_sticker_filter(tmp_path):
+    clock = [1_700_000_000.0]
+    engine = _make_engine(tmp_path, clock)
+    m_space = _msg("你好呀", sender="A B", wxid="wxid_ab")
+    m_other = _msg("我也来", sender="乙", wxid="wxid_b")
+
+    # 含空格昵称能直接通过 @前缀匹配定位
+    matched = engine._reply_target_msg("@A B 你好呀", [m_space, m_other])
+    assert matched is not None and matched.sender == "A B"
+
+    # 剥掉 @ 后的回复靠 reply_targets 仍能精准归属，且忽略表情包占位
+    engine.record_replies(
+        "测试群",
+        [m_space, m_other],
+        ["你好呀", "欢迎呀", "[表情包: 开心]"],
+        chatroom_id="room_1",
+        reply_targets=["A B", "乙"],
+    )
+    assert engine.store.get("room_1", "wxid:wxid_ab") is not None
+    assert engine.store.get("room_1", "wxid:wxid_b") is not None
+    engine.store.close()
+
+
+def test_negative_event_resolution_clears_guarded_after_recovery(tmp_path):
+    clock = [1_700_000_000.0]
+    engine = _make_engine(tmp_path, clock)
+    # 初始 trust=0 -> 越界后 trust=0 且有未解决负面事件
+    engine.apply_event("room_1", "甲", "boundary_push", sender_wxid="wxid_a")
+    assert engine.store.has_unresolved_negative_event("room_1", "wxid:wxid_a") is True
+
+    # 超过 24h 冷静期后，trust 仍 < 10 且未解决负面事件存在 -> 保持 guarded
+    clock[0] += 25 * 3600.0
+    assert engine.describe_person("room_1", "甲", sender_wxid="wxid_a")[1] == "guarded"
+
+    # 跨多日守边界把信任拉回 >= 10 后，旧负面事件自动标为 resolved，解除 guarded
+    rec = engine.store.get("room_1", "wxid:wxid_a")
+    rec.trust = 9.5
+    engine.store.upsert(rec)
+    engine.apply_event("room_1", "甲", "respect_boundary", sender_wxid="wxid_a")
+    assert engine.store.has_unresolved_negative_event("room_1", "wxid:wxid_a") is False
+    assert engine.describe_person("room_1", "甲", sender_wxid="wxid_a")[1] != "guarded"
+    engine.store.close()
+
+
+def test_concurrent_apply_event_is_atomic(tmp_path):
+    import threading
+
+    clock = [1_700_000_000.0]
+    engine = _make_engine(tmp_path, clock)
+    engine.get_or_create("room_1", "甲", sender_wxid="wxid_a", persist=True)
+
+    # 并发写入 10 次负面扣分（先设高分），不应发生 Lost Update
+    rec = engine.store.get("room_1", "wxid:wxid_a")
+    rec.trust = 80.0
+    engine.store.upsert(rec)
+
+    threads = [
+        threading.Thread(
+            target=engine.apply_event,
+            args=("room_1", "甲", "boundary_push"),
+            kwargs={"sender_wxid": "wxid_a"},
+        )
+        for _ in range(10)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    final = engine.store.get("room_1", "wxid:wxid_a")
+    assert final.trust == pytest.approx(80.0 - 10 * 3.0)
+    engine.store.close()

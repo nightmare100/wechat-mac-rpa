@@ -334,6 +334,7 @@ class ReplyGenerator:
         self.last_go_online: bool = False  # 本次回复是否答应朧月上线（触发静默）
         self.last_chime_in: bool = False  # 本次回复 LLM 是否标了主动插话
         self.last_chime_in_dropped: bool = False  # 本次是否有主动插话因冷却被丢弃（bot 记录原因用）
+        self.last_reply_targets: List[Optional[str]] = []  # 剥除 @ 前每条回复对应的目标昵称（供关系引擎精准归属）
         self.enable_chime_in = os.getenv("ENABLE_CHIME_IN", "1").strip().lower() in ("1", "true", "yes", "on")
         self.enable_direct_group_reply = os.getenv("ENABLE_DIRECT_GROUP_REPLY", "1").strip().lower() in ("1", "true", "yes", "on")
         self.chime_in_cooldown = _env_int("CHIME_IN_COOLDOWN_MINUTES", 60, 0, 1440) * 60  # 每个群主动插话的冷却（秒）
@@ -1044,6 +1045,7 @@ class ReplyGenerator:
         self.last_go_online = False
         self.last_chime_in = False
         self.last_chime_in_dropped = False
+        self.last_reply_targets = []
         if not unreplied:
             self._submit_to_judge(tick_id, [], unreplied, all_messages, is_group)
             return []
@@ -1285,6 +1287,12 @@ class ReplyGenerator:
             replies, fresh_targets = self._apply_chime_in_limit(chat_name, unreplied, replies, all_messages)
         if is_group:
             self.followup.record(chat_name, unreplied, replies, fresh_targets=fresh_targets, history=all_messages)
+        # 在剥除 @ 前记录每条回复的目标昵称（支持含空格昵称），供发送后关系引擎精准归属
+        from src.reply.relationship_store import RelationshipEngine
+        self.last_reply_targets = [
+            (m.sender if (m := RelationshipEngine._reply_target_msg(r, unreplied)) is not None else _reply_target(r, unreplied))
+            for r in replies
+        ]
         # 未知昵称不依赖聊天类型清理，避免类型误判时发出 @未知。
         replies = _apply_at_policy(replies, keep_rate=AT_KEEP_RATE if is_group else None)
         self.last_llm_messages = [dict(m) for m in final_messages]

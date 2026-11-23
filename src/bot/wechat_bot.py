@@ -1104,13 +1104,23 @@ class WeChatBot:
                         (getattr(m, "chatroom_id", None) for m in to_reply if getattr(m, "chatroom_id", None)),
                         None,
                     )
-                    self.relationship_engine.record_replies(
-                        chat_name, to_reply, sent_replies, chatroom_id=chatroom_id
+                    reply_targets = getattr(self.generator, "last_reply_targets", None)
+                    negative_handled = self.relationship_engine.record_replies(
+                        chat_name,
+                        to_reply,
+                        sent_replies,
+                        chatroom_id=chatroom_id,
+                        reply_targets=reply_targets,
                     )
                     rel_eval = getattr(self, "relationship_evaluator", None)
                     if rel_eval is not None:
                         rel_eval.enqueue_replies(
-                            chat_name, to_reply, sent_replies, chatroom_id=chatroom_id
+                            chat_name,
+                            to_reply,
+                            sent_replies,
+                            chatroom_id=chatroom_id,
+                            reply_targets=reply_targets,
+                            skip_user_keys=negative_handled,
                         )
                 except Exception as e:
                     self.logger.warning("[Relationship] 记录互动失败: %s", e)
@@ -1219,26 +1229,31 @@ class WeChatBot:
         """自动运行主循环"""
         self.running = True
         self._interval = interval
-        while self.running:
-            if self._check_sleep(datetime.now()):
-                time.sleep(SLEEP_CHECK_SECONDS)
-                continue
-            tick_started = time.monotonic()
-            try:
-                pusher = getattr(self, "scheduled_pusher", None)
-                if pusher is not None:
-                    pusher.run_due()
-            except Exception as e:
-                self.logger.error(f"定时推送异常: {e}", exc_info=True)
-            try:
-                self.tick()
-            except Exception as e:
-                self.logger.error(f"Tick #{self._tick_id} 未捕获异常: {e}", exc_info=True)
-            # 每 60 个 tick（约 15 分钟，按 15s 间隔）输出一次 DeepSeek token 统计
-            if self._tick_id > 0 and self._tick_id % 60 == 0:
-                from src.utils.qwen_client import QwenClient
-                QwenClient.log_token_stats(self.logger.runtime_logger)
-            time.sleep(max(0.0, interval - (time.monotonic() - tick_started)))
+        try:
+            while self.running:
+                if self._check_sleep(datetime.now()):
+                    time.sleep(SLEEP_CHECK_SECONDS)
+                    continue
+                tick_started = time.monotonic()
+                try:
+                    pusher = getattr(self, "scheduled_pusher", None)
+                    if pusher is not None:
+                        pusher.run_due()
+                except Exception as e:
+                    self.logger.error(f"定时推送异常: {e}", exc_info=True)
+                try:
+                    self.tick()
+                except Exception as e:
+                    self.logger.error(f"Tick #{self._tick_id} 未捕获异常: {e}", exc_info=True)
+                # 每 60 个 tick（约 15 分钟，按 15s 间隔）输出一次 DeepSeek token 统计
+                if self._tick_id > 0 and self._tick_id % 60 == 0:
+                    from src.utils.qwen_client import QwenClient
+                    QwenClient.log_token_stats(self.logger.runtime_logger)
+                time.sleep(max(0.0, interval - (time.monotonic() - tick_started)))
+        finally:
+            rel_eval = getattr(self, "relationship_evaluator", None)
+            if rel_eval is not None:
+                rel_eval.stop(flush=False)
 
     def _check_sleep(self, now: datetime) -> bool:
         """返回当前是否休眠；进入/醒来时记日志，醒来时开始「积压消息不回复」。"""

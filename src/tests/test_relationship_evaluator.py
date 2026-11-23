@@ -138,3 +138,52 @@ def test_multi_user_bucketing_and_background_worker(tmp_path):
     assert level_a == "guarded"
     assert rec_b is not None and rec_b.affection == pytest.approx(0.6)
     engine.store.close()
+
+
+def test_no_double_penalty_when_sync_track_handled_boundary(tmp_path):
+    clock = [1_700_000_000.0]
+    engine = _make_engine(tmp_path, clock)
+    rec = engine.get_or_create("room_1", "甲", sender_wxid="wxid_a", persist=True)
+    rec.trust = 20.0
+    engine.store.upsert(rec)
+
+    llm = _FakeLLM('{"events":[{"event_type":"boundary_push","intensity":1.0,"confidence":0.95,"summary":"索要语音"}]}')
+    evaluator = RelationshipEvaluator(engine, llm, batch_turns=1, now=lambda: clock[0])
+
+    m_a = _msg("发个语音听听", sender="甲", wxid="wxid_a")
+    m_b = _msg("谢谢帮忙", sender="乙", wxid="wxid_b")
+    neg = engine.record_replies(
+        "测试群", [m_a, m_b], ["不发语音", "不客气"], chatroom_id="room_1", reply_targets=["甲", "乙"]
+    )
+    enqueued = evaluator.enqueue_replies(
+        "测试群",
+        [m_a, m_b],
+        ["不发语音", "不客气"],
+        chatroom_id="room_1",
+        reply_targets=["甲", "乙"],
+        skip_user_keys=neg,
+    )
+    assert enqueued == 1  # 仅乙入队，甲已在同步轨扣分跳过
+    evaluator.flush_due()
+    # 甲只扣一次（20 - 3 = 17），不被双重扣分
+    assert engine.store.get("room_1", "wxid:wxid_a").trust == pytest.approx(17.0)
+    engine.store.close()
+
+
+def test_compatible_with_llm_client_without_timeout_param(tmp_path):
+    class _NoTimeoutLLM:
+        def __init__(self):
+            self.called = 0
+
+        def chat(self, messages=None, temperature=None, max_tokens=None):
+            self.called += 1
+            return '{"events":[{"event_type":"sincere_care","intensity":1.0,"confidence":0.9,"summary":"真诚关心"}]}'
+
+    clock = [1_700_000_000.0]
+    engine = _make_engine(tmp_path, clock)
+    llm = _NoTimeoutLLM()
+    evaluator = RelationshipEvaluator(engine, llm, batch_turns=1, now=lambda: clock[0])
+    evaluator.enqueue_replies("测试群", [_msg("注意休息")], ["@甲 知道啦"])
+    assert evaluator.flush_due() == 1
+    assert llm.called == 1
+    engine.store.close()

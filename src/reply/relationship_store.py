@@ -444,6 +444,18 @@ class RelationshipStore:
             ).fetchone()
             return row is not None
 
+    def resolve_negative_events(self, chat_key: str, user_key: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                UPDATE relationship_events
+                SET resolved = 1
+                WHERE chat_key = ? AND user_key = ? AND resolved = 0
+                """,
+                (chat_key, user_key),
+            )
+            self._conn.commit()
+
     def list_events(self, chat_key: str, user_key: str, limit: int = 20) -> List[Dict[str, Any]]:
         with self._lock:
             rows = self._conn.execute(
@@ -482,6 +494,7 @@ class RelationshipEngine:
         self.user_wiki_dir = Path(user_wiki_dir) if user_wiki_dir else None
         self.now = now
         self.daily_chat_interval = daily_chat_interval
+        self._op_lock = threading.RLock()
 
     def _has_user_wiki(self, sender: str) -> bool:
         if not self.user_wiki_dir or not self.user_wiki_dir.exists():
@@ -561,40 +574,41 @@ class RelationshipEngine:
         persist: bool = True,
     ) -> RelationshipRecord:
         """按 wxid 优先查找记录；若存在旧 name: 记录且本次带 wxid，自动合并迁移。"""
-        ukey = make_user_key(sender, sender_wxid)
-        if not ukey:
-            return RelationshipRecord(chat_key=chat_key, user_key="", display_name=_clean_sender_name(sender))
+        with self._op_lock:
+            ukey = make_user_key(sender, sender_wxid)
+            if not ukey:
+                return RelationshipRecord(chat_key=chat_key, user_key="", display_name=_clean_sender_name(sender))
 
-        rec = self.store.get(chat_key, ukey)
-        if rec is not None:
-            old_name = rec.display_name
-            rec.add_alias(sender)
-            if persist and rec.display_name != old_name:
-                rec.updated_at = self.now()
+            rec = self.store.get(chat_key, ukey)
+            if rec is not None:
+                old_name = rec.display_name
+                rec.add_alias(sender)
+                if persist and rec.display_name != old_name:
+                    rec.updated_at = self.now()
+                    self.store.upsert(rec)
+                return rec
+
+            # 本次带 wxid 但 wxid 记录不存在：尝试把同群旧 name: 记录迁移过来
+            if sender_wxid:
+                legacy = self.store.find_by_alias(chat_key, sender, key_prefix="name:")
+                if legacy is not None:
+                    old_key = legacy.user_key
+                    legacy.user_key = ukey
+                    legacy.add_alias(sender)
+                    legacy.updated_at = self.now()
+                    if persist:
+                        self.store.migrate_key(chat_key, old_key, legacy)
+                    return legacy
+            else:
+                # 无 wxid 时尝试按昵称/OCR 变体匹配已有记录（含 wxid: 记录）
+                matched = self.store.find_by_alias(chat_key, sender)
+                if matched is not None:
+                    return matched
+
+            rec = self._create_initial_record(chat_key, ukey, sender, history=history)
+            if persist:
                 self.store.upsert(rec)
             return rec
-
-        # 本次带 wxid 但 wxid 记录不存在：尝试把同群旧 name: 记录迁移过来
-        if sender_wxid:
-            legacy = self.store.find_by_alias(chat_key, sender, key_prefix="name:")
-            if legacy is not None:
-                old_key = legacy.user_key
-                legacy.user_key = ukey
-                legacy.add_alias(sender)
-                legacy.updated_at = self.now()
-                if persist:
-                    self.store.migrate_key(chat_key, old_key, legacy)
-                return legacy
-        else:
-            # 无 wxid 时尝试按昵称/OCR 变体匹配已有记录（含 wxid: 记录）
-            matched = self.store.find_by_alias(chat_key, sender)
-            if matched is not None:
-                return matched
-
-        rec = self._create_initial_record(chat_key, ukey, sender, history=history)
-        if persist:
-            self.store.upsert(rec)
-        return rec
 
     def _reset_daily_counters_if_needed(self, rec: RelationshipRecord, today: str) -> None:
         if rec.last_interaction_date != today:
@@ -615,93 +629,101 @@ class RelationshipEngine:
         resolved: Optional[bool] = None,
         history: Optional[List[ChatMessage]] = None,
     ) -> Optional[RelationshipRecord]:
-        """按程序规则结算单条关系事件并落库。"""
+        """按程序规则原子结算单条关系事件并落库。"""
         if event_type not in EVENT_WEIGHTS:
             _logger.warning("[Relationship] 未知事件类型，忽略: %s", event_type)
             return None
         if confidence < MIN_EVENT_CONFIDENCE:
             return None
 
-        rec = self.get_or_create(chat_key, sender, sender_wxid=sender_wxid, history=history, persist=True)
-        if not rec.user_key:
-            return None
+        with self._op_lock:
+            rec = self.get_or_create(chat_key, sender, sender_wxid=sender_wxid, history=history, persist=True)
+            if not rec.user_key:
+                return None
 
-        now_ts = self.now()
-        today = _date_str(now_ts)
-        self._reset_daily_counters_if_needed(rec, today)
+            now_ts = self.now()
+            today = _date_str(now_ts)
+            self._reset_daily_counters_if_needed(rec, today)
 
-        base_fam, base_aff, base_trust = EVENT_WEIGHTS[event_type]
-        scale = max(0.0, min(1.0, float(intensity)))
-        is_negative = event_type in NEGATIVE_EVENTS
+            base_fam, base_aff, base_trust = EVENT_WEIGHTS[event_type]
+            scale = max(0.0, min(1.0, float(intensity)))
+            is_negative = event_type in NEGATIVE_EVENTS
 
-        if is_negative:
-            d_fam = base_fam * scale
-            d_aff = base_aff * scale
-            d_trust = base_trust * scale
-            if event_type == "boundary_push":
-                rec.guarded_until = max(rec.guarded_until or 0.0, now_ts + GUARDED_DURATION_FIRST)
-                rec.guarded_reason = summary or "越界要求被拒"
-            elif event_type == "repeated_annoyance":
-                rec.guarded_until = max(rec.guarded_until or 0.0, now_ts + GUARDED_DURATION_REPEAT)
-                rec.guarded_reason = summary or "被拒后反复纠缠"
-            elif event_type == "rude_or_deception":
-                rec.guarded_until = max(rec.guarded_until or 0.0, now_ts + GUARDED_DURATION_REPEAT)
-                rec.guarded_reason = summary or "明显冒犯或欺骗"
-            event_resolved = False if resolved is None else resolved
-        else:
-            # 24 小时同类正面事件收益递减
-            recent_count = self.store.count_recent_events(
-                chat_key, rec.user_key, event_type, now_ts - 86400.0
+            if is_negative:
+                d_fam = base_fam * scale
+                d_aff = base_aff * scale
+                d_trust = base_trust * scale
+                if event_type == "boundary_push":
+                    rec.guarded_until = max(rec.guarded_until or 0.0, now_ts + GUARDED_DURATION_FIRST)
+                    rec.guarded_reason = summary or "越界要求被拒"
+                elif event_type == "repeated_annoyance":
+                    rec.guarded_until = max(rec.guarded_until or 0.0, now_ts + GUARDED_DURATION_REPEAT)
+                    rec.guarded_reason = summary or "被拒后反复纠缠"
+                elif event_type == "rude_or_deception":
+                    rec.guarded_until = max(rec.guarded_until or 0.0, now_ts + GUARDED_DURATION_REPEAT)
+                    rec.guarded_reason = summary or "明显冒犯或欺骗"
+                event_resolved = False if resolved is None else resolved
+            else:
+                # 24 小时同类正面事件收益递减
+                recent_count = self.store.count_recent_events(
+                    chat_key, rec.user_key, event_type, now_ts - 86400.0
+                )
+                decay = REPEAT_DECAY_FACTORS[min(recent_count, len(REPEAT_DECAY_FACTORS) - 1)]
+                raw_fam = base_fam * scale * decay
+                raw_aff = base_aff * scale * decay
+                raw_trust = base_trust * scale * decay
+
+                # 每日正向总上限
+                d_fam = min(raw_fam, max(0.0, DAILY_MAX_FAMILIARITY_GAIN - rec.daily_familiarity_gain))
+                d_aff = min(raw_aff, max(0.0, DAILY_MAX_AFFECTION_GAIN - rec.daily_affection_gain))
+                d_trust = min(raw_trust, max(0.0, DAILY_MAX_TRUST_GAIN - rec.daily_trust_gain))
+
+                rec.daily_familiarity_gain += d_fam
+                rec.daily_affection_gain += d_aff
+                rec.daily_trust_gain += d_trust
+
+                # 真诚道歉可缩短剩余警戒期（减半），但不直接清零严重信任损失
+                if event_type == "sincere_apology" and rec.guarded_until and rec.guarded_until > now_ts:
+                    remaining = rec.guarded_until - now_ts
+                    rec.guarded_until = now_ts + remaining * 0.5
+                event_resolved = True if resolved is None else resolved
+
+            if rec.last_interaction_date != today:
+                rec.interaction_days += 1
+                rec.last_interaction_date = today
+
+            rec.familiarity = _clamp(rec.familiarity + d_fam)
+            rec.affection = _clamp(rec.affection + d_aff)
+            rec.trust = _clamp(rec.trust + d_trust)
+            rec.stage = compute_stage(
+                rec.stage, rec.familiarity, rec.affection, rec.trust, rec.interaction_days
             )
-            decay = REPEAT_DECAY_FACTORS[min(recent_count, len(REPEAT_DECAY_FACTORS) - 1)]
-            raw_fam = base_fam * scale * decay
-            raw_aff = base_aff * scale * decay
-            raw_trust = base_trust * scale * decay
+            if event_type == "daily_chat":
+                rec.last_daily_chat_at = now_ts
 
-            # 每日正向总上限
-            d_fam = min(raw_fam, max(0.0, DAILY_MAX_FAMILIARITY_GAIN - rec.daily_familiarity_gain))
-            d_aff = min(raw_aff, max(0.0, DAILY_MAX_AFFECTION_GAIN - rec.daily_affection_gain))
-            d_trust = min(raw_trust, max(0.0, DAILY_MAX_TRUST_GAIN - rec.daily_trust_gain))
+            # 恢复闭环：守边界或真诚道歉且信任回到安全线以上时，将旧未解决负面事件标为已解决
+            if event_type in ("respect_boundary", "sincere_apology") and rec.trust >= 10.0:
+                self.store.resolve_negative_events(chat_key, rec.user_key)
+            if rec.guarded_until is not None and rec.guarded_until <= now_ts and not self._is_guarded(rec):
+                rec.guarded_until = None
+                rec.guarded_reason = ""
 
-            rec.daily_familiarity_gain += d_fam
-            rec.daily_affection_gain += d_aff
-            rec.daily_trust_gain += d_trust
-
-            # 真诚道歉可缩短剩余警戒期（减半），但不直接清零严重信任损失
-            if event_type == "sincere_apology" and rec.guarded_until and rec.guarded_until > now_ts:
-                remaining = rec.guarded_until - now_ts
-                rec.guarded_until = now_ts + remaining * 0.5
-            event_resolved = True if resolved is None else resolved
-
-        if rec.last_interaction_date != today:
-            rec.interaction_days += 1
-            rec.last_interaction_date = today
-
-        rec.familiarity = _clamp(rec.familiarity + d_fam)
-        rec.affection = _clamp(rec.affection + d_aff)
-        rec.trust = _clamp(rec.trust + d_trust)
-        rec.stage = compute_stage(
-            rec.stage, rec.familiarity, rec.affection, rec.trust, rec.interaction_days
-        )
-        if event_type == "daily_chat":
-            rec.last_daily_chat_at = now_ts
-        rec.updated_at = now_ts
-
-        self.store.upsert(rec)
-        self.store.insert_event(
-            chat_key,
-            rec.user_key,
-            event_type,
-            d_fam,
-            d_aff,
-            d_trust,
-            intensity=scale,
-            confidence=confidence,
-            summary=summary,
-            resolved=event_resolved,
-            created_at=now_ts,
-        )
-        return rec
+            rec.updated_at = now_ts
+            self.store.upsert(rec)
+            self.store.insert_event(
+                chat_key,
+                rec.user_key,
+                event_type,
+                d_fam,
+                d_aff,
+                d_trust,
+                intensity=scale,
+                confidence=confidence,
+                summary=summary,
+                resolved=event_resolved,
+                created_at=now_ts,
+            )
+            return rec
 
     def _is_guarded(self, rec: RelationshipRecord) -> bool:
         now_ts = self.now()
@@ -775,19 +797,52 @@ class RelationshipEngine:
         return results
 
     @staticmethod
-    def _reply_target_msg(reply: str, unreplied: List[ChatMessage]) -> Optional[ChatMessage]:
-        """定位本条回复对应的未读消息对象，用于精准归属互动与越界警戒。"""
+    def _reply_target_msg(
+        reply: str,
+        unreplied: List[ChatMessage],
+        target_hint: Optional[str] = None,
+    ) -> Optional[ChatMessage]:
+        """定位本条回复对应的未读消息对象；支持剥 @ 前的 target_hint 与含空格昵称前缀匹配。"""
+        text = (reply or "").strip()
+        if not text or text.startswith("[表情包:"):
+            return None
         other_msgs = [m for m in unreplied if m.sender_type == SenderType.OTHER and m.sender]
         if not other_msgs:
             return None
-        m = _LEADING_AT_RE.match(reply or "")
-        if m:
-            target = m.group(1)
-            if target not in _UNKNOWN_SENDERS:
+
+        # 1. 优先使用剥 @ 前记录的 target_hint
+        if target_hint and target_hint not in _UNKNOWN_SENDERS:
+            cleaned_hint = _clean_sender_name(target_hint)
+            for msg in reversed(other_msgs):
+                if _same_person_name(_clean_sender_name(msg.sender), cleaned_hint):
+                    return msg
+
+        # 2. 优先用本批未读中已知昵称（按长度降序）做 @<sender> 前缀匹配，支持含空格昵称
+        if text.startswith("@"):
+            body = text[1:]
+            known_msgs = sorted(
+                other_msgs,
+                key=lambda m: len(_clean_sender_name(m.sender)),
+                reverse=True,
+            )
+            for msg in known_msgs:
+                cname = _clean_sender_name(msg.sender)
+                if not cname or cname in _UNKNOWN_SENDERS:
+                    continue
+                if body.startswith(cname) and (
+                    len(body) == len(cname) or body[len(cname)].isspace()
+                ):
+                    return msg
+
+            # 回退到单 token @匹配（允许 1 字 OCR 误差）
+            m = _LEADING_AT_RE.match(text)
+            if m and m.group(1) not in _UNKNOWN_SENDERS:
+                target = m.group(1)
                 for msg in reversed(other_msgs):
                     if _same_person_name(_clean_sender_name(msg.sender), target):
                         return msg
-        # 没有 @ 时，仅当本批未读只来自同一人时才归属到该人
+
+        # 3. 没有 @ 时，仅当本批未读只来自同一人时才归属到该人
         unique: List[ChatMessage] = []
         for msg in other_msgs:
             if not any(_same_person_name(_clean_sender_name(msg.sender), _clean_sender_name(u.sender)) for u in unique):
@@ -801,14 +856,21 @@ class RelationshipEngine:
         replies: List[str],
         *,
         chatroom_id: Optional[str] = None,
-    ) -> None:
-        """同步轨：在回复真正发出后记录基础 daily_chat（带最小间隔防刷分）与精准越界警戒。"""
+        reply_targets: Optional[List[Optional[str]]] = None,
+    ) -> set:
+        """同步轨：在回复真正发出后记录基础 daily_chat（带最小间隔防刷分）与精准越界警戒。
+
+        返回本次已在同步轨处理过负面越界事件的 (chat_key, user_key) 集合，
+        供异步评估器跳过同轮重复扣分。
+        """
+        negative_handled: set = set()
         if not unreplied or not replies:
-            return
+            return negative_handled
         now_ts = self.now()
         handled_users: set = set()
-        for reply in replies:
-            target_msg = self._reply_target_msg(reply, unreplied)
+        for idx, reply in enumerate(replies):
+            hint = reply_targets[idx] if (reply_targets and idx < len(reply_targets)) else None
+            target_msg = self._reply_target_msg(reply, unreplied, target_hint=hint)
             if target_msg is None:
                 continue
             ckey = make_chat_key(chat_name or target_msg.chat_name, chatroom_id or getattr(target_msg, "chatroom_id", None))
@@ -832,21 +894,24 @@ class RelationshipEngine:
             )
             replied_refusal = any(word in (reply or "").replace(" ", "") for word in _REFUSALS)
 
-            rec = self.get_or_create(ckey, target_msg.sender, sender_wxid=wxid, persist=True)
-            if asked_boundary and replied_refusal:
-                event_type = "repeated_annoyance" if self._is_guarded(rec) else "boundary_push"
-                self.apply_event(
-                    ckey,
-                    target_msg.sender,
-                    event_type,
-                    sender_wxid=wxid,
-                    summary="越界要求触发拒绝",
-                )
-            elif now_ts - rec.last_daily_chat_at >= self.daily_chat_interval:
-                self.apply_event(
-                    ckey,
-                    target_msg.sender,
-                    "daily_chat",
-                    sender_wxid=wxid,
-                    summary="常规有效互动",
-                )
+            with self._op_lock:
+                rec = self.get_or_create(ckey, target_msg.sender, sender_wxid=wxid, persist=True)
+                if asked_boundary and replied_refusal:
+                    event_type = "repeated_annoyance" if self._is_guarded(rec) else "boundary_push"
+                    self.apply_event(
+                        ckey,
+                        target_msg.sender,
+                        event_type,
+                        sender_wxid=wxid,
+                        summary="越界要求触发拒绝",
+                    )
+                    negative_handled.add((ckey, ukey))
+                elif now_ts - rec.last_daily_chat_at >= self.daily_chat_interval:
+                    self.apply_event(
+                        ckey,
+                        target_msg.sender,
+                        "daily_chat",
+                        sender_wxid=wxid,
+                        summary="常规有效互动",
+                    )
+        return negative_handled
