@@ -260,10 +260,14 @@ class WeChatBot:
             print(f"  • 表情包回复: 已启用，{mode}（可用标签: {', '.join(tags) if tags else '无'}）")
         from src.reply.relationship_store import RelationshipEngine
         from src.reply.relationship_evaluator import RelationshipEvaluator
+        from src.reply.mood_engine import MoodEngine
         self.relationship_engine = RelationshipEngine()
+        self.mood_engine = MoodEngine()
         enable_rel_eval = os.environ.get("ENABLE_RELATIONSHIP_EVALUATOR", "1").strip().lower() in ("1", "true", "yes", "on")
         self.relationship_evaluator: Optional[RelationshipEvaluator] = (
-            RelationshipEvaluator(self.relationship_engine, llm_client=actual_llm)
+            RelationshipEvaluator(
+                self.relationship_engine, llm_client=actual_llm, mood_engine=self.mood_engine
+            )
             if (enable_rel_eval and actual_llm is not None) else None
         )
         if self.relationship_evaluator is not None:
@@ -279,6 +283,7 @@ class WeChatBot:
             sticker_prompt=sticker_prompt,
             sticker_tags_provider=self.sticker_policy.available_tags if self.sticker_policy is not None else None,
             relationship_engine=self.relationship_engine,
+            mood_engine=self.mood_engine,
         )
         self.generator._system_prompt()  # persona 占位符（BOT_NAME 等）未配置时启动即报错
         self.sender = WeChatMessageSender(silent_mode=os.environ.get("WECHAT_SILENT_MODE") == "1")
@@ -934,11 +939,31 @@ class WeChatBot:
                 and is_group
                 and self._group_feature_enabled(chat_name, "voice_reply", True)
             )
+            decision = None
+            voice_target_msg = to_reply[-1] if to_reply else None
+            if to_reply:
+                _rtargets = getattr(self.generator, "last_reply_targets", None) or []
+                if _rtargets and _rtargets[0] and getattr(self, "relationship_engine", None) is not None:
+                    matched_voice_msg = self.relationship_engine._reply_target_msg(
+                        replies[0] if replies else "", to_reply, target_hint=_rtargets[0]
+                    )
+                    if matched_voice_msg is not None:
+                        voice_target_msg = matched_voice_msg
             if voice_allowed:
                 decision = self.voice_policy.decide(
-                    chat_name, to_reply[-1].sender if to_reply else "", replies,
+                    chat_name, voice_target_msg.sender if voice_target_msg else "", replies,
                     getattr(self.generator, "last_voice_meta", None), datetime.now(),
                 )
+                # 心情与语音一致性：犯困/不耐烦/小郁闷时抑制主动发元气语音
+                mood_engine = getattr(self, "mood_engine", None)
+                if decision.send_voice and decision.scene != "要听语音" and mood_engine is not None:
+                    from src.reply.relationship_store import make_chat_key, make_user_key
+                    m_ckey = make_chat_key(chat_name, getattr(voice_target_msg, "chatroom_id", None) if voice_target_msg else None)
+                    m_ukey = make_user_key(voice_target_msg.sender, getattr(voice_target_msg, "sender_wxid", None)) if voice_target_msg else None
+                    in_bed = in_sleep_window(getattr(self.generator, "bedtime_window", None), datetime.now())
+                    if not mood_engine.allows_upbeat_voice(m_ckey, user_key=m_ukey, in_bedtime=in_bed):
+                        decision.send_voice = False
+                        decision.reason = "当前心情/精力不适合主动发欢快语音"
                 self.logger.info("[VoiceReply] chat=%s sender=%s scene=%s decision=%s reason=%s",
                                  chat_name, to_reply[-1].sender if to_reply else "", decision.scene or "-",
                                  "发" if decision.send_voice else "不发", decision.reason)
@@ -1122,6 +1147,21 @@ class WeChatBot:
                             reply_targets=reply_targets,
                             skip_user_keys=negative_handled,
                         )
+                    mood_engine = getattr(self, "mood_engine", None)
+                    if mood_engine is not None:
+                        from src.reply.relationship_store import make_chat_key, make_user_key
+                        m_ckey = make_chat_key(chat_name, chatroom_id)
+                        mood_engine.record_bot_reply(m_ckey)
+                        for (neg_ckey, neg_ukey), neg_event in negative_handled.items():
+                            mood_engine.apply_event(
+                                neg_ckey, neg_event, user_key=neg_ukey, summary="越界要求触发拒绝"
+                            )
+                        if voiced and decision is not None and decision.mood:
+                            m_ukey = (
+                                make_user_key(voice_target_msg.sender, getattr(voice_target_msg, "sender_wxid", None))
+                                if voice_target_msg else None
+                            )
+                            mood_engine.apply_voice_mood(m_ckey, decision.mood, user_key=m_ukey)
                 except Exception as e:
                     self.logger.warning("[Relationship] 记录互动失败: %s", e)
 
@@ -1254,6 +1294,12 @@ class WeChatBot:
             rel_eval = getattr(self, "relationship_evaluator", None)
             if rel_eval is not None:
                 rel_eval.stop(flush=False)
+            rel_engine = getattr(self, "relationship_engine", None)
+            if rel_engine is not None:
+                rel_engine.store.close()
+            mood_engine = getattr(self, "mood_engine", None)
+            if mood_engine is not None:
+                mood_engine.store.close()
 
     def _check_sleep(self, now: datetime) -> bool:
         """返回当前是否休眠；进入/醒来时记日志，醒来时开始「积压消息不回复」。"""

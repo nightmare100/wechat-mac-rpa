@@ -322,13 +322,15 @@ class ReplyGenerator:
                  group_config=None,
                  sticker_prompt: str = "",
                  sticker_tags_provider=None,
-                 relationship_engine=None):
+                 relationship_engine=None,
+                 mood_engine=None):
         self.llm_client = llm_client
         self.voice_prompt = voice_prompt  # 回复语音：启用时追加到群聊 system prompt（见 src/reply/voice_policy.py）
         self.sticker_prompt = sticker_prompt  # 表情包提示词模板（见 src/reply/sticker_policy.py）
         self.sticker_tags_provider = sticker_tags_provider  # 可调用对象，动态返回可用表情标签列表
         self.group_config = group_config  # 可选按群开关覆写（见 src/bot/group_config.py）
         self.relationship_engine = relationship_engine  # 可选持久化关系引擎（见 src/reply/relationship_store.py）
+        self.mood_engine = mood_engine  # 可选持久化心情引擎（见 src/reply/mood_engine.py）
         self.last_voice_meta: Optional[Dict] = None
         self.last_sticker_meta: Optional[Dict] = None
         self.last_go_online: bool = False  # 本次回复是否答应朧月上线（触发静默）
@@ -1799,7 +1801,24 @@ class ReplyGenerator:
         bedtime = getattr(self, "bedtime_window", None)
         in_bedtime = in_sleep_window(bedtime, now_dt)
         from src.reply.current_state import current_state
-        mood, energy, state_rules = current_state(in_bedtime)
+        mood_chat_key = ""
+        mood_user_key = None
+        if self.mood_engine is not None and unreplied:
+            from src.reply.relationship_store import make_chat_key, make_user_key
+            last_other = next((m for m in reversed(unreplied) if m.sender_type == SenderType.OTHER), None)
+            target_for_mood = last_other or unreplied[-1]
+            mood_chat_key = make_chat_key(
+                chat_name or target_for_mood.chat_name,
+                getattr(target_for_mood, "chatroom_id", None),
+            )
+            if last_other is not None and last_other.sender:
+                mood_user_key = make_user_key(last_other.sender, getattr(last_other, "sender_wxid", None))
+        mood, energy, state_rules = current_state(
+            in_bedtime,
+            mood_engine=self.mood_engine,
+            chat_key=mood_chat_key,
+            user_key=mood_user_key,
+        )
         session_fields.append(
             f'<current_state mood="{mood}" energy="{energy}">{xml_escape(state_rules)}</current_state>'
         )

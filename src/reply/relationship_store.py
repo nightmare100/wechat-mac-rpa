@@ -857,13 +857,13 @@ class RelationshipEngine:
         *,
         chatroom_id: Optional[str] = None,
         reply_targets: Optional[List[Optional[str]]] = None,
-    ) -> set:
+    ) -> Dict[Tuple[str, str], str]:
         """同步轨：在回复真正发出后记录基础 daily_chat（带最小间隔防刷分）与精准越界警戒。
 
-        返回本次已在同步轨处理过负面越界事件的 (chat_key, user_key) 集合，
-        供异步评估器跳过同轮重复扣分。
+        返回本次已在同步轨处理过负面越界事件的 {(chat_key, user_key): event_type} 映射，
+        供异步评估器跳过同轮重复扣分，并供 MoodEngine 按真实事件类型同步更新心情。
         """
-        negative_handled: set = set()
+        negative_handled: Dict[Tuple[str, str], str] = {}
         if not unreplied or not replies:
             return negative_handled
         now_ts = self.now()
@@ -905,7 +905,7 @@ class RelationshipEngine:
                         sender_wxid=wxid,
                         summary="越界要求触发拒绝",
                     )
-                    negative_handled.add((ckey, ukey))
+                    negative_handled[(ckey, ukey)] = event_type
                 elif now_ts - rec.last_daily_chat_at >= self.daily_chat_interval:
                     self.apply_event(
                         ckey,

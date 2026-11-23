@@ -89,6 +89,7 @@ class RelationshipEvaluator:
         engine: RelationshipEngine,
         llm_client: Any = None,
         *,
+        mood_engine: Any = None,
         batch_turns: int = 3,
         idle_seconds: float = 300.0,
         poll_interval: float = 30.0,
@@ -98,6 +99,7 @@ class RelationshipEvaluator:
     ):
         self.engine = engine
         self.llm_client = llm_client
+        self.mood_engine = mood_engine
         self.batch_turns = max(1, int(batch_turns))
         self.idle_seconds = max(1.0, float(idle_seconds))
         self.poll_interval = max(0.05, float(poll_interval))
@@ -355,6 +357,18 @@ class RelationshipEvaluator:
             )
             if rec is not None:
                 applied += 1
+                if self.mood_engine is not None:
+                    try:
+                        self.mood_engine.apply_event(
+                            bucket.chat_key,
+                            ev["event_type"],
+                            user_key=rec.user_key,
+                            intensity=ev["intensity"],
+                            relationship_level=current_level,
+                            summary=ev["summary"],
+                        )
+                    except Exception as e:
+                        _logger.warning("[RelationshipEvaluator] 同步更新心情失败 (%s): %s", bucket.sender, e)
                 _logger.info(
                     "[RelationshipEvaluator] %s (%s) -> %s (intensity=%.2f, conf=%.2f, stage=%s)",
                     bucket.sender,
