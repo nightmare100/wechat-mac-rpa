@@ -87,3 +87,52 @@ def test_relationship_dashboard_empty_and_with_data(tmp_path, monkeypatch):
     ov2 = client.get("/api/relationship/overview", params={"chat": "room_1", "q": "李四"}).json()
     assert ov2["users"][0]["is_guarded"] is False
     assert ov2["users"][0]["mood"] == "开心"  # 个人负面已清，回落群级氛围
+
+
+def test_relationship_admin_buddy_filter_consistency_and_chat_name_map(tmp_path, monkeypatch):
+    import sqlite3
+    from fastapi.testclient import TestClient
+
+    from src.reply.mood_engine import MoodEngine, MoodStore
+    from src.reply.relationship_store import RelationshipEngine, RelationshipStore
+
+    monkeypatch.setattr(admin, "WORK_DIR", str(tmp_path))
+    monkeypatch.setenv("BUDDY_MATCH", "朧月,胧月")
+
+    # 准备 chat_history.db 的群名映射
+    hist_db = tmp_path / "data" / "db" / "chat_history.db"
+    hist_db.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(hist_db))
+    conn.execute("CREATE TABLE chatrooms (chatroom_id TEXT PRIMARY KEY, display_name TEXT)")
+    conn.execute("INSERT INTO chatrooms VALUES ('123@chatroom', '战神公会群')")
+    conn.execute("INSERT INTO chatrooms VALUES ('456@chatroom', '摸鱼小群')")
+    conn.commit()
+    conn.close()
+
+    rel_store = RelationshipStore(db_path=tmp_path / "data" / "db" / "relationship.db")
+    rel_engine = RelationshipEngine(store=rel_store, user_wiki_dir=tmp_path / "wiki")
+    rel_engine.apply_event("123@chatroom", "朧月", "daily_chat", sender_wxid="wxid_buddy")
+    rel_engine.apply_event("456@chatroom", "路人", "boundary_push", sender_wxid="wxid_other")
+    rel_store.close()
+
+    mood_store = MoodStore(db_path=tmp_path / "data" / "db" / "mood.db")
+    mood_engine = MoodEngine(store=mood_store)
+    mood_engine.apply_event("123@chatroom", "sincere_care", user_key="wxid:wxid_buddy")
+    mood_engine.apply_event("456@chatroom", "friendly_banter", user_key="wxid:wxid_other")
+    mood_store.close()
+
+    client = TestClient(admin.app)
+    # 1. 按群筛选时，summary.guarded_count 与 group_moods 口径均与筛选一致，且映射到中文群名
+    ov = client.get("/api/relationship/overview", params={"chat": "123@chatroom"}).json()
+    assert ov["summary"]["user_count"] == 1
+    assert ov["summary"]["guarded_count"] == 0
+    assert len(ov["group_moods"]) == 1
+    assert ov["group_moods"][0]["chat_label"] == "战神公会群"
+    assert ov["users"][0]["chat_label"] == "战神公会群"
+    assert ov["users"][0]["effective_level"] == "buddy"
+
+    # 2. 详情页与总览页一致，也显示 buddy 和中文群名
+    detail = client.get("/relationship/user", params={"chat_key": "123@chatroom", "user_key": "wxid:wxid_buddy"})
+    assert detail.status_code == 200
+    assert "buddy" in detail.text
+    assert "战神公会群" in detail.text

@@ -1965,6 +1965,28 @@ def _mood_db_path() -> Path:
     return Path(WORK_DIR) / "data" / "db" / "mood.db"
 
 
+def _load_chat_name_map() -> Dict[str, str]:
+    """从 chat_history.db 读取 chatroom_id -> 中文群名 映射（只读容错）。"""
+    import sqlite3
+
+    history_db = Path(WORK_DIR) / "data" / "db" / "chat_history.db"
+    if not history_db.exists():
+        return {}
+    conn = sqlite3.connect(str(history_db))
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute("SELECT chatroom_id, display_name FROM chatrooms").fetchall()
+        return {
+            str(r["chatroom_id"]): str(r["display_name"])
+            for r in rows
+            if r["chatroom_id"] and r["display_name"]
+        }
+    except sqlite3.OperationalError:
+        return {}
+    finally:
+        conn.close()
+
+
 def _fmt_ts(ts: Optional[float]) -> str:
     if not ts:
         return "-"
@@ -1985,6 +2007,7 @@ def _load_relationship_and_mood_snapshot(chat_filter: str = "", query: str = "")
     now_ts = _time.time()
     rel_db = _relationship_db_path()
     mood_db = _mood_db_path()
+    chat_name_map = _load_chat_name_map()
 
     group_moods: Dict[str, Dict[str, Any]] = {}
     user_moods: Dict[tuple, Dict[str, Any]] = {}
@@ -2000,8 +2023,10 @@ def _load_relationship_and_mood_snapshot(chat_filter: str = "", query: str = "")
                 decayed = _decay_intensity(raw_mood, raw_int, now_ts - updated_at)
                 eff_mood = raw_mood if decayed >= DECAY_FLOOR else "平静"
                 eff_int = round(decayed, 1) if eff_mood != "平静" else 0.0
+                ck = r["chat_key"]
                 item = {
-                    "chat_key": r["chat_key"],
+                    "chat_key": ck,
+                    "chat_label": chat_name_map.get(ck, ck),
                     "scope_key": r["scope_key"],
                     "mood": eff_mood,
                     "intensity": eff_int,
@@ -2009,9 +2034,9 @@ def _load_relationship_and_mood_snapshot(chat_filter: str = "", query: str = "")
                     "updated_at": updated_at,
                 }
                 if r["scope_key"] == MoodEngine.GROUP_SCOPE:
-                    group_moods[r["chat_key"]] = item
+                    group_moods[ck] = item
                 else:
-                    user_moods[(r["chat_key"], r["scope_key"])] = item
+                    user_moods[(ck, r["scope_key"])] = item
         except sqlite3.OperationalError:
             pass
         finally:
@@ -2020,7 +2045,6 @@ def _load_relationship_and_mood_snapshot(chat_filter: str = "", query: str = "")
     users: List[Dict[str, Any]] = []
     chats: set = set(group_moods.keys())
     total_events = 0
-    guarded_count = 0
     if rel_db.exists():
         conn = sqlite3.connect(str(rel_db))
         conn.row_factory = sqlite3.Row
@@ -2039,6 +2063,7 @@ def _load_relationship_and_mood_snapshot(chat_filter: str = "", query: str = "")
                 ckey = r["chat_key"]
                 ukey = r["user_key"]
                 chats.add(ckey)
+                chat_label = chat_name_map.get(ckey, ckey)
                 dname = r["display_name"] or ukey
                 try:
                     aliases = _json.loads(r["aliases_json"] or "[]")
@@ -2052,8 +2077,6 @@ def _load_relationship_and_mood_snapshot(chat_filter: str = "", query: str = "")
                     (guarded_until is not None and guarded_until > now_ts)
                     or (trust < 10.0 and (ckey, ukey) in unresolved_set)
                 )
-                if is_guarded:
-                    guarded_count += 1
                 buddy = is_buddy(dname)
                 eff_level = "buddy" if buddy else ("guarded" if is_guarded else (r["stage"] or "stranger"))
                 um = user_moods.get((ckey, ukey))
@@ -2069,12 +2092,13 @@ def _load_relationship_and_mood_snapshot(chat_filter: str = "", query: str = "")
                     continue
                 if query:
                     q_low = query.lower()
-                    hay = " ".join([dname, ukey, ckey, *[str(a) for a in aliases]]).lower()
+                    hay = " ".join([dname, ukey, ckey, chat_label, *[str(a) for a in aliases]]).lower()
                     if q_low not in hay:
                         continue
 
                 users.append({
                     "chat_key": ckey,
+                    "chat_label": chat_label,
                     "user_key": ukey,
                     "display_name": dname,
                     "aliases": [str(a) for a in aliases if a and str(a) != dname],
@@ -2098,11 +2122,22 @@ def _load_relationship_and_mood_snapshot(chat_filter: str = "", query: str = "")
         finally:
             conn.close()
 
+    filtered_group_moods = [
+        gm for gm in group_moods.values()
+        if not chat_filter or gm["chat_key"] == chat_filter
+    ]
+    guarded_count = sum(1 for u in users if u["is_guarded"])
+    chat_options = [
+        {"key": ck, "label": chat_name_map.get(ck, ck)}
+        for ck in sorted(chats)
+    ]
+
     return {
         "rel_db_exists": rel_db.exists(),
         "mood_db_exists": mood_db.exists(),
         "chats": sorted(chats),
-        "group_moods": list(group_moods.values()),
+        "chat_options": chat_options,
+        "group_moods": filtered_group_moods,
         "users": users,
         "summary": {
             "user_count": len(users),
@@ -2188,7 +2223,7 @@ def relationship_dashboard(chat: str = Query(""), q: str = Query("")):
             reason_html = f'<div style="color:var(--muted);font-size:12px;margin-top:6px">原因：{html.escape(gm["reason"])}</div>' if gm["reason"] else ""
             cards.append(
                 f'<div style="background:var(--card);border:1px solid var(--border);border-radius:8px;padding:12px 14px;min-width:220px">'
-                f'<div style="font-weight:600;font-size:13px;margin-bottom:6px">{html.escape(gm["chat_key"])}</div>'
+                f'<div style="font-weight:600;font-size:13px;margin-bottom:6px">{html.escape(gm["chat_label"])}</div>'
                 f'<div>{_mood_badge(gm["mood"], gm["intensity"])}</div>'
                 f'{reason_html}'
                 f'<div style="color:var(--muted);font-size:11px;margin-top:6px">更新：{_fmt_ts(gm["updated_at"])}</div>'
@@ -2200,8 +2235,8 @@ def relationship_dashboard(chat: str = Query(""), q: str = Query("")):
 
     # 群筛选下拉与搜索框
     chat_options = '<option value="">全部群聊</option>' + "".join(
-        f'<option value="{html.escape(c, quote=True)}" {"selected" if c == chat_f else ""}>{html.escape(c)}</option>'
-        for c in snap["chats"]
+        f'<option value="{html.escape(c["key"], quote=True)}" {"selected" if c["key"] == chat_f else ""}>{html.escape(c["label"])}</option>'
+        for c in snap["chat_options"]
     )
     filter_bar = f"""
     <form method="get" action="/relationship" style="display:flex;gap:8px;align-items:center;margin-bottom:14px;flex-wrap:wrap">
@@ -2223,7 +2258,7 @@ def relationship_dashboard(chat: str = Query(""), q: str = Query("")):
         )
         rows_html += (
             f'<tr>'
-            f'<td style="font-size:12px;color:var(--muted)">{html.escape(u["chat_key"])}</td>'
+            f'<td style="font-size:12px;color:var(--muted)">{html.escape(u["chat_label"])}</td>'
             f'<td><a href="{u["detail_url"]}" style="color:var(--blue);font-weight:600">{html.escape(u["display_name"])}</a>{alias_str}</td>'
             f'<td>{_stage_badge(u["effective_level"])}{guard_tip}</td>'
             f'<td>{_bar_cell(u["familiarity"], "#58a6ff")}</td>'
@@ -2267,8 +2302,10 @@ def relationship_user_detail(chat_key: str = Query(...), user_key: str = Query(.
 
     from src.reply.mood_engine import MoodEngine, MoodStore
     from src.reply.relationship_store import RelationshipStore
+    from src.utils.identity import is_buddy
 
     rel_db = _relationship_db_path()
+    chat_label = _load_chat_name_map().get(chat_key, chat_key)
     if not rel_db.exists():
         return HTMLResponse(_page("群友详情", '<p style="color:var(--muted)">尚未生成 relationship.db。</p><p><a href="/relationship" style="color:var(--blue)">← 返回列表</a></p>', "/relationship"))
 
@@ -2295,7 +2332,7 @@ def relationship_user_detail(chat_key: str = Query(...), user_key: str = Query(.
 
     now_ts = _time.time()
     is_guarded = bool((rec.guarded_until and rec.guarded_until > now_ts) or (rec.trust < 10.0 and has_unresolved))
-    eff_level = "guarded" if is_guarded else rec.stage
+    eff_level = "buddy" if is_buddy(rec.display_name or user_key) else ("guarded" if is_guarded else rec.stage)
 
     ev_rows = ""
     for ev in events:
@@ -2322,7 +2359,7 @@ def relationship_user_detail(chat_key: str = Query(...), user_key: str = Query(.
       <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
         <div>
           <div style="font-size:18px;font-weight:700">{html.escape(rec.display_name or user_key)} {_stage_badge(eff_level)} {_mood_badge(cur_mood)}</div>
-          <div style="color:var(--muted);font-size:12px;margin-top:4px">群：{html.escape(chat_key)} · 主键：<code>{html.escape(user_key)}</code> · 别名：{html.escape(", ".join(rec.aliases) or "-")}</div>
+          <div style="color:var(--muted);font-size:12px;margin-top:4px">群：{html.escape(chat_label)}（<code>{html.escape(chat_key)}</code>） · 主键：<code>{html.escape(user_key)}</code> · 别名：{html.escape(", ".join(rec.aliases) or "-")}</div>
           <div style="color:var(--muted);font-size:12px;margin-top:4px">互动天数：{rec.interaction_days} 天 · 今日正向累积：熟 {rec.daily_familiarity_gain:.1f} / 好 {rec.daily_affection_gain:.1f} / 信 {rec.daily_trust_gain:.1f} · 精力：{html.escape(cur_energy)}</div>
           {f'<div style="color:var(--red);font-size:12px;margin-top:4px">警戒状态：{html.escape(rec.guarded_reason or "边界警戒")}（至 {_fmt_ts(rec.guarded_until)}）</div>' if is_guarded else ''}
         </div>
