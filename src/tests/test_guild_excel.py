@@ -439,3 +439,125 @@ def test_edit_command_flow_follows_delivery_policy(tmp_path):
             wb.close()
     finally:
         flow.executor.shutdown()
+
+
+def test_parse_merge_command():
+    from src.bot.guild_excel import parse_merge_command
+
+    req_range = parse_merge_command("请汇总11-21-11-23的工会魔物情报")
+    assert req_range.start_date == (None, 11, 21)
+    assert req_range.end_date == (None, 11, 23)
+    assert req_range.filename == "公会魔物情报汇总_11-21_11-23.xlsx"
+
+    req_cn = parse_merge_command("请汇总11月21日-11月23日的公会魔物情报，最终输出:周报.xlsx")
+    assert req_cn.start_date == (None, 11, 21)
+    assert req_cn.end_date == (None, 11, 23)
+    assert req_cn.filename == "周报.xlsx"
+
+    req_dot = parse_merge_command("请整合11.21至11.23的工会魔物情报")
+    assert req_dot.start_date == (None, 11, 21)
+    assert req_dot.end_date == (None, 11, 23)
+
+    assert parse_merge_command("请汇总公会情报").filename == "公会情报汇总.xlsx"
+    assert parse_merge_command("请整合公会情报").filename == "公会情报汇总.xlsx"
+    assert parse_merge_command("请汇总Excel，最终输出:11月战报").filename == "11月战报.xlsx"
+    assert parse_merge_command("请汇总一下大家的意见") is None
+    with pytest.raises(GuildExcelError):
+        parse_merge_command("请汇总公会情报，最终输出:../bad.xlsx")
+    with pytest.raises(GuildExcelError, match="起始日期不能晚于结束日期"):
+        parse_merge_command("请汇总11-23-11-21的工会魔物情报")
+    with pytest.raises(GuildExcelError, match="不合法"):
+        parse_merge_command("请汇总11-31-11-32的工会魔物情报")
+
+
+def test_merge_command_flow_consolidates_group_workbooks_and_normalizes_ocr_symbols(tmp_path):
+    import hashlib
+    from openpyxl import Workbook, load_workbook
+    from src.bot import guild_excel
+    from src.bot.guild_excel import GuildExcelFlow
+    from src.models.base import ActionResult
+
+    if not (guild_excel._SKILL / "scripts" / "merge.py").is_file():
+        pytest.skip("local guild-monster-excel merge script is not installed")
+
+    outbox = tmp_path / "outbox"
+    group_key = hashlib.sha256(b"abc@chatroom").hexdigest()
+    group_dir = tmp_path / "workbooks" / group_key
+    group_dir.mkdir(parents=True)
+
+    # 创建三天的每日战报（11-21、11-22、11-24），测试只汇总 11-21-11-22 时自动过滤 11-24
+    wb1 = Workbook()
+    ws1 = wb1.active
+    ws1.title = "1队"
+    ws1.append(("名称", "战力", "魔物得分"))
+    ws1.append(("破军、斩月", "24.20m", "150.00t"))
+    ws1.append(("Kevin ノ LA", "11.30m", None))
+    ws2 = wb1.create_sheet("2队")
+    ws2.append(("名称", "战力", "魔物得分"))
+    ws2.append(("我是牛大宝", "27.00m", "100.00t"))
+    wb1.save(group_dir / "公会情报11-21.xlsx")
+    wb1.close()
+
+    wb2 = Workbook()
+    ws1b = wb2.active
+    ws1b.title = "一队"
+    ws1b.append(("名称", "战力", "魔物得分"))
+    ws1b.append(("破军丶斩月", "24.50m", "200.00t"))
+    ws1b.append(("Kevin 丿 LA", "11.50m", "500.00b"))
+    ws3b = wb2.create_sheet("三队")
+    ws3b.append(("名称", "战力", "魔物得分"))
+    ws3b.append(("汗津津的猪", "10.50m", "1.50t"))
+    wb2.save(group_dir / "公会情报11-22.xlsx")
+    wb2.close()
+
+    wb3 = Workbook()
+    ws1c = wb3.active
+    ws1c.title = "一队"
+    ws1c.append(("名称", "战力", "魔物得分"))
+    ws1c.append(("破军、斩月", "99.00m", "999.00t"))
+    wb3.save(group_dir / "公会情报11-24.xlsx")
+    wb3.close()
+
+    send_text = Mock()
+    send_file = Mock(return_value=ActionResult(success=True))
+    flow = GuildExcelFlow(Mock(), send_text, send_file, outbox=outbox)
+    try:
+        cmd = message(text="请汇总11-21-11-22的工会魔物情报", message_type="text", chat_name="戰神管理群")
+        assert flow.handle("戰神管理群", cmd) == "收到，正在汇总本群的公会 Excel。"
+        flow.jobs[-1][1].result(timeout=10)
+        flow.poll("戰神管理群")
+
+        send_file.assert_called_once()
+        target_chat, sent_path = send_file.call_args.args
+        assert target_chat == "戰神管理群"
+        assert sent_path.name == "公会魔物情报汇总_11-21_11-22.xlsx"
+        # 汇总文件不写入 workbooks 目录，避免污染每日战报
+        assert not (group_dir / "公会魔物情报汇总_11-21_11-22.xlsx").exists()
+
+        wb = load_workbook(sent_path, read_only=True)
+        try:
+            assert wb.sheetnames == ["一队", "二队", "三队", "人员变动"]
+            assert list(wb["一队"].values) == [
+                ("名称", "战力", "魔物得分(11-21)", "魔物得分(11-22)", "魔物总得分"),
+                ("破军丶斩月", "24.50m", "150.00t", "200.00t", "350.00t"),
+                ("Kevin 丿 LA", "11.50m", None, "500.00b", "500.00b"),
+            ]
+            assert list(wb["二队"].values) == [
+                ("名称", "战力", "魔物得分(11-21)", "魔物得分(11-22)", "魔物总得分"),
+                ("我是牛大宝", "27.00m", "100.00t", None, "100.00t"),
+            ]
+            assert list(wb["三队"].values) == [
+                ("名称", "战力", "魔物得分(11-21)", "魔物得分(11-22)", "魔物总得分"),
+                ("汗津津的猪", "10.50m", None, "1.50t", "1.50t"),
+            ]
+        finally:
+            wb.close()
+        assert any("已汇总 2 份文件（11-21、11-22）" in call.args[1] for call in send_text.call_args_list)
+
+        # 指定范围内无文件时友好报错
+        empty_cmd = message(text="请汇总10-01-10-05的工会魔物情报", message_type="text", chat_name="戰神管理群")
+        flow.handle("戰神管理群", empty_cmd)
+        with pytest.raises(GuildExcelError, match="未找到 10-01 至 10-05"):
+            flow.jobs[-1][1].result(timeout=10)
+    finally:
+        flow.executor.shutdown()

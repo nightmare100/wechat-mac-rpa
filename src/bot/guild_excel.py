@@ -29,6 +29,16 @@ _WINDOW_VALUE_RE = re.compile(r"^(\d+)\s*(?:分钟|分|min|m)?$", re.IGNORECASE)
 _EDIT_COMMAND = re.compile(
     r"请修改\s*(.+?)\s*(?:[,，]\s*|\s+)工作表\s*[:：]\s*(.*?)\s*[,，]\s*把\s*(.+)\s*的\s*(战力|魔物分数|魔物得分)\s*改为\s*(.+)"
 )
+_DATE_TOKEN = r"(?:20\d{2}[-_.年])?\d{1,2}[-_.月]\d{1,2}日?"
+_DATE_YMD_RE = re.compile(r"(20\d{2})[-_.年](\d{1,2})[-_.月](\d{1,2})日?")
+_DATE_MD_RE = re.compile(r"(?<!\d)(\d{1,2})[-_.月](\d{1,2})日?(?!\d)")
+_MERGE_RANGE_COMMAND = re.compile(
+    rf"请(?:汇总|整合)\s*({_DATE_TOKEN})\s*(?:[-~～—]|至|到)\s*({_DATE_TOKEN})\s*的?\s*[工公]会(?:魔物)?情报(?:\s*[,，]\s*最终输出\s*[:：](.+))?"
+)
+_MERGE_COMMAND = re.compile(
+    r"请(?:汇总|整合)(?:[工公]会(?:魔物)?情报|[工公]会Excel|Excel|excel)(?:\s*[,，]\s*最终输出\s*[:：](.+))?"
+)
+_DEFAULT_MERGE_FILENAME = "公会情报汇总.xlsx"
 _NUMBER_RE = re.compile(r"^([+-]?\d+(?:\.\d+)?)\s*(k|m|b|t|w|千|万|百万|亿|十亿|万亿)?$", re.IGNORECASE)
 _UNIT_MULTIPLIERS = {
     "": 1.0,
@@ -78,6 +88,13 @@ class GuildExcelEditRequest:
     nickname: str
     field: str  # "power" or "score"
     value: float | None
+
+
+@dataclass(frozen=True)
+class GuildExcelMergeRequest:
+    filename: str = _DEFAULT_MERGE_FILENAME
+    start_date: tuple[int | None, int, int] | None = None
+    end_date: tuple[int | None, int, int] | None = None
 
 
 def _validate_sheet(sheet: str) -> str:
@@ -178,6 +195,86 @@ def parse_edit_command(text: str) -> GuildExcelEditRequest | None:
     field = "power" if field_label == "战力" else "score"
     value = parse_numeric_value(raw_value)
     return GuildExcelEditRequest(filename, sheet, nickname, field, value)
+
+
+def _parse_date_token(raw: str) -> tuple[int | None, int, int]:
+    from datetime import date
+
+    text = raw.strip()
+    m_ymd = _DATE_YMD_RE.fullmatch(text)
+    if m_ymd:
+        year, month, day = int(m_ymd.group(1)), int(m_ymd.group(2)), int(m_ymd.group(3))
+        try:
+            date(year, month, day)
+        except ValueError as exc:
+            raise GuildExcelError(f"日期「{text}」不合法，请检查月份和日期。") from exc
+        return year, month, day
+    m_md = _DATE_MD_RE.fullmatch(text)
+    if m_md:
+        month, day = int(m_md.group(1)), int(m_md.group(2))
+        try:
+            date(2024, month, day)  # 闰年校验月/日合法性
+        except ValueError as exc:
+            raise GuildExcelError(f"日期「{text}」不合法，请检查月份和日期。") from exc
+        return None, month, day
+    raise GuildExcelError(f"无法识别日期「{text}」，请使用如 11-21 或 11月21日。")
+
+
+def _format_date_label(d: tuple[int | None, int, int]) -> str:
+    year, month, day = d
+    return f"{year}-{month:02d}-{day:02d}" if year is not None else f"{month:02d}-{day:02d}"
+
+
+def _extract_file_date(path: Path) -> tuple[int | None, int, int] | None:
+    stem = path.stem
+    m_ymd = _DATE_YMD_RE.search(stem)
+    if m_ymd:
+        year, month, day = int(m_ymd.group(1)), int(m_ymd.group(2)), int(m_ymd.group(3))
+        if 1 <= month <= 12 and 1 <= day <= 31:
+            return year, month, day
+    m_md = _DATE_MD_RE.search(stem)
+    if m_md:
+        month, day = int(m_md.group(1)), int(m_md.group(2))
+        if 1 <= month <= 12 and 1 <= day <= 31:
+            return None, month, day
+    return None
+
+
+def _date_in_range(
+    file_date: tuple[int | None, int, int],
+    start: tuple[int | None, int, int],
+    end: tuple[int | None, int, int],
+) -> bool:
+    fy, fm, fd = file_date
+    sy, sm, sd = start
+    ey, em, ed = end
+    if sy is not None and ey is not None and fy is not None:
+        return (sy, sm, sd) <= (fy, fm, fd) <= (ey, em, ed)
+    return (sm, sd) <= (fm, fd) <= (em, ed)
+
+
+def parse_merge_command(text: str) -> GuildExcelMergeRequest | None:
+    stripped = (text or "").strip()
+    range_match = _MERGE_RANGE_COMMAND.fullmatch(stripped)
+    if range_match is not None:
+        raw_start, raw_end, raw_filename = range_match.groups()
+        start_date = _parse_date_token(raw_start)
+        end_date = _parse_date_token(raw_end)
+        if start_date[0] is not None and end_date[0] is not None:
+            if start_date > end_date:
+                raise GuildExcelError("起始日期不能晚于结束日期。")
+        elif (start_date[1], start_date[2]) > (end_date[1], end_date[2]):
+            raise GuildExcelError("起始日期不能晚于结束日期。")
+        default_name = f"公会魔物情报汇总_{_format_date_label(start_date)}_{_format_date_label(end_date)}.xlsx"
+        filename = _validate_filename(raw_filename.strip()) if raw_filename is not None else default_name
+        return GuildExcelMergeRequest(filename=filename, start_date=start_date, end_date=end_date)
+
+    match = _MERGE_COMMAND.fullmatch(stripped)
+    if match is None:
+        return None
+    raw_filename = match.group(1)
+    filename = _validate_filename(raw_filename.strip()) if raw_filename is not None else _DEFAULT_MERGE_FILENAME
+    return GuildExcelMergeRequest(filename=filename)
 
 
 def select_images(
@@ -481,20 +578,82 @@ def edit_workbook_file(path: Path, request: GuildExcelEditRequest) -> tuple[str,
         book.close()
 
 
+def merge_group_workbooks(
+    group_dir: Path,
+    output: Path,
+    *,
+    start_date: tuple[int | None, int, int] | None = None,
+    end_date: tuple[int | None, int, int] | None = None,
+    skill: Path = _SKILL,
+) -> dict:
+    """调用 guild-monster-excel 技能的 scripts/merge.py 汇总指定群目录下的每日工作簿（支持按日期范围筛选）。"""
+    merge_script = skill / "scripts" / "merge.py"
+    if not merge_script.is_file():
+        raise GuildExcelError("本机缺少 guild-monster-excel 整合脚本。")
+    if not group_dir.is_dir():
+        raise GuildExcelError("当前群还没有已生成的公会 Excel 文件，请先生成每日战报。")
+    inputs = sorted(
+        p for p in group_dir.iterdir()
+        if p.is_file()
+        and p.suffix.lower() == ".xlsx"
+        and not p.name.startswith((".", "~$"))
+        and p.name != output.name
+    )
+    if start_date is not None and end_date is not None:
+        matched = []
+        for p in inputs:
+            file_date = _extract_file_date(p)
+            if file_date is not None and _date_in_range(file_date, start_date, end_date):
+                matched.append(p)
+        if not matched:
+            raise GuildExcelError(
+                f"未找到 {_format_date_label(start_date)} 至 {_format_date_label(end_date)} 的公会 Excel 文件，请检查日期范围。"
+            )
+        inputs = matched
+    elif not inputs:
+        raise GuildExcelError("当前群还没有已生成的公会 Excel 文件，请先生成每日战报。")
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(merge_script), *(str(p) for p in inputs), "-o", str(output)],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=True,
+        )
+        summary = json.loads(proc.stdout)
+    except (subprocess.SubprocessError, OSError, ValueError) as exc:
+        raise GuildExcelError("Excel 汇总失败，请检查本机每日战报文件及依赖。") from exc
+    if not output.is_file() or not output.stat().st_size:
+        raise GuildExcelError("没有生成汇总 Excel 文件。")
+    return summary
+
+
 class GuildExcelFlow:
     """Append workbooks serially and deliver snapshots on the Bot's UI thread."""
 
-    def __init__(self, perception, send_text, send_file, *, worker=create_workbook, outbox=_OUTBOX, group_config=None):
+    def __init__(
+        self,
+        perception,
+        send_text,
+        send_file,
+        *,
+        worker=create_workbook,
+        merger=merge_group_workbooks,
+        outbox=_OUTBOX,
+        group_config=None,
+    ):
         self.perception = perception
         self.send_text = send_text
         self.send_file = send_file
         self.worker = worker
+        self.merger = merger
         self.outbox = Path(outbox)
         self.workbooks = self.outbox.parent / "workbooks"
         self.group_config = group_config
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="guild-excel")
         self.jobs: list[tuple[str, Future[Path]]] = []
-        self._job_meta: dict[Future[Path], tuple[str, int, str, str, list[tuple[str, str]] | None]] = {}
+        self._job_meta: dict[Future[Path], tuple[str, int, str, str, str, list[tuple[str, str]] | None]] = {}
 
     def _delivery_policy(self, origin_chat: str) -> tuple[int, str, str]:
         if self.group_config is None or not origin_chat:
@@ -513,10 +672,13 @@ class GuildExcelFlow:
         try:
             request = parse_command(message.text)
             edit_request = None if request is not None else parse_edit_command(message.text)
+            merge_request = (
+                None if (request is not None or edit_request is not None) else parse_merge_command(message.text)
+            )
         except GuildExcelError as exc:
             reply = str(exc)
         else:
-            if request is None and edit_request is None:
+            if request is None and edit_request is None and merge_request is None:
                 return None
             if request is not None:
                 if not message.chatroom_id or message.create_time is None:
@@ -527,10 +689,10 @@ class GuildExcelFlow:
                     waiting = bool(self.jobs)
                     future = self.executor.submit(self._append_workbook, request, message)
                     min_sheets, target_chat, target_message = self._delivery_policy(chat_name)
-                    self._job_meta[future] = (request.sheet, min_sheets, target_chat, target_message, None)
+                    self._job_meta[future] = ("append", min_sheets, target_chat, target_message, request.sheet, None)
                     self.jobs.append((chat_name, future))
                     reply = "收到，已排队，处理完成后会回发 Excel。" if waiting else "收到，正在识别图片并生成 Excel。"
-            else:
+            elif edit_request is not None:
                 if not message.chatroom_id:
                     reply = "无法确认当前群，请使用 TraceMemo 模式。"
                 elif len(self.jobs) >= _MAX_PENDING_JOBS:
@@ -540,9 +702,21 @@ class GuildExcelFlow:
                     edit_box: list[tuple[str, str]] = []
                     future = self.executor.submit(self._edit_workbook, edit_request, message, edit_box)
                     min_sheets, target_chat, target_message = self._delivery_policy(chat_name)
-                    self._job_meta[future] = (edit_request.sheet, min_sheets, target_chat, target_message, edit_box)
+                    self._job_meta[future] = ("edit", min_sheets, target_chat, target_message, edit_request.sheet, edit_box)
                     self.jobs.append((chat_name, future))
                     reply = "收到，已排队，修改完成后会按群策略处理。" if waiting else "收到，正在修改 Excel。"
+            else:
+                if not message.chatroom_id:
+                    reply = "无法确认当前群，请使用 TraceMemo 模式。"
+                elif len(self.jobs) >= _MAX_PENDING_JOBS:
+                    reply = "公会统计队列已满，请稍后再发指令。"
+                else:
+                    waiting = bool(self.jobs)
+                    merge_box: list[tuple[str, str]] = []
+                    future = self.executor.submit(self._merge_workbooks, merge_request, message, merge_box)
+                    self._job_meta[future] = ("merge", 1, chat_name, "", "", merge_box)
+                    self.jobs.append((chat_name, future))
+                    reply = "收到，已排队，汇总完成后会回发 Excel。" if waiting else "收到，正在汇总本群的公会 Excel。"
         self.send_text(chat_name, reply)
         return reply
 
@@ -597,13 +771,47 @@ class GuildExcelFlow:
         edit_box.append((actual_sheet, detail))
         return delivery_file
 
+    def _merge_workbooks(
+        self,
+        request: GuildExcelMergeRequest,
+        command: ChatMessage,
+        merge_box: list[tuple[str, str]],
+    ) -> Path:
+        group_key = hashlib.sha256(command.chatroom_id.encode("utf-8")).hexdigest()
+        group_dir = self.workbooks / group_key
+        with TemporaryDirectory(prefix="guild-excel-merge-") as directory:
+            output = Path(directory) / request.filename
+            summary = self.merger(
+                group_dir,
+                output,
+                start_date=request.start_date,
+                end_date=request.end_date,
+            )
+            self.outbox.mkdir(parents=True, exist_ok=True)
+            delivery_dir = Path(mkdtemp(prefix="job-", dir=self.outbox))
+            delivery_file = delivery_dir / request.filename
+            try:
+                shutil.copyfile(output, delivery_file)
+            except OSError:
+                delivery_file.unlink(missing_ok=True)
+                delivery_dir.rmdir()
+                raise
+        dates = summary.get("dates") or []
+        inputs = summary.get("inputs") or []
+        sheets = summary.get("sheets") or {}
+        team_parts = [f"{t} {sheets[t]['members']}人" for t in ("一队", "二队", "三队") if t in sheets]
+        date_text = "、".join(dates) if dates else "无日期"
+        detail = f"已汇总 {len(inputs)} 份文件（{date_text}）：{'，'.join(team_parts)}。"
+        merge_box.append((request.filename, detail))
+        return delivery_file
+
     def poll(self, chat_name):
         for index, (origin_chat, future) in enumerate(self.jobs):
             if origin_chat != chat_name or not future.done():
                 continue
             self.jobs.pop(index)
-            sheet_name, min_sheets, delivery_chat, target_message, edit_box = self._job_meta.pop(
-                future, ("", 1, origin_chat, "", None)
+            kind, min_sheets, delivery_chat, target_message, sheet_name, detail_box = self._job_meta.pop(
+                future, ("append", 1, origin_chat, "", "", None)
             )
             delivery_chat = delivery_chat or origin_chat
             try:
@@ -614,8 +822,16 @@ class GuildExcelFlow:
                 _LOGGER.exception("公会统计任务失败")
                 self.send_text(origin_chat, "公会统计处理失败，请检查 Bot 日志。")
             else:
-                if edit_box is not None and edit_box:
-                    actual_sheet, edit_detail = edit_box[0]
+                if kind == "merge":
+                    merge_detail = detail_box[0][1] if detail_box else "已完成汇总。"
+                    if not self.send_file(origin_chat, delivery_file).success:
+                        self.send_text(origin_chat, f"汇总 Excel 已生成并保存在本机，但未能发到群里。{merge_detail}")
+                    else:
+                        self.send_text(origin_chat, merge_detail)
+                    return
+
+                if kind == "edit" and detail_box:
+                    actual_sheet, edit_detail = detail_box[0]
                     if min_sheets > 1:
                         sheet_count, _, _ = _inspect_workbook_sheet(delivery_file, actual_sheet)
                         if sheet_count < min_sheets:
