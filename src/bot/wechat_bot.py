@@ -184,6 +184,47 @@ class WeChatBot:
             self.logger.info("[Treasure] chat=%s", chat_name)
         return handled
 
+    def _enrich_target_images(
+        self,
+        chat_name: str,
+        to_reply: list[ChatMessage],
+        all_messages: list[ChatMessage],
+        is_group: bool,
+    ) -> int:
+        """仅在存在明确回复目标（非主动插话）且该目标发了图片时，按需调用 VLM 识别图片。"""
+        describer = getattr(self, "image_describer", None)
+        if describer is None or not to_reply:
+            return 0
+        global_enabled = describer.enabled
+        if is_group:
+            if not self._group_feature_enabled(chat_name, "image_understanding", global_enabled):
+                return 0
+        elif not global_enabled:
+            return 0
+
+        client = getattr(self.perception, "client", None)
+        if client is None or not hasattr(client, "read_bytes"):
+            return 0
+
+        if is_group:
+            trigger_fn = getattr(self.generator, "direct_reply_triggers", None)
+            if not callable(trigger_fn):
+                return 0
+            target_msgs = trigger_fn(chat_name, to_reply, all_messages)
+        else:
+            target_msgs = [m for m in to_reply if m.sender_type == SenderType.OTHER]
+
+        if not target_msgs:
+            return 0
+
+        return describer.enrich_messages(
+            chat_name,
+            to_reply,
+            all_messages,
+            target_msgs,
+            reader=client.read_bytes,
+        )
+
     def __init__(self, profile=None, on_message: Optional[Callable] = None, llm_client=None,
                  debug_mode: bool = False, use_openclaw: bool = True, perception=None,
                  enable_chat_switch: bool = True):
@@ -277,6 +318,8 @@ class WeChatBot:
         )
         if self.relationship_evaluator is not None:
             self.relationship_evaluator.start()
+        from src.perception.image_describer import ImageDescriber
+        self.image_describer = ImageDescriber()
         self.generator = ReplyGenerator(
             llm_client=actual_llm,
             memory_engine=self.memory_engine,
@@ -773,6 +816,9 @@ class WeChatBot:
                 )
                 self.debug_logger.log_action("none", action_input="", success=False, error="等对方说完再回")
                 return
+
+            # 仅在有明确 target（非主动插话）且 target 发了图片时，按需补全图片视觉描述
+            self._enrich_target_images(chat_name, to_reply, all_messages, is_group)
 
             # 传递完整消息上下文 + 所有未读消息，让 AI 生成多条回复
             t_gen_start = time.time()
