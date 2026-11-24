@@ -15,23 +15,44 @@ def message(**fields):
 
 
 def test_command_is_exact_and_disallows_paths():
-    assert parse_command("请读取小明的图片，工作表：11月21日，最终输出：战报").filename == "战报.xlsx"
+    req = parse_command("请读取小明的图片，工作表：11月21日，最终输出：战报")
+    assert req.filename == "战报.xlsx"
+    assert req.window_minutes == 10
+
+    req_with_time = parse_command("请读取希。的图片，工作表:一队，最终输出:公会情报11-23.xlsx，时间:30")
+    assert req_with_time.nickname == "希。"
+    assert req_with_time.sheet == "一队"
+    assert req_with_time.filename == "公会情报11-23.xlsx"
+    assert req_with_time.window_minutes == 30
+
+    assert parse_command("请读取希。的图片，工作表:一队，最终输出:公会情报11-23.xlsx, 时间：60分钟").window_minutes == 60
+    assert parse_command("请读取希。的图片，工作表:一队，最终输出:公会情报11-23.xlsx，时间:15分").window_minutes == 15
+
     with pytest.raises(GuildExcelError):
         parse_command("请读取小明的图片，工作表:今日,最终输出:../战报.xlsx")
+    with pytest.raises(GuildExcelError, match="时间参数"):
+        parse_command("请读取希。的图片，工作表:一队，最终输出:公会情报11-23.xlsx，时间:0")
+    with pytest.raises(GuildExcelError, match="时间参数"):
+        parse_command("请读取希。的图片，工作表:一队，最终输出:公会情报11-23.xlsx，时间:abc")
     assert parse_command("你能帮我读取小明的图片吗") is None
 
 
 def test_selects_recent_images_from_one_sender_in_current_group():
     command = message(create_time=2200, local_id=10)
-    first, last = message(create_time=1000), message(create_time=2200, local_id=9)
-    nineteen_minutes_before = message(create_time=1060, local_id=2)
-    other = [message(create_time=999), message(create_time=2201), message(chatroom_id="other"),
+    first, last = message(create_time=1600), message(create_time=2200, local_id=9)
+    nine_minutes_before = message(create_time=1660, local_id=2)
+    older_twenty_min = message(create_time=1000, local_id=1)
+    other = [message(create_time=1599), message(create_time=2201), message(chatroom_id="other"),
              message(sender="小红"), message(create_time=2200, local_id=11)]
-    assert select_images([last, *other, nineteen_minutes_before, first], command, "小明") == [
-        first, nineteen_minutes_before, last,
+    assert select_images([last, *other, nine_minutes_before, first], command, "小明") == [
+        first, nine_minutes_before, last,
+    ]
+    # 自定义 20 分钟窗口时可包含 20 分钟前的图片
+    assert select_images([older_twenty_min, last], command, "小明", window_minutes=20) == [
+        older_twenty_min, last,
     ]
     with pytest.raises(GuildExcelError, match="重名"):
-        select_images([first, message(sender_wxid="wx_b", local_id=2)], command, "小明")
+        select_images([first, message(sender_wxid="wx_b", create_time=1700, local_id=2)], command, "小明")
     with pytest.raises(GuildExcelError, match="不要折叠发送图片.*等待 30 秒"):
         select_images([], command, "小明")
 
@@ -70,7 +91,7 @@ def test_workbook_uses_scoped_images_and_skill_exporter(tmp_path, monkeypatch):
     monkeypatch.setattr(guild_excel, "_run_codex", recognize)
     output = guild_excel.create_workbook(request, command, perception, tmp_path)
     assert output.name == "战报.xlsx"
-    perception.recent_group_messages.assert_called_once_with("abc@chatroom", -100)
+    perception.recent_group_messages.assert_called_once_with("abc@chatroom", 500)
     assert [call.args[0] for call in perception.client.read_bytes.call_args_list] == ["/media/one", "/media/two"]
     workbook = load_workbook(output, read_only=True)
     try:

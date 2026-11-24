@@ -22,7 +22,10 @@ from src.models.base import ChatMessage, SenderType
 from src.perception.tracememo_pipeline import TraceMemoError
 
 _LOGGER = logging.getLogger(__name__)
-_COMMAND = re.compile(r"请读取(.+?)的图片\s*[,，]\s*工作表\s*[:：](.*?)\s*[,，]\s*最终输出\s*[:：](.*)")
+_COMMAND = re.compile(
+    r"请读取(.+?)的图片\s*[,，]\s*工作表\s*[:：](.*?)\s*[,，]\s*最终输出\s*[:：](.*?)(?:\s*[,，]\s*时间\s*[:：]\s*(.+))?"
+)
+_WINDOW_VALUE_RE = re.compile(r"^(\d+)\s*(?:分钟|分|min|m)?$", re.IGNORECASE)
 _EDIT_COMMAND = re.compile(
     r"请修改\s*(.+?)\s*(?:[,，]\s*|\s+)工作表\s*[:：]\s*(.*?)\s*[,，]\s*把\s*(.+)\s*的\s*(战力|魔物分数|魔物得分)\s*改为\s*(.+)"
 )
@@ -44,8 +47,9 @@ _UNIT_MULTIPLIERS = {
 _CLEAR_TOKENS = {"空", "清空", "无", "null", "none"}
 _SKILL = Path.home() / ".agents/skills/guild-monster-excel"
 _OUTBOX = Path(__file__).resolve().parents[2] / "data" / "guild_excel" / "outbox"
-_WINDOW_MINUTES = 20
+_WINDOW_MINUTES = 10
 _WINDOW_SECONDS = _WINDOW_MINUTES * 60
+_MAX_WINDOW_MINUTES = 1440
 _MAX_IMAGES = 20
 _MAX_PENDING_JOBS = 8
 _MAX_IMAGE_BYTES = 12 * 1024 * 1024
@@ -64,6 +68,7 @@ class GuildExcelRequest:
     nickname: str
     sheet: str
     filename: str
+    window_minutes: int = _WINDOW_MINUTES
 
 
 @dataclass(frozen=True)
@@ -134,16 +139,31 @@ def _parse_cell_number(val) -> float | None:
         return None
 
 
+def _parse_window_minutes(raw: str | None) -> int:
+    if raw is None:
+        return _WINDOW_MINUTES
+    match = _WINDOW_VALUE_RE.fullmatch(raw.strip())
+    if match is None:
+        raise GuildExcelError(f"时间参数须为 1–{_MAX_WINDOW_MINUTES} 的整数分钟（例如 时间:30）。")
+    minutes = int(match.group(1))
+    if not 1 <= minutes <= _MAX_WINDOW_MINUTES:
+        raise GuildExcelError(f"时间参数须为 1–{_MAX_WINDOW_MINUTES} 的整数分钟（例如 时间:30）。")
+    return minutes
+
+
 def parse_command(text: str) -> GuildExcelRequest | None:
     match = _COMMAND.fullmatch((text or "").strip())
     if match is None:
         return None
-    nickname, sheet, filename = (field.strip() for field in match.groups())
+    nickname, sheet, filename, raw_window = (
+        field.strip() if field is not None else None for field in match.groups()
+    )
     if not nickname or len(nickname) > 80 or any(ord(c) < 32 for c in nickname):
         raise GuildExcelError("请填写群友的完整昵称。")
     sheet = _validate_sheet(sheet)
     filename = _validate_filename(filename)
-    return GuildExcelRequest(nickname, sheet, filename)
+    window_minutes = _parse_window_minutes(raw_window)
+    return GuildExcelRequest(nickname, sheet, filename, window_minutes=window_minutes)
 
 
 def parse_edit_command(text: str) -> GuildExcelEditRequest | None:
@@ -160,14 +180,21 @@ def parse_edit_command(text: str) -> GuildExcelEditRequest | None:
     return GuildExcelEditRequest(filename, sheet, nickname, field, value)
 
 
-def select_images(messages, command: ChatMessage, nickname: str) -> list[ChatMessage]:
+def select_images(
+    messages,
+    command: ChatMessage,
+    nickname: str,
+    *,
+    window_minutes: int = _WINDOW_MINUTES,
+) -> list[ChatMessage]:
     if command.create_time is None or not command.chatroom_id:
         raise GuildExcelError("无法确认指令时间或当前群。")
+    window_seconds = window_minutes * 60
     recent = []
     for msg in messages:
         if (msg.chatroom_id != command.chatroom_id or msg.sender.strip() != nickname
                 or msg.create_time is None or msg.sender_type != SenderType.OTHER
-                or not command.create_time - _WINDOW_SECONDS <= msg.create_time <= command.create_time):
+                or not command.create_time - window_seconds <= msg.create_time <= command.create_time):
             continue
         if msg.create_time == command.create_time and (
             msg.local_id is None or command.local_id is None or msg.local_id >= command.local_id
@@ -175,16 +202,16 @@ def select_images(messages, command: ChatMessage, nickname: str) -> list[ChatMes
             continue
         recent.append(msg)
     if len({msg.sender_wxid for msg in recent if msg.sender_wxid}) > 1:
-        raise GuildExcelError(f"近 {_WINDOW_MINUTES} 分钟内有重名群友，请使用唯一的群昵称。")
+        raise GuildExcelError(f"近 {window_minutes} 分钟内有重名群友，请使用唯一的群昵称。")
     images = {}
     for msg in recent:
         if msg.message_type == "image":
             key = ("server", msg.server_id) if msg.server_id not in ("", "0", None) else ("local", msg.local_id)
             images.setdefault(key, msg)
     if not images:
-        raise GuildExcelError(f"没找到该群友在指令前 {_WINDOW_MINUTES} 分钟内发送的图片，请先发图再发指令。{_IMAGE_SEND_HINT}")
+        raise GuildExcelError(f"没找到该群友在指令前 {window_minutes} 分钟内发送的图片，请先发图再发指令。{_IMAGE_SEND_HINT}")
     if len(images) > _MAX_IMAGES:
-        raise GuildExcelError(f"近 {_WINDOW_MINUTES} 分钟图片超过 {_MAX_IMAGES} 张，请分批处理。")
+        raise GuildExcelError(f"近 {window_minutes} 分钟图片超过 {_MAX_IMAGES} 张，请分批处理。")
     return sorted(images.values(), key=lambda msg: (msg.create_time, msg.local_id or 0))
 
 
@@ -260,9 +287,11 @@ def _run_codex(request, images, directory, skill):
 def create_workbook(request, command, perception, directory, *, skill=_SKILL):
     if not (skill / "SKILL.md").is_file() or not (skill / "scripts/export.py").is_file():
         raise GuildExcelError("本机缺少 guild-monster-excel 技能。")
+    window_minutes = request.window_minutes
+    window_seconds = window_minutes * 60
     try:
-        messages = perception.recent_group_messages(command.chatroom_id, command.create_time - _WINDOW_SECONDS)
-        images = select_images(messages, command, request.nickname)
+        messages = perception.recent_group_messages(command.chatroom_id, command.create_time - window_seconds)
+        images = select_images(messages, command, request.nickname, window_minutes=window_minutes)
         paths, total_bytes = [], 0
         for index, msg in enumerate(images, start=1):
             if not msg.media_url:
@@ -286,8 +315,8 @@ def create_workbook(request, command, perception, directory, *, skill=_SKILL):
         raise GuildExcelError(f"TraceMemo 读取群图片失败，请确认原图可打开后重试。{_IMAGE_SEND_HINT}") from exc
 
     _LOGGER.info(
-        "[GuildExcel] 已拉取图片 %d 张 (sender=%s, sheet=%s, file=%s)",
-        len(paths), request.nickname, request.sheet, request.filename,
+        "[GuildExcel] 已拉取图片 %d 张 (sender=%s, sheet=%s, file=%s, window=%dm)",
+        len(paths), request.nickname, request.sheet, request.filename, window_minutes,
     )
     records = _run_codex(request, paths, directory, skill)
     output = directory / request.filename
