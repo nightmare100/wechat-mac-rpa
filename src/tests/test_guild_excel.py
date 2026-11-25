@@ -561,3 +561,46 @@ def test_merge_command_flow_consolidates_group_workbooks_and_normalizes_ocr_symb
             flow.jobs[-1][1].result(timeout=10)
     finally:
         flow.executor.shutdown()
+
+
+def test_target_message_parts_combines_without_immediate_repeat(tmp_path):
+    import json
+    from src.bot.group_config import GroupConfig
+    from src.bot.guild_excel import GuildExcelFlow
+
+    part1 = [f"开头{i}，" for i in range(10)]
+    part2 = [f"加油{i}！" for i in range(10)]
+    cfg_path = tmp_path / "group_config.json"
+    cfg_path.write_text(
+        json.dumps(
+            {
+                "groups": {
+                    "戰神管理群": {
+                        "guild_excel_min_sheets": 3,
+                        "guild_excel_target_chat": "弓箭2战神公会",
+                        "guild_excel_target_message": "兜底文案",
+                        "guild_excel_target_message_parts": [part1, part2],
+                    },
+                    "旧配置群": {
+                        "guild_excel_target_message": "仅单句文案",
+                    },
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    flow = GuildExcelFlow(Mock(), Mock(), Mock(), outbox=tmp_path / "outbox", group_config=GroupConfig(cfg_path))
+    try:
+        prev = None
+        for _ in range(10):
+            _, target_chat, msg = flow._delivery_policy("戰神管理群")
+            assert target_chat == "弓箭2战神公会"
+            assert any(msg.startswith(p) for p in part1)
+            assert any(msg.endswith(p) for p in part2)
+            assert msg != prev
+            prev = msg
+        # 旧配置仍向后兼容
+        assert flow._delivery_policy("旧配置群")[2] == "仅单句文案"
+    finally:
+        flow.executor.shutdown()

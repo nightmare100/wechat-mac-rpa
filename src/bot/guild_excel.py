@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -654,6 +655,31 @@ class GuildExcelFlow:
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="guild-excel")
         self.jobs: list[tuple[str, Future[Path]]] = []
         self._job_meta: dict[Future[Path], tuple[str, int, str, str, str, list[tuple[str, str]] | None]] = {}
+        self._last_part_indices: dict[str, tuple[int, ...]] = {}
+
+    def _compose_target_message(self, origin_chat: str) -> str:
+        raw_parts = self.group_config.get(origin_chat, "guild_excel_target_message_parts", None)
+        if isinstance(raw_parts, list) and raw_parts:
+            groups = [
+                [item.strip() for item in group if isinstance(item, str) and item.strip()]
+                for group in raw_parts
+                if isinstance(group, list)
+            ]
+            groups = [g for g in groups if g]
+            if groups:
+                prev = self._last_part_indices.get(origin_chat, ())
+                chosen_indices: list[int] = []
+                chosen_texts: list[str] = []
+                for idx, options in enumerate(groups):
+                    prev_i = prev[idx] if idx < len(prev) else -1
+                    pool = [i for i in range(len(options)) if i != prev_i] or list(range(len(options)))
+                    pick = random.choice(pool)
+                    chosen_indices.append(pick)
+                    chosen_texts.append(options[pick])
+                self._last_part_indices[origin_chat] = tuple(chosen_indices)
+                return "".join(chosen_texts)
+        raw_msg = self.group_config.get(origin_chat, "guild_excel_target_message", "")
+        return raw_msg.strip() if isinstance(raw_msg, str) and raw_msg.strip() else ""
 
     def _delivery_policy(self, origin_chat: str) -> tuple[int, str, str]:
         if self.group_config is None or not origin_chat:
@@ -662,8 +688,7 @@ class GuildExcelFlow:
         min_sheets = raw_min if isinstance(raw_min, int) and not isinstance(raw_min, bool) and raw_min >= 1 else 1
         raw_target = self.group_config.get(origin_chat, "guild_excel_target_chat", "")
         target_chat = raw_target.strip() if isinstance(raw_target, str) and raw_target.strip() else origin_chat
-        raw_msg = self.group_config.get(origin_chat, "guild_excel_target_message", "")
-        target_message = raw_msg.strip() if isinstance(raw_msg, str) and raw_msg.strip() else ""
+        target_message = self._compose_target_message(origin_chat)
         return min_sheets, target_chat, target_message
 
     def handle(self, chat_name, message):
