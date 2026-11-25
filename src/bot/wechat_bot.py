@@ -184,6 +184,84 @@ class WeChatBot:
             self.logger.info("[Treasure] chat=%s", chat_name)
         return handled
 
+    @staticmethod
+    def _parse_non_negative_int_env(name: str, default: int) -> int:
+        raw = os.environ.get(name, "").strip()
+        if not raw:
+            return default
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            return default
+
+    def _in_send_backoff(self, chat_name: str, now: Optional[float] = None) -> bool:
+        until = getattr(self, "_chat_send_backoff_until", {}).get(chat_name, 0.0)
+        if not until:
+            return False
+        return (time.time() if now is None else now) < until
+
+    def _record_send_outcome(
+        self,
+        chat_name: str,
+        *,
+        succeeded: bool,
+        send_failed: bool,
+        unreplied: list[ChatMessage],
+        now: Optional[float] = None,
+    ) -> bool:
+        """更新发送失败计数与退避；返回 True 表示单批失败达上限，应标记已处理不再死循环。"""
+        if not hasattr(self, "_consecutive_send_failures"):
+            self._consecutive_send_failures = 0
+        if not hasattr(self, "_chat_send_failures"):
+            self._chat_send_failures = {}
+        if not hasattr(self, "_chat_send_backoff_until"):
+            self._chat_send_backoff_until = {}
+
+        if succeeded:
+            self._consecutive_send_failures = 0
+            self._chat_send_failures.pop(chat_name, None)
+            self._chat_send_backoff_until.pop(chat_name, None)
+            return False
+
+        if not send_failed:
+            return False
+
+        ts = time.time() if now is None else now
+        self._consecutive_send_failures += 1
+        chat_fails = self._chat_send_failures.get(chat_name, 0) + 1
+        self._chat_send_failures[chat_name] = chat_fails
+
+        backoff_sec = min(60.0, 15.0 * (2 ** (chat_fails - 1)))
+        self._chat_send_backoff_until[chat_name] = ts + backoff_sec
+
+        max_total = getattr(self, "_max_consecutive_send_failures", 5)
+        if max_total > 0 and self._consecutive_send_failures >= max_total:
+            msg = (
+                f"[Bot] 连续发送失败达到上限 ({self._consecutive_send_failures}/{max_total})，"
+                f"疑似微信窗口/焦点异常，自动停止主循环以防空耗 Token"
+            )
+            self.logger.error(msg)
+            print(f"\n🛑 {msg}")
+            self.running = False
+
+        retry_limit = getattr(self, "_send_retry_limit", 3)
+        if retry_limit > 0 and chat_fails >= retry_limit:
+            self.logger.warning(
+                "[Bot] '%s' 连续发送失败 %d 次（已达单批重试上限 %d），放弃该批未读以防死循环",
+                chat_name, chat_fails, retry_limit,
+            )
+            self._chat_send_failures.pop(chat_name, None)
+            self._chat_send_backoff_until.pop(chat_name, None)
+            for m in unreplied:
+                self.global_store.mark_replied(chat_name, m, "")
+            return True
+
+        self.logger.info(
+            "[Bot] 发送失败 (%d/%d，全局连续 %d/%d)，退避 %.0fs 后重试 %s",
+            chat_fails, retry_limit, self._consecutive_send_failures, max_total, backoff_sec, chat_name,
+        )
+        return False
+
     def _enrich_target_images(
         self,
         chat_name: str,
@@ -458,6 +536,15 @@ class WeChatBot:
 
         # 服务号/公众号列表恢复冷却
         self._last_recovery_time: float = 0.0
+
+        # 发送失败退避与连续失败熔断退出（防止微信窗口/焦点异常时无限重试空耗 LLM Token）
+        self._consecutive_send_failures: int = 0
+        self._chat_send_failures: dict[str, int] = {}
+        self._chat_send_backoff_until: dict[str, float] = {}
+        self._send_retry_limit: int = self._parse_non_negative_int_env("BOT_SEND_RETRY_LIMIT", 3)
+        self._max_consecutive_send_failures: int = self._parse_non_negative_int_env(
+            "BOT_MAX_CONSECUTIVE_SEND_FAILURES", 5
+        )
 
         # 全局状态持久化目录
         project_root = Path(__file__).parent.parent.parent
@@ -815,6 +902,14 @@ class WeChatBot:
                     latest_text=unreplied[-1].text if unreplied else "",
                 )
                 self.debug_logger.log_action("none", action_input="", success=False, error="等对方说完再回")
+                return
+
+            # 发送失败退避期内不再重复调 LLM，避免微信异常时死循环空耗 Token
+            if self._in_send_backoff(chat_name):
+                self.logger.log_decision(
+                    tick_id, should_reply=False, reason="发送失败退避中",
+                    latest_text=unreplied[-1].text if unreplied else "",
+                )
                 return
 
             # 仅在有明确 target（非主动插话）且 target 发了图片时，按需补全图片视觉描述
@@ -1239,6 +1334,10 @@ class WeChatBot:
             # 注意：这里标记的是本轮所有 unreplied（不只是 to_reply），
             # 因为 bot 已经看过并决策过，不需要反复处理。
             if not send_failed or sent_replies:
+                if sent_replies and not send_skipped:
+                    self._record_send_outcome(
+                        chat_name, succeeded=True, send_failed=False, unreplied=unreplied
+                    )
                 delivered_text = " | ".join(sent_replies)
                 to_reply_set = set(id(m) for m in to_reply)
                 for msg in unreplied:
@@ -1250,7 +1349,9 @@ class WeChatBot:
                 if send_skipped:
                     self.logger.info("[Bot] 静默跳过已 mark_replied，下轮不再重试 %s", chat_name)
             else:
-                self.logger.info("[Bot] 发送失败，未 mark_replied，下轮仍会重试 %s", chat_name)
+                self._record_send_outcome(
+                    chat_name, succeeded=False, send_failed=True, unreplied=unreplied
+                )
 
             # Judge 评分已由 generator._submit_to_judge 异步处理（唯一路径）
 
