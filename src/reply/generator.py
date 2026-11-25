@@ -1356,13 +1356,25 @@ class ReplyGenerator:
                 else chime_on)
         ]
 
+    @staticmethod
+    def _is_at_other_only(msgs: List[ChatMessage]) -> bool:
+        """判断目标消息是否全都是定向 @别人（非 @我）的对话，避免主动插话替别人接话。"""
+        text_msgs = [m for m in msgs if (m.text or "").strip()]
+        if not text_msgs:
+            return False
+        at_pattern = re.compile(r"(?:^|[\s，,。！？!?.：:])@[^\s@]")
+        return all(
+            bool(at_pattern.search(m.text or "")) and not m.is_at_me and not is_at_bot(m.text)
+            for m in text_msgs
+        )
+
     def _apply_chime_in_limit(self, chat_name: str, unreplied: List[ChatMessage],
                               replies: List[str], history: Optional[List[ChatMessage]] = None) -> Tuple[List[str], set]:
-        """群聊回复逐条判断（不管 LLM 标没标 chime_in）：对象有现有触发的照常发；其余算主动插话，冷却中丢弃，放行则开始冷却。"""
+        """群聊回复逐条判断（不管 LLM 标没标 chime_in）：对象有现有触发的照常发；其余算主动插话，冷却中或 @别人 丢弃，放行则开始冷却。"""
         chime_on = self.is_chime_in_enabled(chat_name)
         direct_on = self.is_direct_group_reply_enabled(chat_name)
         allowed = self.chime_in_allowed(chat_name)
-        kept, fresh_targets, dropped, chimed = [], set(), [], False
+        kept, fresh_targets, dropped, dropped_at_other, chimed = [], set(), [], [], False
         for reply in replies:
             target = _reply_target(reply, unreplied)
             # 认不出对象、或对象对不上任何未读时按整批判断（偏保守：批里有触发就不当插话）
@@ -1374,6 +1386,8 @@ class ReplyGenerator:
             if self._has_reply_trigger(chat_name, msgs, history):
                 if direct_on:
                     kept.append(reply)
+            elif self._is_at_other_only(msgs):
+                dropped_at_other.append(reply)
             elif allowed:
                 kept.append(reply)
                 chimed = True
@@ -1383,6 +1397,9 @@ class ReplyGenerator:
                 dropped.append(reply)
         if chimed:
             self.chime_in_last[chat_name] = time.time()
+        if dropped_at_other:
+            self.last_chime_in_dropped = True
+            _logger.info("[ChimeIn] '%s' 目标消息为 @别人，丢弃主动插话: %s", chat_name, dropped_at_other)
         if dropped:
             self.last_chime_in_dropped = True
             reason = "冷却中" if chime_on else "已关闭"

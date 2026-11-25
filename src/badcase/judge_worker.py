@@ -526,7 +526,10 @@ class JudgeWorker:
         try:
             data = json.loads(text)
         except json.JSONDecodeError:
-            return _empty_judge_result("JSON 解析失败")
+            from src.utils.json_extractor import extract_json
+            data = extract_json(raw)
+            if not isinstance(data, dict):
+                return _empty_judge_result("JSON 解析失败")
 
         checks = data.get("checks", {})
         dims_raw = data.get("dimensions", {})

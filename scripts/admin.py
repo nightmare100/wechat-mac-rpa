@@ -174,25 +174,35 @@ def dashboard():
 
 
 @app.get("/ticks", response_class=HTMLResponse)
-def tick_list(page: int = Query(1), filter: str = Query("all")):
+def tick_list(page: int = Query(1), filter: str = Query("all"), sort: str = Query("time")):
+    page = max(1, page)
+    if filter not in ("all", "replied", "scored", "skipped"):
+        filter = "all"
+    if sort not in ("time", "score_asc", "score_desc"):
+        sort = "time"
+
+    where_map = {
+        "all": "",
+        "replied": "WHERE should_reply=1",
+        "scored": "WHERE judge_score IS NOT NULL AND judge_score > 0",
+        "skipped": "WHERE skip_reason IS NOT NULL",
+    }
+    order_map = {
+        "time": "ORDER BY created_at DESC, tick_id DESC",
+        "score_asc": "ORDER BY CASE WHEN judge_score IS NULL OR judge_score <= 0 THEN 1 ELSE 0 END ASC, judge_score ASC, created_at DESC, tick_id DESC",
+        "score_desc": "ORDER BY CASE WHEN judge_score IS NULL OR judge_score <= 0 THEN 1 ELSE 0 END ASC, judge_score DESC, created_at DESC, tick_id DESC",
+    }
+    where_sql = where_map[filter]
+    order_sql = order_map[sort]
+
     db = get_db()
     conn = db._get_conn()
     offset = (page - 1) * 20
-    if filter == "skipped":
-        rows = conn.execute(
-            "SELECT id, session_id, tick_id, chat_name, messages_count, new_messages_count, should_reply, send_success, skip_reason, judge_score, human_is_badcase, human_badcase_type, replies_sent_json, raw_response, duration_ms, created_at FROM tick_log WHERE skip_reason IS NOT NULL ORDER BY created_at DESC, tick_id DESC LIMIT ? OFFSET ?",
-            (20, offset),
-        ).fetchall()
-    elif filter == "replied":
-        rows = conn.execute(
-            "SELECT id, session_id, tick_id, chat_name, messages_count, new_messages_count, should_reply, send_success, skip_reason, judge_score, human_is_badcase, human_badcase_type, replies_sent_json, raw_response, duration_ms, created_at FROM tick_log WHERE should_reply=1 ORDER BY created_at DESC, tick_id DESC LIMIT ? OFFSET ?",
-            (20, offset),
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT id, session_id, tick_id, chat_name, messages_count, new_messages_count, should_reply, send_success, skip_reason, judge_score, human_is_badcase, human_badcase_type, replies_sent_json, raw_response, duration_ms, created_at FROM tick_log ORDER BY created_at DESC, tick_id DESC LIMIT ? OFFSET ?",
-            (20, offset),
-        ).fetchall()
+    rows = conn.execute(
+        f"SELECT id, session_id, tick_id, chat_name, messages_count, new_messages_count, should_reply, send_success, skip_reason, judge_score, human_is_badcase, human_badcase_type, replies_sent_json, raw_response, duration_ms, created_at FROM tick_log {where_sql} {order_sql} LIMIT ? OFFSET ?",
+        (20, offset),
+    ).fetchall()
+    total = conn.execute(f"SELECT COUNT(*) FROM tick_log {where_sql}").fetchone()[0]
     conn.close()
 
     rows_html = ""
@@ -213,7 +223,12 @@ def tick_list(page: int = Query(1), filter: str = Query("all")):
                 status = "⚠️未生成回复"
         else:
             status = "⏭️无消息"
-        llm_score = f'{r["judge_score"]:.0f}' if r['judge_score'] else "-"
+        if r["judge_score"] is not None and r["judge_score"] > 0:
+            llm_score = f'{r["judge_score"]:.0f}'
+        elif r["judge_score"] == 0:
+            llm_score = '<span style="color:var(--muted)">0</span>'
+        else:
+            llm_score = "-"
         human = ""
         if r['human_is_badcase'] == 1:
             human = f'❌{r["human_badcase_type"] or "badcase"}'
@@ -234,21 +249,29 @@ def tick_list(page: int = Query(1), filter: str = Query("all")):
           <td>{html.escape(status)}</td><td style="font-size:11px">{html.escape(reply_preview)}</td><td>{llm_score}</td><td>{html.escape(human)}</td><td>{r['duration_ms'] or 0}ms</td>
           <td style="font-size:11px;color:var(--muted)">{html.escape(r['created_at'] if r['created_at'] else '')}</td></tr>"""
 
-    conn = db._get_conn()
-    if filter == "skipped":
-        total = conn.execute("SELECT COUNT(*) FROM tick_log WHERE skip_reason IS NOT NULL").fetchone()[0]
-    elif filter == "replied":
-        total = conn.execute("SELECT COUNT(*) FROM tick_log WHERE should_reply=1").fetchone()[0]
-    else:
-        total = conn.execute("SELECT COUNT(*) FROM tick_log").fetchone()[0]
-    conn.close()
-    total_pages = (total + 19) // 20
-    content = f"""<p style="margin-bottom:12px"><a href="?filter=all">全部({total})</a> | <a href="?filter=replied">已回复</a> | <a href="?filter=skipped">跳过</a> | <span style="color:var(--muted);font-size:12px">每页20条</span></p>
+    total_pages = max(1, (total + 19) // 20)
+
+    def _link(label: str, f_val: str, s_val: str, active: bool) -> str:
+        style = 'style="font-weight:bold;color:var(--blue)"' if active else ""
+        return f'<a href="?filter={f_val}&sort={s_val}" {style}>{label}</a>'
+
+    filter_bar = " | ".join([
+        _link("全部", "all", sort, filter == "all"),
+        _link("已回复", "replied", sort, filter == "replied"),
+        _link("已评分", "scored", sort, filter == "scored"),
+        _link("跳过", "skipped", sort, filter == "skipped"),
+    ])
+    sort_bar = " | ".join([
+        _link("按时间", filter, "time", sort == "time"),
+        _link("评分低→高", filter, "score_asc", sort == "score_asc"),
+        _link("评分高→低", filter, "score_desc", sort == "score_desc"),
+    ])
+    content = f"""<p style="margin-bottom:12px">筛选：{filter_bar} &nbsp;·&nbsp; 排序：{sort_bar} &nbsp;·&nbsp; <span style="color:var(--muted);font-size:12px">共 {total} 条（每页20条）</span></p>
     <table><tr><th>Tick</th><th>聊天</th><th>消息</th><th>状态</th><th>回复</th><th>LLM</th><th>👤</th><th>耗时</th><th>时间</th></tr>{rows_html}</table>
     <div style="margin-top:12px;font-size:13px">
-      <a href="?page={page-1}&filter={html.escape(filter)}" style="color:var(--blue);margin-right:12px" {'hidden' if page<=1 else ''}>← 上一页</a>
+      <a href="?page={page-1}&filter={html.escape(filter)}&sort={html.escape(sort)}" style="color:var(--blue);margin-right:12px" {'hidden' if page<=1 else ''}>← 上一页</a>
       第 {page} 页 / 共 {total_pages} 页
-      <a href="?page={page+1}&filter={html.escape(filter)}" style="color:var(--blue);margin-left:12px">下一页 →</a>
+      <a href="?page={page+1}&filter={html.escape(filter)}&sort={html.escape(sort)}" style="color:var(--blue);margin-left:12px" {'hidden' if page>=total_pages else ''}>下一页 →</a>
     </div>"""
     return HTMLResponse(_page("Tick 查看", content, "/ticks"))
 

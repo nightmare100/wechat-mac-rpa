@@ -266,3 +266,21 @@ def test_chime_followup_rounds_and_blocked_after_other_messages():
     history = [self_msg] + [_m(f"路人{i}", str(i)) for i in range(FOLLOWUP_MAX_OTHER_MESSAGES + 1)] + [next_msg]
     assert gen.generate([next_msg], history, is_group=True) == []
     assert gen.last_chime_in_dropped is True
+
+
+def test_chime_in_blocks_at_other_person_without_starting_cooldown():
+    gen = _gen('{"replies":["@2kk 快把手机藏好"],"chime_in":true}')
+    # 2kk 定向 @别人，主动插话应被拦截，且不消耗冷却时间
+    at_other = _m("2kk", "@余乐无忧（心享）\u2005主管来了")
+    assert _run(gen, at_other) == []
+    assert gen.last_chime_in_dropped is True
+    assert "群" not in gen.chime_in_last
+
+    # 包含邮箱（非 @别人）的普通消息不受影响，正常放行主动插话
+    email_msg = _m("2kk", "联系 test@example.com 抽到红装了")
+    assert _run(gen, email_msg) == ["快把手机藏好"]
+
+    # @Bot 自己仍正常直接回复，不被拦截
+    gen2 = _gen('{"replies":["@2kk 在呀"]}')
+    at_bot = _m("2kk", "@『宵桜』囡囡 在吗")
+    assert _run(gen2, at_bot) == ["在呀"]

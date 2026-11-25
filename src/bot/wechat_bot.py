@@ -1230,7 +1230,7 @@ class WeChatBot:
             self._update_tick_send_result(
                 tick_id,
                 sent_replies,
-                success=not send_failed and not send_skipped and len(sent_replies) == len(replies),
+                success=not send_failed and not send_skipped and len(sent_replies) >= len(replies),
             )
 
             # 首条真实发送失败时保留未处理以便重试；若已有部分发送成功，则整批结束，
