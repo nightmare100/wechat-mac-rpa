@@ -462,7 +462,12 @@ class WeChatMessageSender(MessageSender):
                 _logger.info(f"[Sender] 白名单聊天 '{chat_name}' 跳过静默，实际发送文件")
             else:
                 _logger.info(f"[Sender] [SILENT] 静默模式跳过发送文件: {file_path}")
-                return ActionResult(success=False, sent_text=f"[文件] {file_name}", error="静默模式跳过发送文件")
+                return ActionResult(
+                    success=False,
+                    sent_text=f"[文件] {file_name}",
+                    error="静默模式跳过发送文件",
+                    skipped=True,
+                )
 
         abs_path = os.path.abspath(file_path)
         if not os.path.exists(abs_path):

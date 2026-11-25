@@ -1253,9 +1253,9 @@ class ReplyGenerator:
                         if self.voice_prompt:
                             from src.reply.voice_policy import parse_voice_meta
                             self.last_voice_meta = parse_voice_meta((parsed_iterate or {}).get("voice"))
-                        if self.sticker_prompt:
+                        if self.sticker_prompt and isinstance(parsed_iterate, dict) and "sticker" in parsed_iterate:
                             from src.reply.sticker_policy import parse_sticker_meta
-                            self.last_sticker_meta = parse_sticker_meta((parsed_iterate or {}).get("sticker"))
+                            self.last_sticker_meta = parse_sticker_meta(parsed_iterate.get("sticker"))
                     elif valid_empty_iterate:
                         current_replies = []
                         current_messages = new_messages

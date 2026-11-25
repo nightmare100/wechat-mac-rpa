@@ -512,6 +512,42 @@ class TestVoiceReply:
         bot._voice_sender.send.assert_not_called()
         bot.sender.send.assert_called_once_with("@A 哼，算你有眼光", chat_name="测试群")
 
+    def test_sticker_replace_silent_skip_does_not_fallback_to_text(self, bot, tmp_path):
+        """静默模式下 replace 发图返回 skipped=True：不回退发文字，避免误报发图失败。"""
+        from src.reply.sticker_policy import StickerDecision, StickerReplyConfig
+
+        bot.voice_policy = None
+        bot.image_describer = None
+        bot.generator.last_reply_targets = []
+        bot.sticker_reply_config = StickerReplyConfig(
+            dry_run=False,
+            stickers_dir=tmp_path,
+            append_probability=1.0,
+            replace_probability=1.0,
+            cooldown_replies=0,
+            cooldown_minutes=0,
+            recent_no_repeat=5,
+            replace_max_chars=8,
+        )
+        bot.sticker_policy = Mock()
+        bot.sticker_policy.decide.return_value = StickerDecision(
+            send_sticker=True,
+            mode="replace",
+            image_path=tmp_path / "a.png",
+            tag="谢谢",
+            reason="命中发送",
+        )
+        bot.sender.send_file.return_value = ActionResult(
+            success=False,
+            sent_text="[文件] a.png",
+            error="静默模式跳过发送文件",
+            skipped=True,
+        )
+        self._tick(bot, tmp_path)
+        bot.sender.send_file.assert_called_once()
+        bot.sender.send.assert_not_called()
+        bot.sticker_policy.record_sent.assert_not_called()
+
 
 def test_disabled_config_no_prompt(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)

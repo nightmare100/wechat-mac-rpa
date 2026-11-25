@@ -1097,10 +1097,15 @@ class WeChatBot:
                                 chat_name=chat_name, replied=True, reply_text=tagged,
                                 reply_time=time.time(), message_type="text",
                             ))
+                    elif img_result.skipped:
+                        tagged = f"[表情包: {sticker_decision.tag}]"
+                        self.logger.log_send(tick_id, success=False, text=tagged, error=img_result.error)
+                        self.debug_logger.log_action("send", action_input=tagged, success=False, error=img_result.error or "")
+                        send_skipped = True
                     else:
                         self.logger.warning("[StickerReply] 替代模式发图失败，回退发文字: %s", img_result.error)
 
-            for i, reply in enumerate([] if (voiced or sticker_replaced) else replies):
+            for i, reply in enumerate([] if (voiced or sticker_replaced or send_skipped) else replies):
                 action_result = self._send_text(chat_name, reply)
                 if action_result.success:
                     sent_replies.append(reply)

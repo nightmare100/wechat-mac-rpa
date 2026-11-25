@@ -184,3 +184,79 @@ def test_generator_injects_sticker_prompt_and_respects_group_config(tmp_path):
     gen.generate([msg_b], [msg_b], is_group=True)
     assert "<sticker_annotation>" not in gen.last_system_prompt
     assert gen.last_sticker_meta is None
+
+
+def test_generator_iterate_preserves_or_updates_sticker_meta(monkeypatch):
+    monkeypatch.setenv("CHIME_IN_COOLDOWN_MINUTES", "0")
+
+    class _LLM:
+        def __init__(self, responses):
+            self.responses = list(responses)
+            self.idx = 0
+
+        def chat(self, messages, tools=None, **kwargs):
+            r = self.responses[self.idx]
+            self.idx += 1
+            return r
+
+    tpl = "<sticker_annotation>可用标签：{{STICKER_TAGS}}</sticker_annotation>"
+
+    # 1) Iterate 输出不含 sticker 键 → 保留主模型原有的 last_sticker_meta
+    llm_keep = _LLM([
+        '{"replies": ["@李桑 谢谢呀！"], "sticker": {"tag": "谢谢", "mode": "append"}}',
+        '{"decision": "fail", "issues": ["去掉感叹号"]}',
+        '{"replies": ["@李桑 谢谢呀"]}',
+    ])
+    gen = ReplyGenerator(
+        llm_client=llm_keep,
+        sticker_prompt=tpl,
+        sticker_tags_provider=lambda: ["开心", "谢谢"],
+    )
+    gen.enable_skills = False
+    gen.enable_self_refine = True
+    gen.enable_react_tools = False
+    gen.enable_chime_in = True
+
+    msg = ChatMessage(text="夸你", sender="李桑", sender_type=SenderType.OTHER, chat_name="群A")
+    replies = gen.generate([msg], [msg], is_group=True)
+    assert replies == ["@李桑 谢谢呀"]
+    assert gen.last_iterate_count == 1
+    assert gen.last_sticker_meta == {"tag": "谢谢", "mode": "append"}
+
+    # 2) Iterate 显式输出 sticker: null → 清空 last_sticker_meta
+    llm_clear = _LLM([
+        '{"replies": ["@李桑 谢谢呀！"], "sticker": {"tag": "谢谢", "mode": "append"}}',
+        '{"decision": "fail", "issues": ["严肃场景别发表情"]}',
+        '{"replies": ["@李桑 收到"], "sticker": null}',
+    ])
+    gen2 = ReplyGenerator(
+        llm_client=llm_clear,
+        sticker_prompt=tpl,
+        sticker_tags_provider=lambda: ["开心", "谢谢"],
+    )
+    gen2.enable_skills = False
+    gen2.enable_self_refine = True
+    gen2.enable_react_tools = False
+    gen2.enable_chime_in = True
+    gen2.generate([msg], [msg], is_group=True)
+    assert gen2.last_iterate_count == 1
+    assert gen2.last_sticker_meta is None
+
+    # 3) Iterate 显式输出新 sticker → 更新 last_sticker_meta
+    llm_update = _LLM([
+        '{"replies": ["@李桑 谢谢呀！"], "sticker": {"tag": "谢谢", "mode": "append"}}',
+        '{"decision": "fail", "issues": ["换个标签"]}',
+        '{"replies": ["@李桑 哈哈"], "sticker": {"tag": "开心", "mode": "replace"}}',
+    ])
+    gen3 = ReplyGenerator(
+        llm_client=llm_update,
+        sticker_prompt=tpl,
+        sticker_tags_provider=lambda: ["开心", "谢谢"],
+    )
+    gen3.enable_skills = False
+    gen3.enable_self_refine = True
+    gen3.enable_react_tools = False
+    gen3.enable_chime_in = True
+    gen3.generate([msg], [msg], is_group=True)
+    assert gen3.last_iterate_count == 1
+    assert gen3.last_sticker_meta == {"tag": "开心", "mode": "replace"}
