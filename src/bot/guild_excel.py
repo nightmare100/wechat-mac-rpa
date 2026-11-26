@@ -65,6 +65,14 @@ _MAX_IMAGES = 20
 _MAX_PENDING_JOBS = 8
 _MAX_IMAGE_BYTES = 12 * 1024 * 1024
 _MAX_BATCH_BYTES = 40 * 1024 * 1024
+_MIN_IMAGE_SHORT_EDGE = 400
+_MIN_IMAGE_LONG_EDGE = 600
+_MIN_CROPPED_LONG_EDGE = 800
+_MIN_CROPPED_SHORT_EDGE = 180
+_MIN_ROSTER_BASELINE_SIZE = 10
+_MIN_ROSTER_OVERLAP_RATIO = 0.75
+_ROSTER_SYMBOL_MAP = str.maketrans({"丶": "、", "乄": "メ", "ノ": "丿"})
+_SHEET_ALIASES = {"1队": "一队", "2队": "二队", "3队": "三队"}
 _CODEX_TIMEOUT_SECONDS = 300
 _IMAGE_EXTENSIONS = {"PNG": ".png", "JPEG": ".jpg", "WEBP": ".webp"}
 _IMAGE_SEND_HINT = "提示：请不要折叠发送图片，并且发送图片后等待 30 秒左右再发送指令。"
@@ -382,6 +390,16 @@ def _run_codex(request, images, directory, skill):
     return response
 
 
+def _is_low_res_image(width: int, height: int) -> bool:
+    """拦截微信缩略图与过低清整图，同时放行高清横向局部裁图（如 1180×260）。"""
+    short_edge, long_edge = min(width, height), max(width, height)
+    if long_edge < _MIN_IMAGE_LONG_EDGE or short_edge < _MIN_CROPPED_SHORT_EDGE:
+        return True
+    if short_edge < _MIN_IMAGE_SHORT_EDGE and long_edge < _MIN_CROPPED_LONG_EDGE:
+        return True
+    return False
+
+
 def create_workbook(request, command, perception, directory, *, skill=_SKILL):
     if not (skill / "SKILL.md").is_file() or not (skill / "scripts/export.py").is_file():
         raise GuildExcelError("本机缺少 guild-monster-excel 技能。")
@@ -391,6 +409,8 @@ def create_workbook(request, command, perception, directory, *, skill=_SKILL):
         messages = perception.recent_group_messages(command.chatroom_id, command.create_time - window_seconds)
         images = select_images(messages, command, request.nickname, window_minutes=window_minutes)
         paths, total_bytes = [], 0
+        dimensions: list[tuple[int, int]] = []
+        low_res: list[tuple[int, int, int]] = []
         for index, msg in enumerate(images, start=1):
             if not msg.media_url:
                 raise GuildExcelError(f"有图片尚未能从 TraceMemo 读取，请在微信打开原图后重试。{_IMAGE_SEND_HINT}")
@@ -401,20 +421,38 @@ def create_workbook(request, command, perception, directory, *, skill=_SKILL):
             try:
                 with Image.open(BytesIO(data)) as image:
                     extension = _IMAGE_EXTENSIONS.get(image.format)
-                    if extension is None or image.width * image.height > 24_000_000:
+                    width, height = image.size
+                    if extension is None or width * height > 24_000_000:
                         raise ValueError("unsupported image")
                     image.verify()
             except (OSError, ValueError, SyntaxError, Image.DecompressionBombError) as exc:
                 raise GuildExcelError("有图片格式不支持、损坏或尺寸过大，请重新发图。") from exc
+            dimensions.append((width, height))
+            if _is_low_res_image(width, height):
+                low_res.append((index, width, height))
+                continue
             path = directory / f"image-{index:02d}{extension}"
             path.write_bytes(data)
             paths.append(path)
     except TraceMemoError as exc:
         raise GuildExcelError(f"TraceMemo 读取群图片失败，请确认原图可打开后重试。{_IMAGE_SEND_HINT}") from exc
 
+    if low_res:
+        _, min_w, min_h = min(low_res, key=lambda item: item[1] * item[2])
+        detail = ", ".join(f"#{idx}:{w}x{h}" for idx, w, h in low_res)
+        _LOGGER.warning(
+            "[GuildExcel] 检测到缩略图/低清图 %d/%d 张 (sender=%s, sheet=%s, file=%s): %s",
+            len(low_res), len(images), request.nickname, request.sheet, request.filename, detail,
+        )
+        raise GuildExcelError(
+            f"检测到 {len(low_res)}/{len(images)} 张图片分辨率过低（疑似微信缩略图，最小 {min_w}×{min_h}），"
+            f"已取消识别以免认错昵称和数值。请确认发送原图，或通知管理员在机器人微信端点击加载原图后重试。{_IMAGE_SEND_HINT}"
+        )
+
+    min_w, min_h = min(dimensions, key=lambda size: size[0] * size[1])
     _LOGGER.info(
-        "[GuildExcel] 已拉取图片 %d 张 (sender=%s, sheet=%s, file=%s, window=%dm)",
-        len(paths), request.nickname, request.sheet, request.filename, window_minutes,
+        "[GuildExcel] 已拉取图片 %d 张 (sender=%s, sheet=%s, file=%s, window=%dm, min_size=%dx%d)",
+        len(paths), request.nickname, request.sheet, request.filename, window_minutes, min_w, min_h,
     )
     records = _run_codex(request, paths, directory, skill)
     output = directory / request.filename
@@ -429,6 +467,80 @@ def create_workbook(request, command, perception, directory, *, skill=_SKILL):
     if not output.is_file() or not output.stat().st_size:
         raise GuildExcelError("没有生成 Excel 文件。")
     return output
+
+
+def _normalize_sheet_key(sheet_name: str) -> str:
+    folded = sheet_name.strip().casefold()
+    return _SHEET_ALIASES.get(folded, folded)
+
+
+def _normalize_roster_name(name: str) -> str:
+    return re.sub(r"\s+", "", name.strip().casefold()).translate(_ROSTER_SYMBOL_MAP)
+
+
+def _read_daily_sheet_members(path: Path, sheet_name: str) -> list[str]:
+    from openpyxl import load_workbook
+
+    target_key = _normalize_sheet_key(sheet_name)
+    book = load_workbook(path, read_only=True)
+    try:
+        target = next((n for n in book.sheetnames if _normalize_sheet_key(n) == target_key), None)
+        if target is None:
+            return []
+        rows = list(book[target].iter_rows(values_only=True))
+        if len(rows) <= 1 or tuple(rows[0][:3]) != ("名称", "战力", "魔物得分"):
+            return []
+        return [str(row[0]).strip() for row in rows[1:] if row and row[0] not in (None, "") and str(row[0]).strip()]
+    finally:
+        book.close()
+
+
+def _check_roster_overlap(output: Path, group_dir: Path, current_filename: str, sheet_name: str) -> None:
+    """与该群最近一份历史日报的同名工作表比对名单重合率，异常偏低时拦截写入与发送。"""
+    if not group_dir.is_dir():
+        return
+    candidates = [
+        p for p in group_dir.iterdir()
+        if p.is_file()
+        and p.suffix.lower() == ".xlsx"
+        and p.name != current_filename
+        and not p.name.startswith((".", "~$"))
+    ]
+    if not candidates:
+        return
+
+    def _sort_key(path: Path):
+        parsed = _extract_file_date(path)
+        date_key = (1, parsed[0] or 9999, parsed[1], parsed[2]) if parsed else (0, 0, 0, 0)
+        return (date_key, path.stat().st_mtime)
+
+    for prev_path in sorted(candidates, key=_sort_key, reverse=True):
+        try:
+            baseline = _read_daily_sheet_members(prev_path, sheet_name)
+        except Exception:
+            continue
+        if len(baseline) < _MIN_ROSTER_BASELINE_SIZE:
+            continue
+        current = _read_daily_sheet_members(output, sheet_name)
+        if not current:
+            return
+        base_norm = {_normalize_roster_name(name) for name in baseline}
+        curr_norm = {_normalize_roster_name(name) for name in current}
+        matched = len(curr_norm & base_norm)
+        ratio = matched / len(curr_norm)
+        if ratio < _MIN_ROSTER_OVERLAP_RATIO:
+            unfamiliar = [name for name in current if _normalize_roster_name(name) not in base_norm]
+            preview = "、".join(unfamiliar[:6])
+            suffix = f" 等 {len(unfamiliar)} 人" if len(unfamiliar) > 6 else ""
+            _LOGGER.warning(
+                "[GuildExcel] 名单重合率异常: sheet=%s current=%s baseline=%s matched=%d/%d (%.1f%%) unfamiliar=%s",
+                sheet_name, current_filename, prev_path.name, matched, len(curr_norm), ratio * 100, preview,
+            )
+            raise GuildExcelError(
+                f"检测到「{sheet_name}」名单与上次（{prev_path.name}）重合率仅 {ratio:.0%}（{matched}/{len(curr_norm)}），"
+                f"疑似截图不清晰导致认错昵称（异常项如：{preview}{suffix}），已取消写入与发送。请核对原图清晰度后重试。"
+            )
+        return
 
 
 def _inspect_workbook_sheet(path: Path, sheet_name: str) -> tuple[int, int, int]:
@@ -774,6 +886,7 @@ class GuildExcelFlow:
                 shutil.copyfile(workbook, staged_input)
                 _drop_existing_sheet(staged_input, request.sheet)
             output = self.worker(request, command, self.perception, directory)
+            _check_roster_overlap(output, workbook.parent, request.filename, request.sheet)
             return self._publish_workbook(output, workbook, request.filename)
 
     def _edit_workbook(

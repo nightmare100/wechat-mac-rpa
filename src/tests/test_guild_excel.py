@@ -68,7 +68,7 @@ def test_workbook_uses_scoped_images_and_skill_exporter(tmp_path, monkeypatch):
         pytest.skip("local guild-monster-excel skill is not installed")
 
     png = BytesIO()
-    Image.new("RGB", (30, 30)).save(png, format="PNG")
+    Image.new("RGB", (1080, 2400)).save(png, format="PNG")
     perception = Mock()
     perception.recent_group_messages.return_value = [
         message(media_url="/media/one"), message(local_id=2, media_url="/media/two"),
@@ -98,6 +98,132 @@ def test_workbook_uses_scoped_images_and_skill_exporter(tmp_path, monkeypatch):
         assert list(workbook["今日"].values) == [("名称", "战力", "魔物得分"), ("队员", "2.00m", "3.00b")]
     finally:
         workbook.close()
+
+
+def test_workbook_rejects_thumbnail_images_before_calling_codex(tmp_path, monkeypatch):
+    from io import BytesIO
+    from PIL import Image
+    from src.bot import guild_excel
+
+    # 边界：拦截缩略图与过低清整图，放行高清横向局部裁图（如 1180×260）
+    assert guild_excel._is_low_res_image(210, 467) is True
+    assert guild_excel._is_low_res_image(300, 700) is True
+    assert guild_excel._is_low_res_image(1080, 150) is True
+    assert guild_excel._is_low_res_image(1180, 260) is False
+    assert guild_excel._is_low_res_image(1180, 964) is False
+    assert guild_excel._is_low_res_image(400, 600) is False
+
+    fake_skill = tmp_path / "skill"
+    (fake_skill / "scripts").mkdir(parents=True)
+    (fake_skill / "SKILL.md").write_text("# mock", encoding="utf-8")
+    (fake_skill / "scripts" / "export.py").write_text("", encoding="utf-8")
+
+    hd_buf, thumb_buf = BytesIO(), BytesIO()
+    Image.new("RGB", (1280, 2844)).save(hd_buf, format="PNG")
+    Image.new("RGB", (210, 467)).save(thumb_buf, format="JPEG")
+    blobs = {"/media/hd": hd_buf.getvalue(), "/media/thumb1": thumb_buf.getvalue(), "/media/thumb2": thumb_buf.getvalue()}
+
+    perception = Mock()
+    perception.recent_group_messages.return_value = [
+        message(local_id=1, media_url="/media/hd"),
+        message(local_id=2, media_url="/media/thumb1"),
+        message(local_id=3, media_url="/media/thumb2"),
+    ]
+    perception.client.read_bytes.side_effect = lambda url, max_bytes=None: blobs[url]
+    request = parse_command("请读取小明的图片，工作表:一队，最终输出:战报.xlsx")
+    command = message(create_time=1100, local_id=10)
+
+    run_codex = Mock()
+    monkeypatch.setattr(guild_excel, "_run_codex", run_codex)
+
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    with pytest.raises(GuildExcelError, match=r"2/3 张图片分辨率过低.*210×467.*机器人微信端点击加载原图"):
+        guild_excel.create_workbook(request, command, perception, work_dir, skill=fake_skill)
+    run_codex.assert_not_called()
+
+
+def test_roster_overlap_blocks_garbled_sheet_from_publishing_and_delivery(tmp_path):
+    import hashlib
+    from openpyxl import Workbook
+    from src.bot.guild_excel import GuildExcelFlow
+    from src.models.base import ActionResult
+
+    outbox = tmp_path / "outbox"
+    group_key = hashlib.sha256(b"abc@chatroom").hexdigest()
+    group_dir = tmp_path / "workbooks" / group_key
+    group_dir.mkdir(parents=True)
+
+    baseline_names = [
+        "害群之马", "破军丶斩月", "花间灼晚意", "落落快退游了",
+        "饿狼1", "既梦", "承汐待潮", "逆流oc",
+        "希芜丶", "调味凉白开", "顾念鸭", "小铄哥哥",
+    ]
+    wb_prev = Workbook()
+    ws_prev = wb_prev.active
+    ws_prev.title = "1队"
+    ws_prev.append(("名称", "战力", "魔物得分"))
+    for idx, name in enumerate(baseline_names):
+        ws_prev.append((name, f"{20 - idx * 0.5:.2f}m", f"{100 - idx:.2f}t"))
+    wb_prev.save(group_dir / "公会情报11-24.xlsx")
+    wb_prev.close()
+
+    batches = {
+        "坏图": [
+            "荒野之马", "派军、新月", "花间灼镜意", "潘森快退游了",
+            "银狼1", "既梦", "承汐待潮", "逆流oc",
+            "希芜、", "调味凉白开", "顾念鸭", "小铄哥哥",
+        ],
+        "好图": [
+            "害群之马", "破军、斩月", "花间灼晚意", "落落快退游了",
+            "饿狼1", "既梦", "承汐待潮", "逆流oc",
+            "希芜、", "调味凉白开", "顾念鸭", "新成员甲",
+        ],
+    }
+
+    def export(request, command, perception, directory):
+        path = directory / request.filename
+        book = Workbook()
+        ws = book.active
+        ws.title = request.sheet
+        ws.append(("名称", "战力", "魔物得分"))
+        for name in batches[request.nickname]:
+            ws.append((name, "20.00m", "10.00t"))
+        book.save(path)
+        book.close()
+        return path
+
+    send_text = Mock()
+    send_file = Mock(return_value=ActionResult(success=True))
+    flow = GuildExcelFlow(Mock(), send_text, send_file, worker=export, outbox=outbox)
+    try:
+        # 1) 重合率仅 7/12 (58%)，拦截写入与发送，管理群收到告警
+        bad_cmd = message(
+            text="请读取坏图的图片，工作表:一队，最终输出:公会情报11-25.xlsx",
+            message_type="text",
+            chat_name="戰神管理群",
+        )
+        flow.handle("戰神管理群", bad_cmd)
+        with pytest.raises(GuildExcelError, match=r"重合率仅 58%.*荒野之马"):
+            flow.jobs[-1][1].result(timeout=5)
+        flow.poll("戰神管理群")
+        send_file.assert_not_called()
+        assert not (group_dir / "公会情报11-25.xlsx").exists()
+        assert any("重合率仅 58%" in call.args[1] for call in send_text.call_args_list)
+
+        # 2) 重合率 11/12 (92%，含 丶/、 符号归一)，正常写入并发送
+        good_cmd = message(
+            text="请读取好图的图片，工作表:一队，最终输出:公会情报11-25.xlsx",
+            message_type="text",
+            chat_name="戰神管理群",
+        )
+        flow.handle("戰神管理群", good_cmd)
+        flow.jobs[-1][1].result(timeout=5)
+        flow.poll("戰神管理群")
+        send_file.assert_called_once()
+        assert (group_dir / "公会情报11-25.xlsx").is_file()
+    finally:
+        flow.executor.shutdown()
 
 
 def test_background_job_only_delivers_to_origin_group(tmp_path):
