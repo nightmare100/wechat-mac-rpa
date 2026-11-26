@@ -303,6 +303,30 @@ class WeChatBot:
             reader=client.read_bytes,
         )
 
+    def _enrich_chime_in_images(
+        self,
+        chat_name: str,
+        target_msgs: list[ChatMessage],
+        to_reply: list[ChatMessage],
+        all_messages: list[ChatMessage],
+    ) -> int:
+        """主动插话确定要回且未在冷却中时，仅对插话目标发出的未解析图片按需调用 VLM。"""
+        describer = getattr(self, "image_describer", None)
+        if describer is None or not target_msgs or not to_reply:
+            return 0
+        if not self._group_feature_enabled(chat_name, "image_understanding", describer.enabled):
+            return 0
+        client = getattr(self.perception, "client", None)
+        if client is None or not hasattr(client, "read_bytes"):
+            return 0
+        return describer.enrich_messages(
+            chat_name,
+            to_reply,
+            all_messages,
+            target_msgs,
+            reader=client.read_bytes,
+        )
+
     def __init__(self, profile=None, on_message: Optional[Callable] = None, llm_client=None,
                  debug_mode: bool = False, use_openclaw: bool = True, perception=None,
                  enable_chat_switch: bool = True):
@@ -917,7 +941,13 @@ class WeChatBot:
 
             # 传递完整消息上下文 + 所有未读消息，让 AI 生成多条回复
             t_gen_start = time.time()
-            replies = self.generator.generate(to_reply, all_messages, is_group=is_group, tick_id=tick_id)
+            replies = self.generator.generate(
+                to_reply,
+                all_messages,
+                is_group=is_group,
+                tick_id=tick_id,
+                chime_in_image_enricher=self._enrich_chime_in_images if is_group else None,
+            )
             t_gen_ms = (time.time() - t_gen_start) * 1000
             self.logger.info(f"[Perf][Tick] LLM generate total={t_gen_ms:.0f}ms replies={len(replies)}")
             reply_text = " | ".join(replies) if replies else ""

@@ -312,3 +312,38 @@ def test_xml_entity_safe_truncation_system_filter_and_no_typo_alias(tmp_path: Pa
 
     # 已移除临时笔误别名「神华」
     assert real_kb.select([_msg("神华集团今天股价怎么样")]) == ""
+
+
+def test_guild_slang_aliases_and_no_guess_boundary(tmp_path: Path):
+    """验证公会群新增黑话别名命中，且 <note> 明确禁止望文生义猜词。"""
+    kb_file = tmp_path / "kb.md"
+    kb_file.write_text(
+        "## 一、基础玩法与公会日常\n\n"
+        "1. **公会飞船**：喊低战有核心/发工会了是指去抢劫低战船拿核心，不是让低战领福利。\n"
+        "2. **魔植**：2 人防守副本。\n"
+        "3. **协助**：帮打或带推。\n\n"
+        "## 二、高频黑话与核心概念\n\n"
+        "1. **三套 S 装**：神谕、格里芬、龙骑三套装备，支持混搭和置换宝珠。\n"
+        "2. **出金 / 歪了**：抽卡或附魔出高品质或歪掉。\n",
+        encoding="utf-8",
+    )
+    kb = GameKnowledgeBase(path=kb_file)
+
+    cases = [
+        ("快，低战有核心，发工会了", "公会飞船"),
+        ("好几天没看见大船了，明天刷核心船", "公会飞船"),
+        ("自己偏偏没有抢劫次数", "公会飞船"),
+        ("3混是3混 就是没混对", "三套 S 装"),
+        ("一直买打折置换宝珠", "三套 S 装"),
+        ("怎么你们深夜附魔都出红", "出金 / 歪了"),
+        ("红歪了一个 浪费了", "出金 / 歪了"),
+        ("有没有滴滴带推 累死我了", "协助"),
+        ("喊宝哥带刷魔植 六票扫荡", "魔植"),
+    ]
+    for utterance, expected_title in cases:
+        block, titles = kb.select_with_matches([_msg(utterance)])
+        assert expected_title in titles, f"{utterance!r} 未命中 {expected_title!r}, 实际={titles}"
+        assert "严禁望文生义" in block
+        # 确认所有提取的关键词长度均 >= 2
+        for entry in parse_game_knowledge(kb_file.read_text(encoding="utf-8")):
+            assert all(len(kw) >= 2 for kw in entry.keywords)

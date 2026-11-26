@@ -1038,7 +1038,8 @@ class ReplyGenerator:
                  enable_time_awareness: Optional[bool] = None,
                  enable_reply_restraint: Optional[bool] = None,
                  enable_unread_dedup: Optional[bool] = None,
-                 enable_timestamps: Optional[bool] = None) -> List[str]:
+                 enable_timestamps: Optional[bool] = None,
+                 chime_in_image_enricher: Optional[Any] = None) -> List[str]:
         """
         生成回复内容，返回多条回复列表（最多3条）。
         支持 ReAct 多轮工具调用，总超时预算 20s；启用 Self-Refine 时生成后追加 Feedback + Iterate。
@@ -1224,6 +1225,86 @@ class ReplyGenerator:
         replies, final_messages = self._react_generate(messages, tools, deadline, chat_name)
         _logger.info(f"[Perf][Generate] react_generate={(time.time()-t_react_start)*1000:.0f}ms replies={len(replies)}")
 
+        # 主动插话按需识图：确认模型要插话且未在冷却中后，才对插话目标补做图片解析并二次投喂
+        if is_group and replies and callable(chime_in_image_enricher):
+            chime_pairs = self._chime_in_target_pairs(chat_name, unreplied, replies, all_messages)
+            chime_targets: List[ChatMessage] = []
+            seen_ct_ids: set[int] = set()
+            for _, msgs in chime_pairs:
+                for m in msgs:
+                    if id(m) not in seen_ct_ids:
+                        seen_ct_ids.add(id(m))
+                        chime_targets.append(m)
+            if chime_targets:
+                from src.perception.image_describer import select_target_images
+                unresolved_before = select_target_images(unreplied, all_messages, chime_targets)
+                try:
+                    enriched = int(chime_in_image_enricher(chat_name, chime_targets, unreplied, all_messages) or 0)
+                except Exception as e:
+                    _logger.warning("[ChimeInImage] 插话按需识图异常: %s", e)
+                    enriched = 0
+                if enriched > 0:
+                    _logger.info(
+                        "[ChimeInImage] chat=%s 补全 %d 张图片描述，重新投喂主模型生成",
+                        chat_name, enriched,
+                    )
+                    self.last_generation_trace.append({
+                        "round": 0,
+                        "type": "chime_in_image_enriched",
+                        "timestamp": time.time(),
+                        "enriched": enriched,
+                    })
+                    user_prompt = self._build_user_prompt(
+                        unreplied, all_messages, is_group,
+                        enable_time_awareness=enable_time_awareness,
+                        enable_unread_dedup=enable_unread_dedup,
+                        enable_timestamps=enable_timestamps,
+                        tools_context=tools_context,
+                    )
+                    if skill_parts:
+                        user_prompt = self._append_request_sections(user_prompt, skill_parts)
+                    if self.last_few_shot_content:
+                        user_prompt = self._append_request_sections(user_prompt, [self.last_few_shot_content])
+                    self.last_user_prompt = user_prompt
+                    # 重置首轮元数据，避免与看图后的新回复错配
+                    self.last_voice_meta = None
+                    self.last_sticker_meta = None
+                    self.last_go_online = False
+                    self.last_chime_in = False
+                    messages = [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ]
+                    deadline = max(deadline, time.time() + 15.0)
+                    t_react2_start = time.time()
+                    replies, final_messages = self._react_generate(messages, tools, deadline, chat_name)
+                    _logger.info(
+                        "[Perf][Generate] chime_in_image_regen=%.0fms replies=%d",
+                        (time.time() - t_react2_start) * 1000, len(replies),
+                    )
+                elif unresolved_before:
+                    _logger.warning(
+                        "[ChimeInImage] chat=%s 目标含 %d 张未解析图片但识图未补全 (enriched=0)",
+                        chat_name, len(unresolved_before),
+                    )
+                    drop_indices: set[int] = set()
+                    for idx, msgs in chime_pairs:
+                        if self._is_unresolved_image_with_short_text(msgs, unreplied, all_messages):
+                            drop_indices.add(idx)
+                    if drop_indices:
+                        dropped_blind = [r for i, r in enumerate(replies) if i in drop_indices]
+                        replies = [r for i, r in enumerate(replies) if i not in drop_indices]
+                        self.last_chime_in_dropped = True
+                        if not replies:
+                            self.last_voice_meta = None
+                            self.last_sticker_meta = None
+                            self.last_go_online = False
+                            self.last_chime_in = False
+                        _logger.warning(
+                            "[ChimeInImage] chat=%s 目标仅有未解析图片与极短文字且识图失败，丢弃主动插话: %s",
+                            chat_name, dropped_blind,
+                        )
+
         # Self-Refine：Feedback + Iterate
         if self.enable_self_refine and replies and deadline - time.time() >= 1.0:
             decision, raw_issues, feedback_messages, _ = self._self_refine(final_messages, deadline)
@@ -1367,6 +1448,54 @@ class ReplyGenerator:
             bool(at_pattern.search(m.text or "")) and not m.is_at_me and not is_at_bot(m.text)
             for m in text_msgs
         )
+
+    @staticmethod
+    def _is_unresolved_image_with_short_text(
+        target_msgs: List[ChatMessage],
+        unreplied: List[ChatMessage],
+        all_messages: List[ChatMessage],
+        max_text_chars: int = 8,
+    ) -> bool:
+        """判断目标消息是否包含未解析图片且配套文字过短（缺乏独立可理解语境）。"""
+        from src.perception.image_describer import select_target_images
+        if not select_target_images(unreplied, all_messages, target_msgs):
+            return False
+        non_img_text = []
+        for m in target_msgs:
+            if getattr(m, "message_type", "") == "image":
+                continue
+            raw = (m.text or "").strip()
+            cleaned = re.sub(r"[\s，,。！？!?.…~～、：:；;\"'“”‘’\[\]（）()]+", "", raw)
+            if cleaned:
+                non_img_text.append(cleaned)
+        return len("".join(non_img_text)) <= max_text_chars
+
+    def _chime_in_target_pairs(
+        self,
+        chat_name: str,
+        unreplied: List[ChatMessage],
+        replies: List[str],
+        history: Optional[List[ChatMessage]] = None,
+    ) -> List[Tuple[int, List[ChatMessage]]]:
+        """返回本轮允许放行的主动插话 (reply_index, target_msgs) 列表，兼容含空格昵称。"""
+        if not replies or not self.is_chime_in_enabled(chat_name) or not self.chime_in_allowed(chat_name):
+            return []
+        from src.reply.relationship_store import RelationshipEngine
+        direct_on = self.is_direct_group_reply_enabled(chat_name)
+        pairs: List[Tuple[int, List[ChatMessage]]] = []
+        for idx, reply in enumerate(replies):
+            matched_msg = RelationshipEngine._reply_target_msg(reply, unreplied)
+            target = matched_msg.sender if matched_msg is not None else _reply_target(reply, unreplied)
+            msgs = [m for m in unreplied if _same_person(m.sender, target)] if target else []
+            if not direct_on and target and not msgs:
+                continue
+            msgs = msgs or unreplied
+            if self._has_reply_trigger(chat_name, msgs, history):
+                continue
+            if self._is_at_other_only(msgs):
+                continue
+            pairs.append((idx, msgs))
+        return pairs
 
     def _apply_chime_in_limit(self, chat_name: str, unreplied: List[ChatMessage],
                               replies: List[str], history: Optional[List[ChatMessage]] = None) -> Tuple[List[str], set]:
