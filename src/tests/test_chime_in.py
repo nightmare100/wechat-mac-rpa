@@ -284,3 +284,58 @@ def test_chime_in_blocks_at_other_person_without_starting_cooldown():
     gen2 = _gen('{"replies":["@2kk 在呀"]}')
     at_bot = _m("2kk", "@『宵桜』囡囡 在吗")
     assert _run(gen2, at_bot) == ["在呀"]
+
+
+def test_chime_in_quiet_hours_blocks_only_chime_in(monkeypatch):
+    from datetime import datetime
+
+    monkeypatch.setenv("CHIME_IN_QUIET_HOURS", "00:30-07:30")
+    gen = _gen()
+
+    # 深夜静默时段内：不允许主动插话，且不消耗冷却
+    assert gen.in_chime_in_quiet_hours("群", now=datetime(2026, 11, 26, 1, 23)) is True
+    assert gen.chime_in_allowed("群", now=datetime(2026, 11, 26, 1, 23)) is False
+    assert gen.chime_in_allowed("群", now=datetime(2026, 11, 26, 3, 31)) is False
+    # 白天/晚间正常时段：允许主动插话
+    assert gen.in_chime_in_quiet_hours("群", now=datetime(2026, 11, 26, 0, 29)) is False
+    assert gen.chime_in_allowed("群", now=datetime(2026, 11, 26, 7, 30)) is True
+    assert gen.chime_in_allowed("群", now=datetime(2026, 11, 26, 18, 10)) is True
+
+    # 强制模拟当前处于深夜静默时段：主动插话被拦截，但 @Bot 直接回复照常放行
+    monkeypatch.setattr(gen, "in_chime_in_quiet_hours", lambda chat_name="", now=None: True)
+    msg = _m("既梦", "红歪了一个")
+    assert "<chime_in_allowed>false</chime_in_allowed>" in gen._build_user_prompt([msg], [msg], is_group=True)
+    assert _run(gen, msg) == []
+    assert gen.last_chime_in_dropped is True
+    assert "群" not in gen.chime_in_last
+
+    gen.llm_client.content = '{"replies":["@相缺 在哒"],"chime_in":true}'
+    assert _run(gen, _m("相缺", "@『宵桜』囡囡 在吗")) == ["在哒"]
+
+
+def test_chime_in_quiet_hours_default_and_group_override(monkeypatch):
+    from datetime import datetime
+
+    # 未配置环境变量时默认启用 00:30-07:30
+    monkeypatch.delenv("CHIME_IN_QUIET_HOURS", raising=False)
+    gen_default = _gen()
+    assert gen_default.chime_in_allowed("群", now=datetime(2026, 11, 26, 2, 0)) is False
+    assert gen_default.chime_in_allowed("群", now=datetime(2026, 11, 26, 12, 0)) is True
+
+    # 支持通过 group_config 按群关闭或自定义静默时段
+    class _GroupCfg:
+        def is_enabled(self, chat_name, key, default=True):
+            return default
+
+        def get(self, chat_name, key, default=None):
+            if key == "chime_in_quiet_hours":
+                if chat_name == "不眠群":
+                    return "off"
+                if chat_name == "早睡群":
+                    return "23:00-08:00"
+            return default
+
+    gen_default.group_config = _GroupCfg()
+    assert gen_default.chime_in_allowed("不眠群", now=datetime(2026, 11, 26, 2, 0)) is True
+    assert gen_default.chime_in_allowed("早睡群", now=datetime(2026, 11, 26, 23, 15)) is False
+    assert gen_default.chime_in_allowed("早睡群", now=datetime(2026, 11, 26, 8, 5)) is True

@@ -8,6 +8,7 @@ import random
 import re
 import threading
 import time
+from datetime import datetime
 from difflib import SequenceMatcher
 from html import escape as xml_escape
 from pathlib import Path
@@ -343,6 +344,16 @@ class ReplyGenerator:
         self.enable_chime_in = os.getenv("ENABLE_CHIME_IN", "1").strip().lower() in ("1", "true", "yes", "on")
         self.enable_direct_group_reply = os.getenv("ENABLE_DIRECT_GROUP_REPLY", "1").strip().lower() in ("1", "true", "yes", "on")
         self.chime_in_cooldown = _env_int("CHIME_IN_COOLDOWN_MINUTES", 60, 0, 1440) * 60  # 每个群主动插话的冷却（秒）
+        # 主动插话深夜静默时段（.env 的 CHIME_IN_QUIET_HOURS，默认 00:30-07:30；设为空或 off 可关闭）
+        raw_quiet = os.environ.get("CHIME_IN_QUIET_HOURS", "00:30-07:30").strip()
+        if raw_quiet.lower() in ("", "0", "off", "none", "false"):
+            self.chime_in_quiet_window = None
+        else:
+            try:
+                self.chime_in_quiet_window = parse_sleep_hours(raw_quiet, name="CHIME_IN_QUIET_HOURS")
+            except ValueError as e:
+                _logger.warning(f"{e}，不启用主动插话深夜静默时段")
+                self.chime_in_quiet_window = None
         self.chime_in_last: Dict[str, float] = {}  # 聊天名 → 上次主动插话的时间
         self._started_at = time.time()  # 启动即视为刚插过话：开机后屏幕上的旧消息不插话
         self.memory_engine = memory_engine
@@ -1420,10 +1431,29 @@ class ReplyGenerator:
             return self.group_config.is_enabled(chat_name, "game_knowledge", default=global_enabled)
         return global_enabled
 
-    def chime_in_allowed(self, chat_name: str) -> bool:
-        return self.is_chime_in_enabled(chat_name) and (
-            time.time() - self.chime_in_last.get(chat_name, self._started_at) >= self.chime_in_cooldown
-        )
+    def _resolve_chime_in_quiet_window(self, chat_name: str = ""):
+        if self.group_config is not None and chat_name:
+            override = self.group_config.get(chat_name, "chime_in_quiet_hours", None)
+            if isinstance(override, str):
+                raw = override.strip()
+                if raw.lower() in ("", "0", "off", "none", "false"):
+                    return None
+                try:
+                    return parse_sleep_hours(raw, name="chime_in_quiet_hours")
+                except ValueError as e:
+                    _logger.warning(f"{e}，回退全局主动插话深夜静默时段")
+        return getattr(self, "chime_in_quiet_window", None)
+
+    def in_chime_in_quiet_hours(self, chat_name: str = "", now: Optional[datetime] = None) -> bool:
+        window = self._resolve_chime_in_quiet_window(chat_name)
+        return in_sleep_window(window, now or datetime.now())
+
+    def chime_in_allowed(self, chat_name: str, now: Optional[datetime] = None) -> bool:
+        if not self.is_chime_in_enabled(chat_name):
+            return False
+        if self.in_chime_in_quiet_hours(chat_name, now=now):
+            return False
+        return time.time() - self.chime_in_last.get(chat_name, self._started_at) >= self.chime_in_cooldown
 
     def group_reply_candidates(self, chat_name, messages, history):
         """按回复入口筛选群聊未读，关闭的入口不转交给另一条路径。"""
@@ -1531,7 +1561,12 @@ class ReplyGenerator:
             _logger.info("[ChimeIn] '%s' 目标消息为 @别人，丢弃主动插话: %s", chat_name, dropped_at_other)
         if dropped:
             self.last_chime_in_dropped = True
-            reason = "冷却中" if chime_on else "已关闭"
+            if not chime_on:
+                reason = "已关闭"
+            elif self.in_chime_in_quiet_hours(chat_name):
+                reason = "深夜静默时段"
+            else:
+                reason = "冷却中"
             _logger.info("[ChimeIn] '%s' %s，丢弃主动插话: %s", chat_name, reason, dropped)
         return kept, fresh_targets
 
@@ -1966,7 +2001,9 @@ class ReplyGenerator:
                 f"{xml_escape(rules)}</relationship>"
             )
         if is_group:
-            session_fields.append(f"<chime_in_allowed>{str(self.chime_in_allowed(chat_name)).lower()}</chime_in_allowed>")
+            session_fields.append(
+                f"<chime_in_allowed>{str(self.chime_in_allowed(chat_name, now=now_dt)).lower()}</chime_in_allowed>"
+            )
         if enable_time_awareness:
             session_fields.append(f"<current_time>{now_dt.strftime('%Y-%m-%d %H:%M')}</current_time>")
             session_fields.append("<timestamp_semantics>消息时间是绝对时间，不代表消息刚刚发出。</timestamp_semantics>")

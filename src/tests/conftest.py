@@ -9,6 +9,9 @@ def _identity_env_defaults(monkeypatch):
     for key, value in {"BOT_NAME": "『宵桜』囡囡", "BOT_AT_KEYWORD": "囡囡", "BUDDY_NAME": "朧月", "BUDDY_MATCH": "朧月,胧月"}.items():
         if not os.environ.get(key):
             monkeypatch.setenv(key, value)
+    # 避免深夜跑单测时默认主动插话静默时段导致既有 chime-in 用例受当前墙钟时间影响
+    if "CHIME_IN_QUIET_HOURS" not in os.environ:
+        monkeypatch.setenv("CHIME_IN_QUIET_HOURS", "")
 
 
 def pytest_addoption(parser):
